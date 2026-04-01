@@ -1,0 +1,15 @@
+# System dependencies (install before pip):
+#   brew install portaudio ffmpeg
+
+customtkinter==5.2.2
+sounddevice==0.5.1
+numpy==2.2.4
+faster-whisper==1.2.1
+pyperclip==1.9.0
+pynput==1.8.1
+requests==2.32.3
+
+# Apple Silicon GPU acceleration (auto-used on arm64 Macs)
+mlx==0.31.1
+mlx-whisper==0.4.3
+webrtcvad==2.0.10
