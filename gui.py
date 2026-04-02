@@ -724,9 +724,14 @@ class AppWindow(ctk.CTkFrame):
     def _hotkey_press(self) -> None: self.safe_after(0, self._on_hotkey_press)
     def _hotkey_release(self) -> None: self.safe_after(0, self._on_hotkey_release)
     def _on_hotkey_press(self) -> None:
-        if self._state == "idle" and not self._hotkey_held: self._transition_to_recording()
+        if self._state == "idle" and not self._hotkey_held:
+            self._transition_to_recording()
+
     def _on_hotkey_release(self) -> None:
         if self._state == "recording":
+            # 確保是在按住快捷鍵的狀態下放開，而不是因為其他原因的干擾
+            if not self._hotkey_held: return
+
             # 防呆：檢查錄音時長，避免誤觸 (少於 0.5 秒則取消)
             elapsed = time.perf_counter() - self._recording_start
             if elapsed < 0.5:

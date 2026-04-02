@@ -241,12 +241,26 @@ class HotkeyManager:
 
     def _normalize(self, key) -> object:
         """Normalize left/right variants to canonical Key values."""
+        if not _PYNPUT_AVAILABLE:
+            return key
+
         aliases = {
             Key.cmd_l: Key.cmd, Key.cmd_r: Key.cmd,
             Key.ctrl_l: Key.ctrl, Key.ctrl_r: Key.ctrl,
             Key.alt_l: Key.alt, Key.alt_r: Key.alt,
             Key.shift_l: Key.shift, Key.shift_r: Key.shift,
-        } if _PYNPUT_AVAILABLE else {}
+        }
+
+        # pynput 有時候會在 macOS 傳入特異的 keyCode，確保正確對應
+        if hasattr(key, "name") and key.name in ("cmd", "cmd_l", "cmd_r"):
+            return Key.cmd
+        if hasattr(key, "name") and key.name in ("shift", "shift_l", "shift_r"):
+            return Key.shift
+        if hasattr(key, "name") and key.name in ("alt", "alt_l", "alt_r"):
+            return Key.alt
+        if hasattr(key, "name") and key.name in ("ctrl", "ctrl_l", "ctrl_r"):
+            return Key.ctrl
+
         return aliases.get(key, key)
 
     def _on_press(self, key) -> None:
