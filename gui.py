@@ -1009,13 +1009,21 @@ class HotkeyBindDialog(ctk.CTkToplevel):
             if c:
                 if self.winfo_exists():
                     self.after(0, lambda: self._l.configure(text=format_hotkey(c)))
-                    self.after(800, lambda: [self._on_apply(c), self.destroy()])
+                    # 在 800ms 後，確保從主執行緒安全執行 callback 並銷毀對話框
+                    self.after(800, self._safe_apply_and_close, c)
             else:
                 if self.winfo_exists():
-                    self.destroy()
+                    self.after(0, self.destroy)
         except Exception as e:
             print(f"Hotkey capture failed: {e}")
             if self.winfo_exists():
+                self.after(0, self.destroy)
+
+    def _safe_apply_and_close(self, c):
+        if self.winfo_exists():
+            try:
+                self._on_apply(c)
+            finally:
                 self.destroy()
 class AccessibilityDialog(ctk.CTkToplevel):
     """macOS Permission Guidance."""
