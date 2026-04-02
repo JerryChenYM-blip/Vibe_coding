@@ -154,12 +154,28 @@ class AudioRecorder:
         """Return the latest RMS amplitude (0.0 – 1.0). Safe to call from any thread."""
         return self._rms_level
 
-    def get_buffer_snapshot(self) -> "np.ndarray":
+    def get_buffer_snapshot(self) -> np.ndarray:
         """Non-destructive copy of all recorded samples so far. Safe to call while recording."""
         with self._lock:
             if not self._frames:
                 return np.zeros(0, dtype=np.float32)
             return np.concatenate(self._frames, axis=0).flatten()
+
+    def get_recent_buffer(self, start_samples: int) -> np.ndarray:
+        """Non-destructive copy of recorded samples starting from start_samples index."""
+        with self._lock:
+            if not self._frames:
+                return np.zeros(0, dtype=np.float32)
+
+            # Since _frames is a list of blocks, we can just concatenate the needed ones
+            # For simplicity, we concatenate all and slice.
+            # In a very high-performance scenario, we could slice before concatenation
+            # but this is already much better than copying all and returning it all
+            # if we only need the tail.
+            full_buffer = np.concatenate(self._frames, axis=0).flatten()
+            if start_samples >= len(full_buffer):
+                return np.zeros(0, dtype=np.float32)
+            return full_buffer[start_samples:]
 
     def is_recording(self) -> bool:
         return self._is_recording

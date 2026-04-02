@@ -511,15 +511,14 @@ class AppWindow(ctk.CTkFrame):
 
     def _stream_tick(self) -> None:
         if self._state != "recording": return
-        snapshot = self.recorder.get_buffer_snapshot()
-        new_samples = len(snapshot) - self._stream_processed_samples
+
+        chunk = self.recorder.get_recent_buffer(self._stream_processed_samples)
+        new_samples = len(chunk)
 
         # Evaluate at least every 0.3s (4800 samples at 16kHz)
         if new_samples < 4800:
             self._stream_tick_id = self.safe_after(300, self._stream_tick)
             return
-
-        chunk = snapshot[self._stream_processed_samples:]
 
         # Check last 1 second (or whatever is available) for speech
         recent_chunk = chunk[-16000:] if len(chunk) > 16000 else chunk
@@ -535,7 +534,7 @@ class AppWindow(ctk.CTkFrame):
             self._stream_tick_id = self.safe_after(300, self._stream_tick)
             return
 
-        self._stream_processed_samples = len(snapshot)
+        self._stream_processed_samples += new_samples
 
         idx = self._stream_chunk_counter
         self._stream_chunk_counter += 1
@@ -770,6 +769,7 @@ class AppWindow(ctk.CTkFrame):
                 print(f"Ollama processing failed: {e}")
                 self.safe_after(0, lambda: [self._ollama_btn.configure(state="normal", text="✨ AI 潤飾"), self._show_toast("✨ AI 潤飾失敗")])
         def _done(res):
+            if not self.winfo_exists(): return
             self._ollama_btn.configure(state="normal", text="✨ AI 潤飾")
             if res.error: self._show_toast(f"AI 錯誤: {res.error}")
             else:
