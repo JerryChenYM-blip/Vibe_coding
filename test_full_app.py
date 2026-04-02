@@ -180,13 +180,13 @@ def test_ollama_client():
     print("TEST 6: Ollama Client (Text Processing)")
     print("=" * 60)
 
-    from ollama_client import OllamaClient, OLLAMA_ENABLED
+    from ollama_client import OllamaClient
 
     client = OllamaClient()
     print(f"  ✓ OllamaClient instance created")
-    print(f"    - Status: {'ENABLED' if OLLAMA_ENABLED else 'DISABLED (stub mode)'}")
+    print(f"    - Status: {'ENABLED' if client.config.enabled else 'DISABLED (stub mode)'}")
 
-    if not OLLAMA_ENABLED:
+    if not client.config.enabled:
         print(f"  ✓ Running in stub mode (can be enabled later)")
 
     print("\n✅ Ollama Client OK\n")
