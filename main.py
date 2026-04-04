@@ -9,8 +9,46 @@ from __future__ import annotations
 
 import sys
 import threading
+import os
+import datetime
+
+# ── Logging Setup ─────────────────────────────────────────────────────
+class Logger:
+    def __init__(self, filename="app.log"):
+        self.terminal = sys.stdout
+        self.log = open(filename, "a", encoding="utf-8")
+
+    def write(self, message):
+        # 避免為單純的換行符號加上時間戳
+        if message.strip():
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            formatted_message = f"[{timestamp}] {message}"
+            self.terminal.write(formatted_message)
+            self.log.write(formatted_message)
+        else:
+            self.terminal.write(message)
+            self.log.write(message)
+        self.log.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+# 啟動日誌重新導向
+sys.stdout = Logger("app.log")
+sys.stderr = sys.stdout
+
+print("\n" + "="*60)
+print(f"NEW SESSION: Whisper Pro started at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print("="*60)
 
 import customtkinter as ctk
+import gui
+import os
+
+print(f"DIAG: Current Working Directory: {os.getcwd()}")
+print(f"DIAG: gui.py location: {gui.__file__}")
+print(f"DIAG: Python executable: {sys.executable}")
 
 from config import Config
 from gui import WIN_W, WIN_H, AppWindow, AccessibilityDialog

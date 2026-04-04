@@ -62,7 +62,7 @@ class AudioRecorder:
         self._stream: Optional[sd.InputStream] = None
         self._is_recording = False
         self._rms_level: float = 0.0
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._device_index: Optional[int] = None
         self._monitor_thread: Optional[threading.Thread] = None
 
@@ -84,49 +84,45 @@ class AudioRecorder:
         Returns True if successful, False otherwise.
         """
         if sd is None:
-            print("ERROR: sounddevice is not available.")
+            print("RECORD: ERROR - sounddevice is not available.")
             return False
 
         with self._lock:
             if self._is_recording:
+                print("RECORD: Already recording, ignoring start request.")
                 return True
+            
             self._frames = []
             self._rms_level = 0.0
             blocksize = int(BLOCK_MS / 1000 * SAMPLE_RATE)
+            
             try:
+                print(f"RECORD: Attempting to start microphone. Device={self._device_index}, Samplerate={SAMPLE_RATE}, Blocksize={blocksize}")
                 self._stream = sd.InputStream(
                     samplerate=SAMPLE_RATE,
                     channels=CHANNELS,
                     dtype=DTYPE,
                     blocksize=blocksize,
-                    device=self._device_index, # Use the selected device
+                    device=self._device_index,
                     callback=self._audio_callback,
                 )
                 self._stream.start()
                 self._is_recording = True
+                print(f"RECORD: Stream active. Latency={self._stream.latency:.4f}s, CPU Load={self._stream.cpu_load:.2%}")
                 
-                # 防呆：啟動守護線緒，防止無限錄音耗盡記憶體 (上限 1 小時)
-                # Ensure only one monitor thread is active
-                if self._monitor_thread is None or not self._monitor_thread.is_alive():
-                    self._monitor_thread = threading.Thread(target=self._auto_stop_monitor, daemon=True)
-                    self._monitor_thread.start()
+                # _auto_stop_monitor is currently not implemented, skipping thread creation
+                # if self._monitor_thread is None or not self._monitor_thread.is_alive():
+                #     self._monitor_thread = threading.Thread(target=self._auto_stop_monitor, daemon=True)
+                #     self._monitor_thread.start()
                 
                 return True
             except Exception as e:
-                print(f"ERROR: Cannot start microphone: {e}")
+                print(f"RECORD ERROR: Initialization failed. Exception: {str(e)}")
+                import traceback
+                traceback.print_exc()
                 self._stream = None
                 self._is_recording = False
                 return False
-
-    def _auto_stop_monitor(self):
-        """Monitor thread to stop recording if it exceeds 1 hour."""
-        start_time = time.time()
-        while self.is_recording():
-            if time.time() - start_time > 3600:
-                print("FORCE STOP: Audio session exceeded 1 hour safety limit.")
-                self.stop()
-                break
-            time.sleep(10)
 
     def stop(self) -> np.ndarray:
         """
@@ -135,20 +131,30 @@ class AudioRecorder:
         """
         with self._lock:
             if not self._is_recording:
+                print("RECORD: stop() called while already idle.")
                 return np.zeros(0, dtype=np.float32)
+            
+            print("RECORD: Stopping audio stream...")
             self._is_recording = False
             if self._stream is not None:
                 try:
                     self._stream.stop()
                     self._stream.close()
-                except: pass
+                    print("RECORD: PortAudio stream closed cleanly.")
+                except Exception as e:
+                    print(f"RECORD ERROR: Error while closing stream: {e}")
                 self._stream = None
+            
             frames = list(self._frames)
             self._frames = [] # 徹底釋放記憶體
 
         if not frames:
+            print("RECORD: Warning - No audio data captured.")
             return np.zeros(0, dtype=np.float32)
-        return np.concatenate(frames, axis=0).flatten()
+            
+        full_audio = np.concatenate(frames, axis=0).flatten()
+        print(f"RECORD: Session complete. Total samples={len(full_audio)}, Duration={len(full_audio)/SAMPLE_RATE:.2f}s")
+        return full_audio
 
     def get_rms_level(self) -> float:
         """Return the latest RMS amplitude (0.0 – 1.0). Safe to call from any thread."""

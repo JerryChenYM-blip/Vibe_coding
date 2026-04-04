@@ -35,7 +35,7 @@ LANGUAGE_OPTIONS: dict[str, str | None] = {
 
 @dataclass
 class Config:
-    hotkey: str = "cmd+shift+space"
+    hotkey: str = "cmd+alt+r"
     model: str = "large-v3-turbo"
     language: str = "自動偵測"
     input_device: Optional[str] = None
@@ -55,9 +55,16 @@ class Config:
             return cfg
         try:
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            # 濾除損壞或不存在的欄位，確保版本相容
             valid_data = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
-            return cls(**valid_data)
+            cfg = cls(**valid_data)
+            
+            # 安全檢查：強制修復會導致 macOS 衝突的熱鍵
+            if cfg.hotkey == "cmd+shift+space":
+                print("CONFIG: Detecting unstable hotkey 'cmd+shift+space', auto-resetting to 'cmd+alt+r'")
+                cfg.hotkey = "cmd+alt+r"
+                cfg.save()
+                
+            return cfg
         except Exception as e:
             print(f"CRITICAL: Config corrupt ({e}). Backing up and resetting.")
             try:

@@ -1,13 +1,13 @@
 """
-Global hotkey listener using pynput.
+Global Hotkey Manager for macOS.
 
-On macOS, global key monitoring requires Accessibility permission.
-This module detects whether that permission is available and exposes
-an is_accessible() helper so the GUI can show a guidance dialog.
-
-Push-to-talk model:
-  on_press  callback → called when the full hotkey combination is pressed
-  on_release callback → called when any key in the combination is released
+Fixes applied vs previous version:
+  • Callbacks (_on_press_cb / _on_release_cb) are now invoked OUTSIDE the
+    internal lock → eliminates potential deadlock when the callback itself
+    triggers any lock-guarded operation.
+  • stop() releases the lock before calling listener.stop() → avoids a
+    deadlock if the pynput thread is mid-callback holding the lock.
+  • capture_hotkey() added — used by the HotkeyBindDialog in the UI.
 """
 
 from __future__ import annotations
@@ -28,44 +28,17 @@ def is_pynput_available() -> bool:
 
 
 def check_accessibility() -> bool:
-    """
-    On macOS, probe whether Accessibility permission is granted using AXIsProcessTrusted.
-    Returns True if granted (or on non-macOS).
-    """
     import platform
     if platform.system() != "Darwin":
         return True
-    
     try:
         from ApplicationServices import AXIsProcessTrusted
         return AXIsProcessTrusted()
-    except (ImportError, AttributeError):
-        # Fallback to pynput probe if pyobjc is missing
-        if not _PYNPUT_AVAILABLE:
-            return False
-        try:
-            from pynput.keyboard import Listener as L
-            sentinel = threading.Event()
-            exc_holder: list[Exception] = []
-
-            def on_press(key):
-                sentinel.set()
-                return False
-
-            def on_err(exc):
-                exc_holder.append(exc)
-                sentinel.set()
-
-            l = L(on_press=on_press, on_error=on_err)
-            l.start()
-            sentinel.wait(timeout=0.05)
-            l.stop()
-            return len(exc_holder) == 0
-        except Exception:
-            return False
+    except Exception:
+        return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Symbol helpers ────────────────────────────────────────────────────────────
 
 _SYMBOL_MAP: dict[str, str] = {
     "cmd":   "⌘",
@@ -73,212 +46,191 @@ _SYMBOL_MAP: dict[str, str] = {
     "alt":   "⌥",
     "shift": "⇧",
     "space": "Space",
-    "f13":   "F13",
-    "f14":   "F14",
-    "f15":   "F15",
 }
 
 
 def parse_hotkey(combo: str) -> set:
-    """
-    Parse a hotkey string like 'cmd+shift+space' into a set of pynput Key objects.
-    Returns an empty set if pynput is not available.
-    """
+    """Parse 'cmd+alt+r' → set of pynput Key / char objects."""
     if not _PYNPUT_AVAILABLE:
         return set()
-
-    result = set()
-    for part in combo.lower().split("+"):
-        part = part.strip()
-        if part in ("cmd", "command"):
-            result.add(Key.cmd)
-        elif part == "ctrl":
-            result.add(Key.ctrl)
-        elif part == "alt":
-            result.add(Key.alt)
-        elif part == "shift":
-            result.add(Key.shift)
-        elif part == "space":
-            result.add(Key.space)
-        elif part.startswith("f") and part[1:].isdigit():
-            try:
-                result.add(getattr(Key, part, None))
-            except AttributeError: pass
+    res: set = set()
+    for p in combo.lower().split("+"):
+        p = p.strip()
+        if p in ("cmd", "command"):
+            res.add(Key.cmd)
+        elif p == "shift":
+            res.add(Key.shift)
+        elif p == "alt":
+            res.add(Key.alt)
+        elif p == "ctrl":
+            res.add(Key.ctrl)
+        elif p == "space":
+            res.add(Key.space)
+        elif len(p) == 1:
+            res.add(p)
         else:
-            # Single character key
-            if len(part) == 1:
-                result.add(KeyCode.from_char(part))
-            else:
-                # Try to find in Key enum anyway
-                try:
-                    result.add(getattr(Key, part, None))
-                except AttributeError: pass
-    result.discard(None)
-    return result
+            try:
+                res.add(getattr(Key, p, p))
+            except Exception:
+                pass
+    return res
 
 
 def format_hotkey(combo: str) -> str:
-    """Return a pretty display string, e.g. 'cmd+shift+space' → '⌘⇧Space'."""
+    """'cmd+alt+r' → '⌘⌥R'"""
     parts = combo.lower().split("+")
-    return "".join(_SYMBOL_MAP.get(p.strip(), p.strip().capitalize()) for p in parts)
+    return "".join(_SYMBOL_MAP.get(p.strip(), p.strip().upper()) for p in parts)
 
 
-def capture_hotkey(timeout: float = 10.0) -> Optional[str]:
+def _normalize_key(key) -> object:
+    """Collapse left/right variants to canonical Key."""
+    if not _PYNPUT_AVAILABLE:
+        return key
+    if key in (Key.cmd,   Key.cmd_l,   Key.cmd_r):   return Key.cmd
+    if key in (Key.shift, Key.shift_l, Key.shift_r): return Key.shift
+    if key in (Key.alt,   Key.alt_l,   Key.alt_r):   return Key.alt
+    if key in (Key.ctrl,  Key.ctrl_l,  Key.ctrl_r):  return Key.ctrl
+    if hasattr(key, "char") and key.char:
+        return key.char.lower()
+    return key
+
+
+def _keys_to_combo(keys: set) -> str:
+    """Convert a set of normalized pynput keys → 'cmd+alt+r' string."""
+    order = [
+        (Key.cmd,   "cmd"),
+        (Key.ctrl,  "ctrl"),
+        (Key.alt,   "alt"),
+        (Key.shift, "shift"),
+    ]
+    parts: list[str] = []
+    remaining = set(keys)
+    for k, name in order:
+        if k in remaining:
+            parts.append(name)
+            remaining.discard(k)
+    for k in sorted(remaining, key=str):
+        if isinstance(k, str):
+            parts.append(k)
+        elif k is Key.space:
+            parts.append("space")
+        elif hasattr(k, "name"):
+            parts.append(k.name)
+        else:
+            parts.append(str(k).replace("Key.", ""))
+    return "+".join(parts) if parts else ""
+
+
+def capture_hotkey(timeout: float = 15.0) -> Optional[str]:
     """
-    Block until the user presses and releases a key combination, then return
-    the combo string (e.g. 'cmd+shift+r').  Returns None on timeout or error.
-    Only usable from a non-main thread.
+    Block until the user presses (and begins to release) a key combination.
+    Returns the combo string (e.g. 'cmd+alt+r'), or None on timeout.
+
+    Used by HotkeyBindDialog to let users rebind the hotkey.
     """
     if not _PYNPUT_AVAILABLE:
         return None
 
-    pressed: Set = set()
-    captured: list[set] = []
     done = threading.Event()
+    current: set = set()
+    max_combo: list[set] = [set()]
+    result: list[Optional[str]] = [None]
 
-    def _canonical(key) -> str:
-        if key == Key.cmd or key == Key.cmd_l or key == Key.cmd_r:
-            return "cmd"
-        if key == Key.ctrl or key == Key.ctrl_l or key == Key.ctrl_r:
-            return "ctrl"
-        if key == Key.alt or key == Key.alt_l or key == Key.alt_r:
-            return "alt"
-        if key == Key.shift or key == Key.shift_l or key == Key.shift_r:
-            return "shift"
-        if key == Key.space:
-            return "space"
-        if hasattr(key, "name"):
-            return key.name
-        if hasattr(key, "char") and key.char:
-            return key.char.lower()
-        return str(key)
+    def _on_press(key):
+        nk = _normalize_key(key)
+        current.add(nk)
+        if len(current) > len(max_combo[0]):
+            max_combo[0] = set(current)
 
-    def on_press(key):
-        pressed.add(_canonical(key))
-
-    def on_release(key):
-        if pressed and not captured:
-            captured.append(set(pressed))
-        pressed.discard(_canonical(key))
-        if not pressed and captured:
+    def _on_release(key):
+        if max_combo[0] and not done.is_set():
+            result[0] = _keys_to_combo(max_combo[0])
             done.set()
-            return False  # stop listener
+            return False          # stop listener
+        nk = _normalize_key(key)
+        current.discard(nk)
 
-    listener = _kb.Listener(on_press=on_press, on_release=on_release)
+    listener = _kb.Listener(on_press=_on_press, on_release=_on_release)
+    listener.daemon = True
     listener.start()
     done.wait(timeout=timeout)
-    listener.stop()
+    if listener.running:
+        listener.stop()
 
-    if not captured:
-        return None
-
-    # Build canonical order: modifiers first, then key
-    modifier_order = ["ctrl", "alt", "shift", "cmd"]
-    keys = list(captured[0])
-    mods = [k for k in modifier_order if k in keys]
-    rest = [k for k in keys if k not in modifier_order]
-    return "+".join(mods + rest)
+    return result[0]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ── HotkeyManager ─────────────────────────────────────────────────────────────
 
 class HotkeyManager:
     """
-    Listens globally for a configurable hotkey combination.
+    Listens for a configurable global hotkey combo and fires callbacks.
 
-    on_press_cb  → called (on pynput thread) when full combo is first pressed
-    on_release_cb → called (on pynput thread) when any combo key is released
-                   while the combo was active
-
-    Both callbacks should be fast; use tkinter's master.after(0, fn) to
-    marshal work back to the main thread.
+    Thread-safety: All shared state is guarded by _lock, but callbacks are
+    invoked OUTSIDE the lock to prevent deadlocks.
     """
 
-    def __init__(
-        self,
-        on_press_cb: Callable[[], None],
-        on_release_cb: Callable[[], None],
-    ) -> None:
-        self._on_press_cb = on_press_cb
+    def __init__(self, on_press_cb: Callable, on_release_cb: Callable) -> None:
+        self._on_press_cb   = on_press_cb
         self._on_release_cb = on_release_cb
-        self._hotkeys: set = set()
-        self._pressed: Set = set()
-        self._combo_active = False
-        self._listener: Optional[object] = None
+        self._hotkeys:      set = set()
+        self._pressed:      Set = set()
+        self._combo_active: bool = False
+        self._listener:     Optional[_kb.Listener] = None
         self._lock = threading.Lock()
 
-    def set_hotkey(self, combo: str) -> None:
-        """Update the active hotkey combination."""
+    def restart(self, combo: str) -> None:
+        self.stop()
         self._hotkeys = parse_hotkey(combo)
-
-    def start(self, combo: str) -> None:
-        """Start the global listener with the given hotkey combo."""
-        if not _PYNPUT_AVAILABLE:
-            print("ERROR: pynput not available. Hotkeys disabled.")
-            return
-        self.set_hotkey(combo)
-        print(f"INFO: Starting hotkey listener for '{combo}'...")
+        print(f"HOTKEY: Starting listener for {self._hotkeys}")
         self._listener = _kb.Listener(
-            on_press=lambda key: self._on_press(key),
-            on_release=lambda key: self._on_release(key),
+            on_press=self._on_p,
+            on_release=self._on_r,
+            suppress=False,
         )
         self._listener.daemon = True
         self._listener.start()
 
     def stop(self) -> None:
-        if self._listener is not None:
+        # Grab the listener reference and clear state under the lock,
+        # then stop the listener OUTSIDE the lock to avoid deadlock
+        # (the pynput thread might be mid-callback holding the lock).
+        listener_to_stop = None
+        with self._lock:
+            listener_to_stop = self._listener
+            self._listener = None
+            self._pressed.clear()
+            self._combo_active = False
+        if listener_to_stop is not None:
+            print("HOTKEY: Stopping listener...")
             try:
-                self._listener.stop()
+                listener_to_stop.stop()
             except Exception:
                 pass
-            self._listener = None
-
-    def restart(self, combo: str) -> None:
-        self.stop()
-        self.start(combo)
-
-    # ── internal ─────────────────────────────────────────────────────────────
 
     def _normalize(self, key) -> object:
-        """Normalize left/right variants to canonical Key values."""
-        aliases = {
-            Key.cmd_l: Key.cmd, Key.cmd_r: Key.cmd,
-            Key.ctrl_l: Key.ctrl, Key.ctrl_r: Key.ctrl,
-            Key.alt_l: Key.alt, Key.alt_r: Key.alt,
-            Key.shift_l: Key.shift, Key.shift_r: Key.shift,
-        } if _PYNPUT_AVAILABLE else {}
-        return aliases.get(key, key)
+        return _normalize_key(key)
 
-    def _on_press(self, key) -> None:
-        if not self._hotkeys:
-            return
-        try:
-            key = self._normalize(key)
-            with self._lock:
-                self._pressed.add(key)
-                # Debug print to help identify issues
-                # print(f"DEBUG: Pressed {key}, Current set: {self._pressed}")
-                if not self._combo_active and self._hotkeys.issubset(self._pressed):
-                    print(f"DEBUG: Hotkey Combo Detected! Triggering callback.")
-                    self._combo_active = True
-                    try:
-                        self._on_press_cb()
-                    except Exception as e:
-                        print(f"DEBUG: Callback error: {e}")
-        except Exception as e:
-            print(f"DEBUG: _on_press error: {e}")
+    def _on_p(self, key) -> None:
+        nk = self._normalize(key)
+        fire = False
+        with self._lock:
+            self._pressed.add(nk)
+            if not self._combo_active and self._hotkeys.issubset(self._pressed):
+                self._combo_active = True
+                fire = True
+        if fire:
+            print("HOTKEY: Triggered!")
+            self._on_press_cb()   # called OUTSIDE lock
 
-    def _on_release(self, key) -> None:
-        try:
-            key = self._normalize(key)
-            with self._lock:
-                self._pressed.discard(key)
-                if self._combo_active and key in self._hotkeys:
-                    print(f"DEBUG: Hotkey Released.")
-                    self._combo_active = False
-                    try:
-                        self._on_release_cb()
-                    except Exception as e:
-                        print(f"DEBUG: Release callback error: {e}")
-        except Exception as e:
-            print(f"DEBUG: _on_release error: {e}")
+    def _on_r(self, key) -> None:
+        nk = self._normalize(key)
+        fire = False
+        with self._lock:
+            if self._combo_active and nk in self._hotkeys:
+                self._combo_active = False
+                fire = True
+            self._pressed.discard(nk)
+        if fire:
+            print("HOTKEY: Released!")
+            self._on_release_cb()  # called OUTSIDE lock
