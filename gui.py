@@ -77,6 +77,33 @@ WAVE_LIVE_COL = "#F5F5F7"
 SPINNER   = ["⠋", "⠙", "⠸", "⠴", "⠦", "⠇"]
 WAVE_BARS = 44
 
+# Breathing glow — record button
+GLOW_SIZE       = 240   # Canvas size (must exceed button+glow radius)
+GLOW_CENTER     = GLOW_SIZE // 2
+BTN_RADIUS      = 82    # Button visual radius
+GLOW_FPS        = 30
+GLOW_TICK_MS    = 1000 // GLOW_FPS
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Colour blending helpers (simulate alpha on tk.Canvas)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _hex_to_rgb(h: str) -> tuple[int, int, int]:
+    h = h.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _blend(fg_hex: str, bg_hex: str, alpha: float) -> str:
+    """Alpha-composite fg over bg. alpha=1.0 → pure fg; alpha=0 → pure bg."""
+    alpha = max(0.0, min(1.0, alpha))
+    r1, g1, b1 = _hex_to_rgb(fg_hex)
+    r2, g2, b2 = _hex_to_rgb(bg_hex)
+    r = int(r2 + (r1 - r2) * alpha)
+    g = int(g2 + (g1 - g2) * alpha)
+    b = int(b2 + (b1 - b2) * alpha)
+    return f"#{r:02X}{g:02X}{b:02X}"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  AppWindow
@@ -103,7 +130,6 @@ class AppWindow(ctk.CTkFrame):
         self._hotkey_held: bool  = False
         self._rec_start:   float = 0.0
         self._spin_idx:    int   = 0
-        self._pulse_hi:    bool  = True
         self._wave_phase:  float = 0.0
 
         # Auto-paste
@@ -212,23 +238,22 @@ class AppWindow(ctk.CTkFrame):
         self._wave_canvas.pack(fill="x", padx=24, pady=(20, 8))
         self._draw_idle_wave()
 
-        # Button zone
+        # Button zone — Canvas hosts the breathing glow; button is overlaid on top
         zone = ctk.CTkFrame(card, fg_color="transparent")
-        zone.pack(pady=(8, 6))
+        zone.pack(pady=(4, 6))
 
-        # Outer ring
-        self._btn_ring = ctk.CTkFrame(
-            zone, width=196, height=196, corner_radius=98,
-            fg_color="transparent",
-            border_color=GREEN_DIM, border_width=2,
+        self._glow_canvas = tk.Canvas(
+            zone,
+            width=GLOW_SIZE, height=GLOW_SIZE,
+            bg=SURF1, highlightthickness=0,
         )
-        self._btn_ring.pack()
-        self._btn_ring.pack_propagate(False)
+        self._glow_canvas.pack()
 
         self._record_btn = ctk.CTkButton(
-            self._btn_ring,
+            self._glow_canvas,
             text="🎤\n點擊錄音",
-            width=164, height=164, corner_radius=82,
+            width=BTN_RADIUS * 2, height=BTN_RADIUS * 2,
+            corner_radius=BTN_RADIUS,
             fg_color=GREEN,
             hover_color="#28B84A",
             text_color="#FFFFFF",
@@ -236,7 +261,12 @@ class AppWindow(ctk.CTkFrame):
             border_width=0,
             command=self._on_record_btn,
         )
-        self._record_btn.place(relx=0.5, rely=0.5, anchor="center")
+        self._record_btn.place(x=GLOW_CENTER, y=GLOW_CENTER, anchor="center")
+
+        # Glow animation state
+        self._glow_phase: float = 0.0
+        self._glow_running: bool = False
+        self._start_glow()
 
         # Auto-paste target label
         self._target_label = ctk.CTkLabel(
@@ -440,13 +470,11 @@ class AppWindow(ctk.CTkFrame):
             fg_color=RED,
             hover_color="#CC3630",
         )
-        self._btn_ring.configure(border_color=RED_DIM)
         self._model_menu.configure(state="disabled")
         self._lang_menu.configure(state="disabled")
         self._status_dot.configure(text_color=RED)
         self._status_label.configure(text="  錄音中")
 
-        self._pulse_btn()
         self._update_wave()
         self._update_timer()
         self._stream_tick_id = self.after(5000, self._stream_tick)
@@ -469,7 +497,6 @@ class AppWindow(ctk.CTkFrame):
             hover_color=ORANGE,
             state="disabled",
         )
-        self._btn_ring.configure(border_color=SURF3)
         self._target_label.configure(text="")
         self._status_dot.configure(text_color=ORANGE)
         self._status_label.configure(text="  轉錄中，請稍候…")
@@ -498,7 +525,6 @@ class AppWindow(ctk.CTkFrame):
             hover_color="#28B84A",
             state="normal",
         )
-        self._btn_ring.configure(border_color=GREEN_DIM)
         self._model_menu.configure(state="normal")
         self._lang_menu.configure(state="normal")
         self._target_label.configure(text="")
@@ -619,12 +645,77 @@ class AppWindow(ctk.CTkFrame):
     #  ANIMATIONS
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _pulse_btn(self) -> None:
-        if self._state != "recording":
+    # ── Breathing glow (always-on, 30fps) ────────────────────────────────────
+    def _start_glow(self) -> None:
+        if self._glow_running:
             return
-        self._record_btn.configure(fg_color=RED if self._pulse_hi else "#8B1A15")
-        self._pulse_hi = not self._pulse_hi
-        self.after(600, self._pulse_btn)
+        self._glow_running = True
+        self._draw_glow()
+
+    def _draw_glow(self) -> None:
+        """Single glow tick. Renders state-aware concentric halo or spinning arc."""
+        if not self._glow_running:
+            return
+
+        c  = self._glow_canvas
+        cx = cy = GLOW_CENTER
+        c.delete("glow")
+
+        phase = self._glow_phase
+
+        if self._state == "processing":
+            # Rotating conic-arc ring — 12 segments, each fading tail-to-head
+            r_outer = BTN_RADIUS + 16        # 98
+            rotation = (phase * 4.5) % 360    # ~13.5°/frame → fast spin
+            segments  = 12
+            seg_ext   = 26
+            seg_gap   = 30 - seg_ext
+            for i in range(segments):
+                alpha = 1.0 - (i / segments) * 0.85   # 1.0 → 0.15 across tail
+                col   = _blend(ORANGE, SURF1, alpha * 0.9)
+                start = rotation + i * (seg_ext + seg_gap)
+                c.create_arc(
+                    cx - r_outer, cy - r_outer,
+                    cx + r_outer, cy + r_outer,
+                    start=start, extent=seg_ext,
+                    style="arc", outline=col, width=4,
+                    tags="glow",
+                )
+        else:
+            # Breathing halo — 6 concentric layers, outer = dimmer
+            if self._state == "recording":
+                base         = RED
+                speed        = 0.105          # ~2.5s breath cycle
+                halo_layers  = 7
+                base_radius  = BTN_RADIUS + 6  # start right outside button
+                spread       = 26             # max expansion at peak
+                strength     = 0.78
+            else:  # idle
+                base         = GREEN
+                speed        = 0.045          # ~6s slow breath
+                halo_layers  = 6
+                base_radius  = BTN_RADIUS + 6
+                spread       = 14
+                strength     = 0.42
+
+            # breath = 0.0 (compressed) → 1.0 (expanded)
+            breath = 0.5 + 0.5 * math.sin(phase * speed)
+
+            for i in range(halo_layers):
+                t = i / (halo_layers - 1)               # 0 (inner) → 1 (outer)
+                r = base_radius + t * spread + breath * (spread * 0.35)
+                # Alpha: inner ring brightest, outer fades out; breath modulates overall
+                layer_alpha = (1.0 - t) ** 1.8          # exponential falloff
+                alpha = strength * layer_alpha * (0.55 + 0.45 * breath)
+                col   = _blend(base, SURF1, alpha)
+                c.create_oval(
+                    cx - r, cy - r, cx + r, cy + r,
+                    outline=col, width=2,
+                    tags="glow",
+                )
+
+        self._glow_phase += 1
+        self.after(GLOW_TICK_MS, self._draw_glow)
 
     def _update_wave(self) -> None:
         if self._state != "recording":
