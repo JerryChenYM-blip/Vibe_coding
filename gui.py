@@ -1,16 +1,17 @@
 """
-Main application window — Apple design language.
+Main application window — Apple MacBook Pro aesthetic.
 
-Colour system:  authentic macOS/iOS system palette
-Glass effect:   simulated with layered surfaces (#F2F2F7 bg → #FFFFFF card)
-Auto-paste:     captures frontmost app before recording, injects ⌘V after STT
+Design language:  apple.com/tw/macbook-pro/
+Colour system:    forced dark, void-black base + layered surfaces
+Typography:       SF Pro Display / Text (macOS native)
+Auto-paste:       captures frontmost app before recording, injects ⌘V after STT
 
-Layout (740 × 740 px):
-  TopBar      — logo · model / language pills
+Layout (760 × 800 px):
+  TopBar      — logo · model / language selectors
   RecordCard  — waveform · circular button · ring indicator
-  ResultCard  — transcription textbox (expands)
-  ActionBar   — pill action buttons
-  StatusBar   — status · auto-paste badge · hotkey · timer
+  ResultCard  — transcription textbox
+  ActionBar   — action buttons
+  StatusBar   — status · hotkey · timer
 """
 
 from __future__ import annotations
@@ -36,51 +37,45 @@ from recorder import AudioRecorder
 from transcriber import Transcriber, TranscriptionResult
 import auto_paste as _ap
 
-# ── Appearance ────────────────────────────────────────────────────────────────
-ctk.set_appearance_mode("System")
+# ── Appearance — force Apple dark aesthetic ───────────────────────────────────
+ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-WIN_W, WIN_H = 740, 740
+WIN_W, WIN_H = 760, 800
 
-# ── Apple system colour palette ───────────────────────────────────────────────
-# Tuples = (light, dark)  |  strings = mode-independent
+# ── Apple MacBook Pro colour palette (forced dark) ────────────────────────────
+# Sourced from apple.com/tw/macbook-pro/ computed styles
 
-# Backgrounds
-SYS_BG   = ("#F2F2F7", "#000000")   # iOS groupedBackground
-CARD     = ("#FFFFFF",  "#1C1C1E")   # iOS secondaryGroupedBackground
-CARD2    = ("#F2F2F7",  "#2C2C2E")   # inset / secondary card
-SEP      = ("#C6C6C8",  "#38383A")   # separator
+BG       = "#000000"   # void black — window body
+SURF1    = "#1D1D1F"   # primary surface — cards, bars
+SURF2    = "#2C2C2E"   # secondary surface — inset, hover
+SURF3    = "#3A3A3C"   # separators, borders, disabled
 
-# Text
-LABEL    = ("#000000",  "#FFFFFF")    # primary label
-LABEL2   = ("#3C3C43",  "#EBEBF5")   # secondary label (60% opacity approx)
-LABEL3   = ("#8E8E93",  "#8E8E93")   # tertiary / hint
+TEXT1    = "#F5F5F7"   # primary label (warm white)
+TEXT2    = "#EBEBF5"   # secondary label
+TEXT3    = "#8E8E93"   # tertiary / hint / muted
 
-# System tints (iOS)
-BLUE     = ("#007AFF",  "#0A84FF")
-BLUE_BG  = ("#E5F1FF",  "#0A2540")
-GREEN    = ("#34C759",  "#30D158")
-GREEN_BG = ("#E3F9EC",  "#012B17")
-RED      = ("#FF3B30",  "#FF453A")
-RED_BG   = ("#FFE5E4",  "#3A0000")
-ORANGE   = ("#FF9500",  "#FF9F0A")
-INDIGO   = ("#5856D6",  "#5E5CE6")
+BLUE     = "#0071E3"   # Apple CTA blue
+BLUE_HV  = "#2997FF"   # blue hover (brighter)
+BLUE_DIM = "#0A2744"   # blue-tinted surface
 
-# Waveform idle bars
-WAVE_IDLE = ("#D1D1D6", "#38383A")
+GREEN    = "#30D158"   # system green (idle)
+GREEN_DIM = "#0A2B1A"  # green-tinted surface
 
-SPINNER  = ["⠋", "⠙", "⠸", "⠴", "⠦", "⠇"]
-WAVE_BARS = 42
+RED      = "#FF453A"   # system red (recording)
+RED_DIM  = "#3A0800"   # red-tinted surface
 
+ORANGE   = "#FF9F0A"   # system orange (processing)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+INDIGO   = "#5E5CE6"   # auto-paste active
+INDIGO_DIM = "#1A1A40" # indigo-tinted surface
 
-def _dark() -> bool:
-    return ctk.get_appearance_mode() == "Dark"
+# Waveform
+WAVE_IDLE_COL = "#3A3A3C"
+WAVE_LIVE_COL = "#F5F5F7"
 
-
-def _card_hex() -> str:
-    return CARD[1] if _dark() else CARD[0]
+SPINNER   = ["⠋", "⠙", "⠸", "⠴", "⠦", "⠇"]
+WAVE_BARS = 44
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -88,10 +83,10 @@ def _card_hex() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AppWindow(ctk.CTkFrame):
-    """Root frame — holds the full UI."""
+    """Root frame — Apple MacBook Pro aesthetic."""
 
     def __init__(self, master: ctk.CTk, cfg: Config) -> None:
-        super().__init__(master, fg_color=SYS_BG, corner_radius=0)
+        super().__init__(master, fg_color=BG, corner_radius=0)
         self.pack(fill="both", expand=True)
 
         self.cfg = cfg
@@ -115,9 +110,9 @@ class AppWindow(ctk.CTkFrame):
         self._paste_target: Optional[str] = None
 
         # Streaming
-        self._stream_samples: int        = 0
-        self._stream_chunks:  list[str]  = []
-        self._stream_tick_id             = None
+        self._stream_samples: int       = 0
+        self._stream_chunks:  list[str] = []
+        self._stream_tick_id            = None
 
         self._build_ui()
         self._start_hotkey_listener()
@@ -137,89 +132,95 @@ class AppWindow(ctk.CTkFrame):
     # ── Top bar ──────────────────────────────────────────────────────────────
 
     def _build_topbar(self) -> None:
-        bar = ctk.CTkFrame(self, height=64, corner_radius=0, fg_color="transparent")
+        bar = ctk.CTkFrame(self, height=60, corner_radius=0, fg_color=SURF1)
         bar.pack(fill="x")
         bar.pack_propagate(False)
 
-        # Left: app title
+        # Thin bottom separator line
+        ctk.CTkFrame(self, height=1, fg_color=SURF3, corner_radius=0).pack(fill="x")
+
+        # Left: title
         left = ctk.CTkFrame(bar, fg_color="transparent")
-        left.pack(side="left", padx=22, fill="y")
+        left.pack(side="left", padx=24, fill="y")
+
         ctk.CTkLabel(
             left,
             text="🎙",
-            font=ctk.CTkFont(size=24),
+            font=ctk.CTkFont(size=20),
         ).pack(side="left", padx=(0, 8))
+
         ctk.CTkLabel(
             left,
             text="Whisper Pro",
-            font=ctk.CTkFont("Helvetica Neue", 18, "bold"),
-            text_color=LABEL,
+            font=ctk.CTkFont("SF Pro Display", 17, "bold"),
+            text_color=TEXT1,
         ).pack(side="left")
 
-        # Right: language + model pills
+        # Right: language + model selectors
         right = ctk.CTkFrame(bar, fg_color="transparent")
         right.pack(side="right", padx=20, fill="y")
 
-        for label_txt, var_attr, menu_attr, values, cb in [
-            ("語言", "_lang_var", "_lang_menu", list(LANGUAGE_OPTIONS.keys()), self._on_language_change),
-            ("模型", "_model_var", "_model_menu", list(MODEL_INFO.keys()), self._on_model_change),
+        for label_txt, var_attr, menu_attr, values, init_val, cb in [
+            ("語言", "_lang_var", "_lang_menu",
+             list(LANGUAGE_OPTIONS.keys()), cfg_val(self.cfg.language), self._on_language_change),
+            ("模型", "_model_var", "_model_menu",
+             list(MODEL_INFO.keys()), cfg_val(self.cfg.model), self._on_model_change),
         ]:
-            pill = ctk.CTkFrame(right, fg_color=CARD2, corner_radius=10, border_width=1, border_color=SEP)
-            pill.pack(side="left", padx=(0, 8), pady=16)
+            grp = ctk.CTkFrame(right, fg_color="transparent")
+            grp.pack(side="left", padx=(0, 16), pady=18)
 
             ctk.CTkLabel(
-                pill, text=label_txt,
-                font=ctk.CTkFont("Helvetica Neue", 11),
-                text_color=LABEL3, padx=8,
-            ).pack(side="left")
+                grp, text=label_txt,
+                font=ctk.CTkFont("SF Pro Text", 12),
+                text_color=TEXT3,
+            ).pack(side="left", padx=(0, 4))
 
-            var = ctk.StringVar(
-                value=self.cfg.language if var_attr == "_lang_var" else self.cfg.model
-            )
+            var = ctk.StringVar(value=init_val)
             setattr(self, var_attr, var)
 
             menu = ctk.CTkOptionMenu(
-                pill,
+                grp,
                 values=values,
                 variable=var,
-                width=96 if var_attr == "_lang_var" else 80,
-                height=28,
+                width=108 if var_attr == "_lang_var" else 148,
+                height=30,
                 corner_radius=8,
-                fg_color="transparent",
-                button_color="transparent",
-                button_hover_color=CARD2,
-                dropdown_fg_color=CARD,
-                text_color=LABEL,
-                font=ctk.CTkFont("Helvetica Neue", 12),
+                fg_color=SURF2,
+                button_color=SURF2,
+                button_hover_color=SURF3,
+                dropdown_fg_color=SURF1,
+                text_color=TEXT1,
+                font=ctk.CTkFont("SF Pro Text", 13),
                 command=cb,
             )
-            menu.pack(side="left", padx=(0, 4))
+            menu.pack(side="left")
             setattr(self, menu_attr, menu)
 
     # ── Record card ──────────────────────────────────────────────────────────
 
     def _build_record_card(self) -> None:
         card = ctk.CTkFrame(
-            self, corner_radius=20,
-            fg_color=CARD, border_color=SEP, border_width=1,
+            self, corner_radius=16,
+            fg_color=SURF1,
         )
-        card.pack(fill="x", padx=16, pady=(2, 6))
+        card.pack(fill="x", padx=16, pady=(14, 6))
 
         # Waveform
         self._wave_canvas = tk.Canvas(
-            card, height=68, bg=_card_hex(), highlightthickness=0,
+            card, height=72, bg=SURF1, highlightthickness=0,
         )
-        self._wave_canvas.pack(fill="x", padx=20, pady=(16, 4))
+        self._wave_canvas.pack(fill="x", padx=24, pady=(20, 8))
         self._draw_idle_wave()
 
         # Button zone
         zone = ctk.CTkFrame(card, fg_color="transparent")
-        zone.pack(pady=(6, 4))
+        zone.pack(pady=(8, 6))
 
-        # Outer ring (glow)
+        # Outer ring
         self._btn_ring = ctk.CTkFrame(
-            zone, width=182, height=182, corner_radius=91,
-            fg_color="transparent", border_color=GREEN_BG, border_width=3,
+            zone, width=196, height=196, corner_radius=98,
+            fg_color="transparent",
+            border_color=GREEN_DIM, border_width=2,
         )
         self._btn_ring.pack()
         self._btn_ring.pack_propagate(False)
@@ -227,160 +228,183 @@ class AppWindow(ctk.CTkFrame):
         self._record_btn = ctk.CTkButton(
             self._btn_ring,
             text="🎤\n點擊錄音",
-            width=154, height=154, corner_radius=77,
-            fg_color=GREEN, hover_color=("#2AAF50", "#28B84A"),
+            width=164, height=164, corner_radius=82,
+            fg_color=GREEN,
+            hover_color="#28B84A",
             text_color="#FFFFFF",
-            font=ctk.CTkFont("Helvetica Neue", 13, "bold"),
+            font=ctk.CTkFont("SF Pro Text", 14, "bold"),
             border_width=0,
             command=self._on_record_btn,
         )
         self._record_btn.place(relx=0.5, rely=0.5, anchor="center")
 
-        # Auto-paste target label (shows during recording)
+        # Auto-paste target label
         self._target_label = ctk.CTkLabel(
-            card,
-            text="",
-            font=ctk.CTkFont("Helvetica Neue", 11),
-            text_color=LABEL3,
+            card, text="",
+            font=ctk.CTkFont("SF Pro Text", 12),
+            text_color=BLUE_HV,
         )
-        self._target_label.pack(pady=(2, 2))
+        self._target_label.pack(pady=(4, 2))
 
         # Hotkey hint
         self._hotkey_hint = ctk.CTkLabel(
             card,
             text=f"按住 {self.cfg.format_hotkey_display()} 即時錄音",
-            font=ctk.CTkFont("Helvetica Neue", 11),
-            text_color=LABEL3,
+            font=ctk.CTkFont("SF Pro Text", 12),
+            text_color=TEXT3,
         )
-        self._hotkey_hint.pack(pady=(0, 14))
+        self._hotkey_hint.pack(pady=(0, 18))
 
     # ── Result card ──────────────────────────────────────────────────────────
 
     def _build_result_card(self) -> None:
         card = ctk.CTkFrame(
-            self, corner_radius=20,
-            fg_color=CARD, border_color=SEP, border_width=1,
+            self, corner_radius=16,
+            fg_color=SURF1,
         )
         card.pack(fill="both", expand=True, padx=16, pady=(0, 6))
 
-        hdr = ctk.CTkFrame(card, fg_color="transparent", height=44)
-        hdr.pack(fill="x", padx=18, pady=(12, 0))
+        # Header
+        hdr = ctk.CTkFrame(card, fg_color="transparent", height=46)
+        hdr.pack(fill="x", padx=20, pady=(14, 0))
         hdr.pack_propagate(False)
 
         self._result_title = ctk.CTkLabel(
             hdr, text="📝  轉錄結果",
-            font=ctk.CTkFont("Helvetica Neue", 13, "bold"),
-            text_color=LABEL, anchor="w",
+            font=ctk.CTkFont("SF Pro Display", 14, "bold"),
+            text_color=TEXT1, anchor="w",
         )
         self._result_title.pack(side="left")
 
         ctk.CTkButton(
-            hdr, text="清除", width=48, height=24,
-            fg_color="transparent", border_width=1, border_color=SEP,
-            text_color=LABEL3, hover_color=CARD2,
-            font=ctk.CTkFont(size=11), corner_radius=8,
+            hdr, text="清除", width=52, height=26,
+            fg_color="transparent",
+            border_width=1, border_color=SURF3,
+            text_color=TEXT3,
+            hover_color=SURF2,
+            font=ctk.CTkFont("SF Pro Text", 12),
+            corner_radius=6,
             command=self._on_clear,
         ).pack(side="right")
 
-        ctk.CTkFrame(card, height=1, fg_color=SEP).pack(fill="x", padx=18, pady=(8, 0))
+        # Divider
+        ctk.CTkFrame(card, height=1, fg_color=SURF3, corner_radius=0).pack(
+            fill="x", padx=20, pady=(6, 0)
+        )
 
+        # Text area
         self._textbox = ctk.CTkTextbox(
             card,
-            font=ctk.CTkFont("Helvetica Neue", 13),
-            wrap="word", corner_radius=0, border_width=0,
-            fg_color="transparent", text_color=LABEL,
+            font=ctk.CTkFont("SF Pro Text", 14),
+            wrap="word",
+            corner_radius=0,
+            border_width=0,
+            fg_color="transparent",
+            text_color=TEXT1,
             state="disabled",
         )
-        self._textbox.pack(fill="both", expand=True, padx=6, pady=(4, 8))
+        self._textbox.pack(fill="both", expand=True, padx=8, pady=(4, 10))
         self._show_placeholder()
 
     # ── Action bar ───────────────────────────────────────────────────────────
 
     def _build_action_bar(self) -> None:
-        bar = ctk.CTkFrame(self, height=52, corner_radius=0, fg_color="transparent")
+        # Top separator
+        ctk.CTkFrame(self, height=1, fg_color=SURF3, corner_radius=0).pack(fill="x")
+
+        bar = ctk.CTkFrame(self, height=58, corner_radius=0, fg_color="transparent")
         bar.pack(fill="x")
         bar.pack_propagate(False)
 
         row = ctk.CTkFrame(bar, fg_color="transparent")
-        row.pack(expand=True, pady=10)
+        row.pack(expand=True, pady=13)
 
+        # Shared style for ghost buttons
         ghost = dict(
-            height=32, corner_radius=16,
-            font=ctk.CTkFont("Helvetica Neue", 12),
-            fg_color=CARD, border_width=1, border_color=SEP,
-            text_color=LABEL, hover_color=CARD2,
+            height=32, corner_radius=8,
+            font=ctk.CTkFont("SF Pro Text", 13),
+            fg_color=SURF1,
+            border_width=1, border_color=SURF3,
+            text_color=TEXT2,
+            hover_color=SURF2,
         )
 
-        ctk.CTkButton(row, text="📋  複製", width=88, command=self._on_copy, **ghost).pack(side="left", padx=4)
-        ctk.CTkButton(row, text="💾  存檔", width=88, command=self._on_save, **ghost).pack(side="left", padx=4)
+        ctk.CTkButton(row, text="📋  複製", width=90,
+                      command=self._on_copy, **ghost).pack(side="left", padx=4)
+        ctk.CTkButton(row, text="💾  存檔", width=90,
+                      command=self._on_save, **ghost).pack(side="left", padx=4)
 
-        # Auto-paste toggle chip
+        # Auto-paste chip
         self._ap_btn = ctk.CTkButton(
             row,
             text="⌨  自動貼上",
-            width=100, height=32, corner_radius=16,
-            font=ctk.CTkFont("Helvetica Neue", 12),
-            fg_color=INDIGO if self.cfg.auto_paste else CARD,
+            width=106, height=32, corner_radius=8,
+            font=ctk.CTkFont("SF Pro Text", 13),
+            fg_color=INDIGO if self.cfg.auto_paste else SURF1,
             border_width=1,
-            border_color=INDIGO if self.cfg.auto_paste else SEP,
-            text_color="#FFFFFF" if self.cfg.auto_paste else LABEL3,
-            hover_color=("#4745AC", "#504EC4"),
+            border_color=INDIGO if self.cfg.auto_paste else SURF3,
+            text_color=TEXT1 if self.cfg.auto_paste else TEXT3,
+            hover_color="#4745C8" if self.cfg.auto_paste else SURF2,
             command=self._toggle_auto_paste,
         )
         self._ap_btn.pack(side="left", padx=4)
 
+        # Ollama
         ollama_ok = self.ollama.is_available()
         self._ollama_btn = ctk.CTkButton(
-            row, text="✨  潤飾", width=88,
+            row, text="✨  潤飾", width=90,
             state="normal" if ollama_ok else "disabled",
-            fg_color=BLUE if ollama_ok else CARD,
-            hover_color=("#0062CC", "#0070E0") if ollama_ok else None,
+            fg_color=BLUE if ollama_ok else SURF1,
+            hover_color=BLUE_HV if ollama_ok else SURF2,
             border_width=1,
-            border_color=BLUE if ollama_ok else SEP,
-            text_color="#FFFFFF" if ollama_ok else LABEL3,
-            height=32, corner_radius=16,
-            font=ctk.CTkFont("Helvetica Neue", 12),
+            border_color=BLUE if ollama_ok else SURF3,
+            text_color=TEXT1 if ollama_ok else TEXT3,
+            height=32, corner_radius=8,
+            font=ctk.CTkFont("SF Pro Text", 13),
             command=self._on_ollama,
         )
         self._ollama_btn.pack(side="left", padx=4)
 
-        ctk.CTkButton(row, text="⚙  設定", width=88, command=self._open_settings, **ghost).pack(side="left", padx=4)
+        ctk.CTkButton(row, text="⚙  設定", width=90,
+                      command=self._open_settings, **ghost).pack(side="left", padx=4)
 
     # ── Status bar ───────────────────────────────────────────────────────────
 
     def _build_status_bar(self) -> None:
-        bar = ctk.CTkFrame(
-            self, height=30, corner_radius=0,
-            fg_color=CARD, border_color=SEP,
-        )
+        ctk.CTkFrame(self, height=1, fg_color=SURF3, corner_radius=0).pack(fill="x")
+        bar = ctk.CTkFrame(self, height=32, corner_radius=0, fg_color=SURF1)
         bar.pack(fill="x", side="bottom")
         bar.pack_propagate(False)
 
         inner = ctk.CTkFrame(bar, fg_color="transparent")
-        inner.pack(fill="x", padx=16, pady=5)
+        inner.pack(fill="x", padx=20, pady=6)
 
         self._status_dot = ctk.CTkLabel(
-            inner, text="●", text_color=GREEN[0], font=ctk.CTkFont(size=9),
+            inner, text="●", text_color=GREEN,
+            font=ctk.CTkFont(size=8),
         )
         self._status_dot.pack(side="left")
 
         self._status_label = ctk.CTkLabel(
-            inner, text=" 模型載入中…",
-            font=ctk.CTkFont("Helvetica Neue", 11), text_color=LABEL3,
+            inner, text="  模型載入中…",
+            font=ctk.CTkFont("SF Pro Text", 12),
+            text_color=TEXT3,
         )
         self._status_label.pack(side="left")
 
         self._timer_label = ctk.CTkLabel(
             inner, text="",
-            font=ctk.CTkFont("Helvetica Neue", 11, "bold"), text_color=RED[0],
+            font=ctk.CTkFont("SF Pro Text", 12, "bold"),
+            text_color=RED,
         )
         self._timer_label.pack(side="right")
 
         self._hotkey_status = ctk.CTkLabel(
             inner, text=self.cfg.format_hotkey_display(),
-            font=ctk.CTkFont("Helvetica Neue", 11), text_color=LABEL3,
+            font=ctk.CTkFont("SF Pro Text", 12),
+            text_color=TEXT3,
         )
-        self._hotkey_status.pack(side="right", padx=14)
+        self._hotkey_status.pack(side="right", padx=16)
 
     # ═══════════════════════════════════════════════════════════════════════
     #  STATE MACHINE
@@ -389,13 +413,13 @@ class AppWindow(ctk.CTkFrame):
     def _transition_to_recording(self) -> None:
         if self._state != "idle":
             return
-        self._state      = "recording"
-        self._rec_start  = time.perf_counter()
+        self._state       = "recording"
+        self._rec_start   = time.perf_counter()
         self._hotkey_held = True
         self._stream_samples = 0
         self._stream_chunks  = []
 
-        # ── Capture frontmost app for auto-paste ──────────────────────────
+        # Capture frontmost app for auto-paste
         if self.cfg.auto_paste:
             self._paste_target = _ap.get_frontmost_app()
             if self._paste_target and self._paste_target not in ("Python", "python3"):
@@ -413,13 +437,14 @@ class AppWindow(ctk.CTkFrame):
 
         self._record_btn.configure(
             text="●\n錄音中…",
-            fg_color=RED, hover_color=("#CC2E24", "#CC3630"),
+            fg_color=RED,
+            hover_color="#CC3630",
         )
-        self._btn_ring.configure(border_color=RED_BG)
+        self._btn_ring.configure(border_color=RED_DIM)
         self._model_menu.configure(state="disabled")
         self._lang_menu.configure(state="disabled")
-        self._status_dot.configure(text_color=RED[0])
-        self._status_label.configure(text=" 錄音中")
+        self._status_dot.configure(text_color=RED)
+        self._status_label.configure(text="  錄音中")
 
         self._pulse_btn()
         self._update_wave()
@@ -440,22 +465,23 @@ class AppWindow(ctk.CTkFrame):
 
         self._record_btn.configure(
             text=f"{SPINNER[0]}\n轉錄中…",
-            fg_color=ORANGE, hover_color=ORANGE,
+            fg_color=ORANGE,
+            hover_color=ORANGE,
             state="disabled",
         )
-        self._btn_ring.configure(border_color=("transparent", "transparent"))
+        self._btn_ring.configure(border_color=SURF3)
         self._target_label.configure(text="")
-        self._status_dot.configure(text_color=ORANGE[0])
-        self._status_label.configure(text=" 轉錄中，請稍候…")
+        self._status_dot.configure(text_color=ORANGE)
+        self._status_label.configure(text="  轉錄中，請稍候…")
         self._timer_label.configure(text="")
 
         self._draw_idle_wave()
         self._animate_spinner()
 
-        tail   = full_audio[self._stream_samples:]
-        model  = self._model_var.get()
-        lang   = self.cfg.get_whisper_language()
-        audio  = tail if len(tail) > 800 else full_audio
+        tail  = full_audio[self._stream_samples:]
+        model = self._model_var.get()
+        lang  = self.cfg.get_whisper_language()
+        audio = tail if len(tail) > 800 else full_audio
 
         threading.Thread(
             target=self._run_transcription,
@@ -468,17 +494,18 @@ class AppWindow(ctk.CTkFrame):
 
         self._record_btn.configure(
             text="🎤\n點擊錄音",
-            fg_color=GREEN, hover_color=("#2AAF50", "#28B84A"),
+            fg_color=GREEN,
+            hover_color="#28B84A",
             state="normal",
         )
-        self._btn_ring.configure(border_color=GREEN_BG)
+        self._btn_ring.configure(border_color=GREEN_DIM)
         self._model_menu.configure(state="normal")
         self._lang_menu.configure(state="normal")
         self._target_label.configure(text="")
 
         model = self._model_var.get()
-        self._status_dot.configure(text_color=GREEN[0])
-        self._status_label.configure(text=f" 就緒 ({model})")
+        self._status_dot.configure(text_color=GREEN)
+        self._status_label.configure(text=f"  就緒 ({model})")
 
         if result is not None:
             self._display_result(result)
@@ -493,8 +520,8 @@ class AppWindow(ctk.CTkFrame):
         self._stream_tick_id = None
         if self._state != "recording":
             return
-        snap       = self.recorder.get_buffer_snapshot()
-        new        = len(snap) - self._stream_samples
+        snap = self.recorder.get_buffer_snapshot()
+        new  = len(snap) - self._stream_samples
         if new < 4 * 16_000:
             self._stream_tick_id = self.after(1000, self._stream_tick)
             return
@@ -542,10 +569,12 @@ class AppWindow(ctk.CTkFrame):
         self._transition_to_idle(result)
         self._show_toast(f"✅  轉錄完成（{result.elapsed_seconds:.1f}s）")
 
-        text = result.text
-        valid = text and text not in ("（未偵測到語音內容）", "（沒有偵測到音訊，請確認麥克風是否正常運作）")
+        text  = result.text
+        valid = text and text not in (
+            "（未偵測到語音內容）",
+            "（沒有偵測到音訊，請確認麥克風是否正常運作）",
+        )
 
-        # Auto-copy (always, if configured)
         if self.cfg.auto_copy and valid:
             try:
                 import pyperclip
@@ -553,7 +582,6 @@ class AppWindow(ctk.CTkFrame):
             except Exception:
                 pass
 
-        # Auto-paste (inject into previously focused app)
         if self.cfg.auto_paste and valid and self._paste_target:
             target = self._paste_target
             self._paste_target = None
@@ -564,7 +592,6 @@ class AppWindow(ctk.CTkFrame):
             ).start()
 
     def _do_auto_paste(self, text: str, target: str) -> None:
-        """Background: copy to clipboard, activate target, ⌘V."""
         success = _ap.paste_to_app(text, target)
         if success:
             self.after(0, lambda: self._show_toast(f"⌨  已貼入 {target}"))
@@ -595,10 +622,9 @@ class AppWindow(ctk.CTkFrame):
     def _pulse_btn(self) -> None:
         if self._state != "recording":
             return
-        color = RED if self._pulse_hi else RED_BG
+        self._record_btn.configure(fg_color=RED if self._pulse_hi else "#8B1A15")
         self._pulse_hi = not self._pulse_hi
-        self._record_btn.configure(fg_color=color)
-        self.after(550, self._pulse_btn)
+        self.after(600, self._pulse_btn)
 
     def _update_wave(self) -> None:
         if self._state != "recording":
@@ -608,42 +634,42 @@ class AppWindow(ctk.CTkFrame):
         self.after(50, self._update_wave)
 
     def _draw_idle_wave(self) -> None:
-        c = self._wave_canvas
+        c  = self._wave_canvas
         c.delete("all")
         w  = c.winfo_width() or WIN_W - 80
-        h  = 68
-        bw = max(3, w // WAVE_BARS - 3)
+        h  = 72
+        bw = max(2, w // WAVE_BARS - 3)
         gp = w // WAVE_BARS
-        col = WAVE_IDLE[1] if _dark() else WAVE_IDLE[0]
         for i in range(WAVE_BARS):
             x  = i * gp + gp // 2
-            bh = 4 + int(6 * abs(math.sin(i * 0.22)))
+            bh = 3 + int(5 * abs(math.sin(i * 0.25)))
             y0 = (h - bh) // 2
-            c.create_rectangle(x, y0, x + bw, y0 + bh, fill=col, outline="")
+            c.create_rectangle(x, y0, x + bw, y0 + bh,
+                                fill=WAVE_IDLE_COL, outline="")
 
     def _draw_live_wave(self, rms: float) -> None:
         import random
-        c = self._wave_canvas
+        c  = self._wave_canvas
         c.delete("all")
         w  = c.winfo_width() or WIN_W - 80
-        h  = 68
-        bw = max(3, w // WAVE_BARS - 3)
+        h  = 72
+        bw = max(2, w // WAVE_BARS - 3)
         gp = w // WAVE_BARS
-        self._wave_phase = (self._wave_phase + 0.22) % (2 * math.pi)
+        self._wave_phase = (self._wave_phase + 0.20) % (2 * math.pi)
         for i in range(WAVE_BARS):
             x    = i * gp + gp // 2
-            wave = 0.5 + 0.5 * math.sin(self._wave_phase + i * 0.35)
-            jit  = random.uniform(0.85, 1.15)
-            bh   = max(4, int((h - 14) * rms * 5 * wave * jit))
-            bh   = min(bh, h - 14)
+            wave = 0.5 + 0.5 * math.sin(self._wave_phase + i * 0.32)
+            jit  = random.uniform(0.88, 1.12)
+            bh   = max(3, int((h - 12) * rms * 5 * wave * jit))
+            bh   = min(bh, h - 12)
             y0   = (h - bh) // 2
-            # Green → Red gradient by amplitude
-            t = min(1.0, rms * 7)
-            r = int(0x34 + t * (0xFF - 0x34))
-            g = int(0xC7 + t * (0x3B - 0xC7))
-            b = int(0x59 + t * (0x30 - 0x59))
+            # White → red-tinted by amplitude
+            t   = min(1.0, rms * 7)
+            r_c = int(0xF5 + t * (0xFF - 0xF5))
+            g_c = int(0xF5 + t * (0x45 - 0xF5))
+            b_c = int(0xF7 + t * (0x3A - 0xF7))
             c.create_rectangle(x, y0, x + bw, y0 + bh,
-                                fill=f"#{r:02X}{g:02X}{b:02X}", outline="")
+                                fill=f"#{r_c:02X}{g_c:02X}{b_c:02X}", outline="")
 
     def _animate_spinner(self) -> None:
         if self._state != "processing":
@@ -726,9 +752,10 @@ class AppWindow(ctk.CTkFrame):
         self.cfg.save()
         on = self.cfg.auto_paste
         self._ap_btn.configure(
-            fg_color=INDIGO if on else CARD,
-            border_color=INDIGO if on else SEP,
-            text_color="#FFFFFF" if on else LABEL3,
+            fg_color=INDIGO if on else SURF1,
+            border_color=INDIGO if on else SURF3,
+            text_color=TEXT1 if on else TEXT3,
+            hover_color="#4745C8" if on else SURF2,
         )
         self._show_toast("⌨  自動貼上已開啟" if on else "⌨  自動貼上已關閉")
 
@@ -758,7 +785,7 @@ class AppWindow(ctk.CTkFrame):
     def _on_model_change(self, value: str) -> None:
         self.cfg.model = value
         self.cfg.save()
-        self._status_label.configure(text=f" 就緒 ({value})")
+        self._status_label.configure(text=f"  就緒 ({value})")
 
     def _on_language_change(self, value: str) -> None:
         self.cfg.language = value
@@ -778,12 +805,12 @@ class AppWindow(ctk.CTkFrame):
         self._hotkey_status.configure(text=cfg.format_hotkey_display())
         self._model_var.set(cfg.model)
         self._lang_var.set(cfg.language)
-        # Sync auto-paste button
         on = cfg.auto_paste
         self._ap_btn.configure(
-            fg_color=INDIGO if on else CARD,
-            border_color=INDIGO if on else SEP,
-            text_color="#FFFFFF" if on else LABEL3,
+            fg_color=INDIGO if on else SURF1,
+            border_color=INDIGO if on else SURF3,
+            text_color=TEXT1 if on else TEXT3,
+            hover_color="#4745C8" if on else SURF2,
         )
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -805,14 +832,12 @@ class AppWindow(ctk.CTkFrame):
                 backend = self.transcriber.active_backend()
                 label   = "⚡ Metal" if backend == "mlx" else "CPU"
                 self.after(0, lambda: self._status_label.configure(
-                    text=f" 就緒 ({model} · {label})"
+                    text=f"  就緒 ({model} · {label})"
                 ))
-                self.after(0, lambda: self._status_dot.configure(
-                    text_color=GREEN[0]
-                ))
+                self.after(0, lambda: self._status_dot.configure(text_color=GREEN))
             except Exception:
-                self.after(0, lambda: self._status_label.configure(text=" 模型載入失敗"))
-                self.after(0, lambda: self._status_dot.configure(text_color=RED[0]))
+                self.after(0, lambda: self._status_label.configure(text="  模型載入失敗"))
+                self.after(0, lambda: self._status_dot.configure(text_color=RED))
 
         threading.Thread(target=_load, daemon=True).start()
 
@@ -828,15 +853,16 @@ class AppWindow(ctk.CTkFrame):
 
     def _show_toast(self, message: str) -> None:
         toast = ctk.CTkFrame(
-            self, corner_radius=14,
-            fg_color=CARD, border_width=1, border_color=SEP,
+            self, corner_radius=10,
+            fg_color=SURF2,
+            border_width=1, border_color=SURF3,
         )
         ctk.CTkLabel(
             toast, text=message,
-            font=ctk.CTkFont("Helvetica Neue", 12),
-            text_color=LABEL, padx=16, pady=9,
+            font=ctk.CTkFont("SF Pro Text", 13),
+            text_color=TEXT1, padx=18, pady=10,
         ).pack()
-        toast.place(relx=1.0, rely=1.0, x=-18, y=-50, anchor="se")
+        toast.place(relx=1.0, rely=1.0, x=-20, y=-52, anchor="se")
         self.after(2800, toast.destroy)
 
     def on_close(self) -> None:
@@ -855,8 +881,9 @@ class SettingsWindow(ctk.CTkToplevel):
         self.cfg         = Config(**cfg.__dict__)
         self._on_save_cb = on_save_cb
         self.title("設定")
-        self.geometry("420x560")
+        self.geometry("440x580")
         self.resizable(False, False)
+        self.configure(fg_color=BG)
         self.grab_set()
         self._build()
 
@@ -866,15 +893,15 @@ class SettingsWindow(ctk.CTkToplevel):
 
         def section(title: str) -> ctk.CTkFrame:
             ctk.CTkLabel(
-                scroll, text=title,
-                font=ctk.CTkFont("Helvetica Neue", 11, "bold"),
-                text_color=LABEL3, anchor="w",
-            ).pack(fill="x", padx=16, pady=(20, 6))
+                scroll, text=title.upper(),
+                font=ctk.CTkFont("SF Pro Text", 11),
+                text_color=TEXT3, anchor="w",
+            ).pack(fill="x", padx=20, pady=(22, 6))
             f = ctk.CTkFrame(
-                scroll, corner_radius=16,
-                fg_color=CARD, border_color=SEP, border_width=1,
+                scroll, corner_radius=12,
+                fg_color=SURF1,
             )
-            f.pack(fill="x", padx=12, pady=(0, 4))
+            f.pack(fill="x", padx=16, pady=(0, 4))
             return f
 
         def row(parent, label: str, widget_fn) -> None:
@@ -883,13 +910,13 @@ class SettingsWindow(ctk.CTkToplevel):
             r.pack_propagate(False)
             ctk.CTkLabel(
                 r, text=label, anchor="w",
-                font=ctk.CTkFont("Helvetica Neue", 13),
-                text_color=LABEL,
+                font=ctk.CTkFont("SF Pro Text", 14),
+                text_color=TEXT1,
             ).pack(side="left")
             widget_fn(r)
 
         def sep_line(parent) -> None:
-            ctk.CTkFrame(parent, height=1, fg_color=SEP).pack(
+            ctk.CTkFrame(parent, height=1, fg_color=SURF3).pack(
                 fill="x", padx=16, pady=0
             )
 
@@ -901,15 +928,21 @@ class SettingsWindow(ctk.CTkToplevel):
             ctk.CTkOptionMenu(
                 r, values=list(MODEL_INFO.keys()),
                 variable=self._model_var,
-                width=100, height=28, corner_radius=8,
+                width=148, height=30, corner_radius=8,
+                fg_color=SURF2, button_color=SURF2,
+                button_hover_color=SURF3,
+                dropdown_fg_color=SURF1,
+                text_color=TEXT1,
+                font=ctk.CTkFont("SF Pro Text", 13),
                 command=self._on_model_preview,
             ).pack(side="right")
 
         row(stt, "模型大小", model_row)
         self._model_desc = ctk.CTkLabel(
             stt, text=MODEL_INFO.get(self.cfg.model, ""),
-            font=ctk.CTkFont(size=11), text_color=LABEL3,
-            wraplength=360, anchor="w",
+            font=ctk.CTkFont("SF Pro Text", 11),
+            text_color=TEXT3,
+            wraplength=380, anchor="w",
         )
         self._model_desc.pack(fill="x", padx=16, pady=(0, 10))
         sep_line(stt)
@@ -920,7 +953,12 @@ class SettingsWindow(ctk.CTkToplevel):
             ctk.CTkOptionMenu(
                 r, values=list(LANGUAGE_OPTIONS.keys()),
                 variable=self._lang_var,
-                width=110, height=28, corner_radius=8,
+                width=112, height=30, corner_radius=8,
+                fg_color=SURF2, button_color=SURF2,
+                button_hover_color=SURF3,
+                dropdown_fg_color=SURF1,
+                text_color=TEXT1,
+                font=ctk.CTkFont("SF Pro Text", 13),
             ).pack(side="right")
 
         row(stt, "辨識語言", lang_row)
@@ -933,7 +971,7 @@ class SettingsWindow(ctk.CTkToplevel):
 
         ctk.CTkLabel(
             hk_row, text="全域快捷鍵", anchor="w",
-            font=ctk.CTkFont("Helvetica Neue", 13), text_color=LABEL,
+            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT1,
         ).pack(side="left")
 
         hk_r = ctk.CTkFrame(hk_row, fg_color="transparent")
@@ -941,39 +979,49 @@ class SettingsWindow(ctk.CTkToplevel):
 
         self._hk_label = ctk.CTkLabel(
             hk_r, text=format_hotkey(self.cfg.hotkey),
-            font=ctk.CTkFont("Helvetica Neue", 12, "bold"),
-            fg_color=CARD2, text_color=LABEL,
-            corner_radius=8, padx=10, pady=4,
+            font=ctk.CTkFont("SF Pro Text", 13, "bold"),
+            fg_color=SURF2, text_color=TEXT1,
+            corner_radius=8, padx=12, pady=4,
         )
         self._hk_label.pack(side="left", padx=(0, 8))
 
         ctk.CTkButton(
             hk_r, text="重新綁定", width=80, height=28, corner_radius=8,
-            fg_color=BLUE_BG, hover_color=BLUE,
-            text_color=BLUE, command=self._rebind_hotkey,
+            fg_color=BLUE_DIM,
+            hover_color=BLUE,
+            border_width=1, border_color=BLUE,
+            text_color=BLUE_HV,
+            font=ctk.CTkFont("SF Pro Text", 12),
+            command=self._rebind_hotkey,
         ).pack(side="left")
 
         # ── 輸出偏好 ──────────────────────────────────────────────────────
         out = section("輸出偏好")
-
-        self._append_var   = ctk.BooleanVar(value=self.cfg.append_results)
-        self._autocopy_var = ctk.BooleanVar(value=self.cfg.auto_copy)
+        self._append_var    = ctk.BooleanVar(value=self.cfg.append_results)
+        self._autocopy_var  = ctk.BooleanVar(value=self.cfg.auto_copy)
         self._autopaste_var = ctk.BooleanVar(value=self.cfg.auto_paste)
 
-        def sw(var, accent=None):
+        sw_style = dict(
+            progress_color=BLUE,
+            button_color=TEXT1,
+            button_hover_color=TEXT2,
+            fg_color=SURF3,
+        )
+
+        def make_sw(var, accent=None):
+            s = dict(sw_style)
+            if accent:
+                s["progress_color"] = accent
             def fn(r):
-                ctk.CTkSwitch(
-                    r, text="", variable=var,
-                    onvalue=True, offvalue=False,
-                    progress_color=accent or BLUE[0],
-                ).pack(side="right")
+                ctk.CTkSwitch(r, text="", variable=var,
+                              onvalue=True, offvalue=False, **s).pack(side="right")
             return fn
 
-        row(out, "追加錄音結果", sw(self._append_var))
+        row(out, "追加錄音結果", make_sw(self._append_var))
         sep_line(out)
-        row(out, "轉錄後自動複製", sw(self._autocopy_var))
+        row(out, "轉錄後自動複製", make_sw(self._autocopy_var))
         sep_line(out)
-        row(out, "語音轉文字後自動貼上 ⌨", sw(self._autopaste_var, INDIGO[0]))
+        row(out, "語音轉文字後自動貼上 ⌨", make_sw(self._autopaste_var, INDIGO))
 
         # ── 關於 ──────────────────────────────────────────────────────────
         about = section("關於")
@@ -981,40 +1029,54 @@ class SettingsWindow(ctk.CTkToplevel):
             ("Whisper 快取", "~/.cache/huggingface"),
             ("設定檔", "~/.whisper_app/config.json"),
         ]:
-            pr = ctk.CTkFrame(about, fg_color="transparent", height=36)
+            pr = ctk.CTkFrame(about, fg_color="transparent", height=38)
             pr.pack(fill="x", padx=16, pady=2)
             pr.pack_propagate(False)
             ctk.CTkLabel(pr, text=label, anchor="w",
-                         font=ctk.CTkFont(size=12), text_color=LABEL).pack(side="left")
+                         font=ctk.CTkFont("SF Pro Text", 13),
+                         text_color=TEXT1).pack(side="left")
             ctk.CTkLabel(pr, text=path, anchor="e",
-                         font=ctk.CTkFont(size=11), text_color=LABEL3).pack(side="right")
+                         font=ctk.CTkFont("SF Pro Text", 11),
+                         text_color=TEXT3).pack(side="right")
 
         ctk.CTkButton(
             about, text="開啟設定資料夾", width=140, height=28,
-            fg_color="transparent", border_width=1, border_color=SEP,
-            text_color=BLUE, hover_color=BLUE_BG,
-            font=ctk.CTkFont(size=12), corner_radius=8,
+            fg_color="transparent",
+            border_width=1, border_color=SURF3,
+            text_color=BLUE_HV,
+            hover_color=SURF2,
+            font=ctk.CTkFont("SF Pro Text", 12),
+            corner_radius=8,
             command=lambda: subprocess.run(
                 ["open", os.path.expanduser("~/.whisper_app")]
             ),
-        ).pack(anchor="w", padx=16, pady=(0, 12))
+        ).pack(anchor="w", padx=16, pady=(0, 14))
 
         # ── Buttons ───────────────────────────────────────────────────────
-        btn_bar = ctk.CTkFrame(self, fg_color="transparent", height=56)
-        btn_bar.pack(fill="x", side="bottom", padx=16, pady=8)
+        ctk.CTkFrame(self, height=1, fg_color=SURF3, corner_radius=0).pack(fill="x")
+        btn_bar = ctk.CTkFrame(self, height=60, fg_color=SURF1, corner_radius=0)
+        btn_bar.pack(fill="x", side="bottom")
         btn_bar.pack_propagate(False)
 
-        ctk.CTkButton(
-            btn_bar, text="取消", width=100, height=36, corner_radius=10,
-            fg_color=CARD2, text_color=LABEL, hover_color=CARD,
-            command=self.destroy,
-        ).pack(side="right", padx=(6, 0))
+        inner = ctk.CTkFrame(btn_bar, fg_color="transparent")
+        inner.pack(side="right", padx=20, pady=12)
 
         ctk.CTkButton(
-            btn_bar, text="儲存", width=100, height=36, corner_radius=10,
-            fg_color=BLUE, hover_color=("#0062CC", "#0070E0"),
+            inner, text="取消", width=88, height=36, corner_radius=8,
+            fg_color=SURF2, text_color=TEXT2,
+            hover_color=SURF3,
+            border_width=1, border_color=SURF3,
+            font=ctk.CTkFont("SF Pro Text", 14),
+            command=self.destroy,
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            inner, text="儲存", width=88, height=36, corner_radius=8,
+            fg_color=BLUE, hover_color=BLUE_HV,
+            text_color=TEXT1,
+            font=ctk.CTkFont("SF Pro Text", 14, "bold"),
             command=self._save,
-        ).pack(side="right")
+        ).pack(side="left")
 
     def _on_model_preview(self, value: str) -> None:
         self._model_desc.configure(text=MODEL_INFO.get(value, ""))
@@ -1047,37 +1109,48 @@ class HotkeyBindDialog(ctk.CTkToplevel):
         self._on_apply_cb = on_apply_cb
         self._captured: Optional[str] = None
         self.title("設定快捷鍵")
-        self.geometry("320x210")
+        self.geometry("340x220")
         self.resizable(False, False)
+        self.configure(fg_color=BG)
         self.grab_set()
         self._build()
         self._start_capture()
 
     def _build(self) -> None:
         ctk.CTkLabel(
-            self, text="請按下想要的快捷鍵組合\n（按下後鬆開確認）",
-            font=ctk.CTkFont("Helvetica Neue", 13), justify="center",
-        ).pack(pady=(24, 10))
+            self,
+            text="請按下想要的快捷鍵組合\n（按下後鬆開確認）",
+            font=ctk.CTkFont("SF Pro Text", 14),
+            text_color=TEXT2,
+            justify="center",
+        ).pack(pady=(28, 12))
 
         self._detect_label = ctk.CTkLabel(
             self, text="等待按鍵…",
-            font=ctk.CTkFont("Helvetica Neue", 16, "bold"),
-            fg_color=CARD2, text_color=LABEL,
-            corner_radius=10, padx=20, pady=10,
+            font=ctk.CTkFont("SF Pro Display", 20, "bold"),
+            fg_color=SURF2, text_color=TEXT1,
+            corner_radius=10, padx=24, pady=12,
         )
-        self._detect_label.pack(pady=8)
+        self._detect_label.pack(pady=4)
 
         bar = ctk.CTkFrame(self, fg_color="transparent")
-        bar.pack(pady=12)
+        bar.pack(pady=16)
 
         ctk.CTkButton(
-            bar, text="取消", width=90, height=32, corner_radius=10,
-            fg_color=CARD2, text_color=LABEL, command=self.destroy,
+            bar, text="取消", width=90, height=32, corner_radius=8,
+            fg_color=SURF2, text_color=TEXT2,
+            hover_color=SURF3,
+            border_width=1, border_color=SURF3,
+            font=ctk.CTkFont("SF Pro Text", 13),
+            command=self.destroy,
         ).pack(side="left", padx=6)
 
         self._apply_btn = ctk.CTkButton(
-            bar, text="確認套用", width=90, height=32, corner_radius=10,
-            state="disabled", fg_color=BLUE, hover_color=("#0062CC", "#0070E0"),
+            bar, text="確認套用", width=90, height=32, corner_radius=8,
+            state="disabled",
+            fg_color=BLUE, hover_color=BLUE_HV,
+            text_color=TEXT1,
+            font=ctk.CTkFont("SF Pro Text", 13, "bold"),
             command=self._apply,
         )
         self._apply_btn.pack(side="left", padx=6)
@@ -1108,14 +1181,16 @@ class AccessibilityDialog(ctk.CTkToplevel):
     def __init__(self, parent) -> None:
         super().__init__(parent)
         self.title("需要權限")
-        self.geometry("480x290")
+        self.geometry("500x300")
         self.resizable(False, False)
+        self.configure(fg_color=BG)
         self.grab_set()
 
         ctk.CTkLabel(
             self, text="🔐  需要「輔助使用」權限",
-            font=ctk.CTkFont("Helvetica Neue", 16, "bold"), text_color=LABEL,
-        ).pack(pady=(28, 10))
+            font=ctk.CTkFont("SF Pro Display", 17, "bold"),
+            text_color=TEXT1,
+        ).pack(pady=(32, 12))
 
         ctk.CTkLabel(
             self,
@@ -1127,21 +1202,28 @@ class AccessibilityDialog(ctk.CTkToplevel):
                 "3. 加入並允許 Terminal 或 python3\n"
                 "4. 重新啟動此 App"
             ),
-            font=ctk.CTkFont("Helvetica Neue", 13),
-            text_color=LABEL, justify="left",
-        ).pack(padx=28, pady=4)
+            font=ctk.CTkFont("SF Pro Text", 13),
+            text_color=TEXT2,
+            justify="left",
+        ).pack(padx=32, pady=4)
 
         bar = ctk.CTkFrame(self, fg_color="transparent")
-        bar.pack(pady=16)
+        bar.pack(pady=20)
 
         ctk.CTkButton(
-            bar, text="跳過", width=120, height=32, corner_radius=10,
-            fg_color=CARD2, text_color=LABEL, command=self.destroy,
+            bar, text="跳過", width=110, height=34, corner_radius=8,
+            fg_color=SURF2, text_color=TEXT2,
+            hover_color=SURF3,
+            border_width=1, border_color=SURF3,
+            font=ctk.CTkFont("SF Pro Text", 13),
+            command=self.destroy,
         ).pack(side="left", padx=6)
 
         ctk.CTkButton(
-            bar, text="開啟系統設定", width=130, height=32, corner_radius=10,
-            fg_color=BLUE, hover_color=("#0062CC", "#0070E0"),
+            bar, text="開啟系統設定", width=130, height=34, corner_radius=8,
+            fg_color=BLUE, hover_color=BLUE_HV,
+            text_color=TEXT1,
+            font=ctk.CTkFont("SF Pro Text", 13, "bold"),
             command=self._open_prefs,
         ).pack(side="left", padx=6)
 
@@ -1151,3 +1233,12 @@ class AccessibilityDialog(ctk.CTkToplevel):
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
         ])
         self.destroy()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Internal helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cfg_val(v):
+    """Return value as-is (helper to keep topbar loop readable)."""
+    return v
