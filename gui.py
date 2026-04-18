@@ -544,23 +544,18 @@ class AppWindow(ctk.CTkFrame):
     #  TRANSCRIPTION
     # ═══════════════════════════════════════════════════════════════════════
 
-    _FAST_THRESHOLD = 8 * 16_000
-
     def _run_transcription(self, audio, model: str, lang) -> None:
         """最終轉錄：一律用使用者選擇的模型跑完整錄音。
 
         `_stream_chunks` 僅作為「完整轉錄失敗」時的 fallback，
         **不再與完整結果拼接**（否則會發生內容重複）。
+
+        已移除先前的 fast-path 短音訊加速：短音訊也用使用者選擇的模型
+        跑完整 `transcribe()`，享受寬鬆 VAD + beam_size=5 + initial_prompt
+        的準確度優勢。Apple Silicon + MLX 下 large-v3-turbo 的延遲足夠低
+        （3s 音訊約 0.4s），不需要走 small 模型換速度。
         """
-        # 短音訊也用使用者選擇的模型，維持一致的準確度。
-        # 對 8 秒以下音訊，若無串流片段可用 transcribe_fast 加速；
-        # 但要傳入 model_size 讓 fast path 也跟隨使用者設定。
-        if len(audio) <= self._FAST_THRESHOLD and not self._stream_chunks:
-            result = self.transcriber.transcribe_fast(
-                audio, language=lang, model_size=model
-            )
-        else:
-            result = self.transcriber.transcribe(audio, model_size=model, language=lang)
+        result = self.transcriber.transcribe(audio, model_size=model, language=lang)
 
         # Fallback：完整轉錄判空/無語音時，才用串流累積的片段
         if result.text in ("", "（未偵測到語音內容）") and self._stream_chunks:
@@ -704,9 +699,13 @@ class AppWindow(ctk.CTkFrame):
     #  EVENT HANDLERS
     # ═══════════════════════════════════════════════════════════════════════
 
+    # Tail padding：停錄音前多等 N 毫秒，抓住使用者說完尾字前放開熱鍵/點按鈕
+    # 的短暫餘音，避免最後一兩個字被切掉。
+    TAIL_PADDING_MS = 300
+
     def _on_record_btn(self) -> None:
         if   self._state == "idle":      self._transition_to_recording()
-        elif self._state == "recording": self._transition_to_processing()
+        elif self._state == "recording": self.after(self.TAIL_PADDING_MS, self._try_stop)
 
     def _hotkey_press(self) -> None:
         self.after(0, self._on_hotkey_press)
@@ -719,6 +718,12 @@ class AppWindow(ctk.CTkFrame):
             self._transition_to_recording()
 
     def _on_hotkey_release(self) -> None:
+        if self._state == "recording":
+            # Tail padding — 多錄 300ms 再停，抓尾音避免漏字
+            self.after(self.TAIL_PADDING_MS, self._try_stop)
+
+    def _try_stop(self) -> None:
+        """延遲後真的停錄音。只在仍為 recording 狀態才執行（防重入）。"""
         if self._state == "recording":
             self._transition_to_processing()
 

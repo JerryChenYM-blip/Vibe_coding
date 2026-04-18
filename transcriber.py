@@ -87,11 +87,35 @@ def _is_silence(audio) -> bool:
 
 
 def _is_hallucination(text: str) -> bool:
-    """Return True if the text looks like a Whisper hallucination."""
+    """Return True if the text looks like a Whisper hallucination.
+
+    寬容策略：只對「短句（< 20 字）」才用子字串檢查。長句子即使包含
+    「訂閱」「感謝」等常見幻覺關鍵字，也視為正當句子保留 — 避免誤殺。
+    """
     if not text:
         return True
     lower = text.lower().replace(" ", "").replace("\n", "")
+    # 長句（≥ 20 字）免檢查 — 幾乎不會有 20 字以上的純幻覺
+    if len(lower) >= 20:
+        return False
     return any(h.lower().replace(" ", "") in lower for h in _HALLUCINATIONS)
+
+
+def _normalize_volume(audio, target_peak: float = 0.9, min_peak: float = 0.5):
+    """若音訊峰值過小（<min_peak）則線性放大到 target_peak。
+
+    避免：使用者小聲說話時峰值過低 → VAD 誤判為靜音 → 整段被丟。
+    防爆：放大倍率上限 12x，避免把底噪放大到爆音。
+    """
+    import numpy as np
+    if audio.size == 0:
+        return audio
+    peak = float(np.abs(audio).max())
+    # 峰值太小（純噪音）或已足夠大（正常音量）就不動
+    if peak <= 0.005 or peak >= min_peak:
+        return audio
+    scale = min(target_peak / peak, 12.0)
+    return (audio * scale).astype(audio.dtype)
 
 
 @dataclass
@@ -144,6 +168,15 @@ class Transcriber:
         if audio.max() > 1.0:
             audio = audio / 32768.0
 
+        # 音量自動正規化：小聲說話時避免 VAD 把整段判為靜音
+        pre_peak = float(np.abs(audio).max()) if audio.size else 0.0
+        audio = _normalize_volume(audio)
+        post_peak = float(np.abs(audio).max()) if audio.size else 0.0
+        if post_peak > pre_peak * 1.5:
+            print(
+                f"WHISPER: Volume normalized (peak {pre_peak:.3f} → {post_peak:.3f})"
+            )
+
         duration = len(audio) / 16_000
         t0 = time.perf_counter()
         print(f"WHISPER: Starting transcription. Backend={BACKEND}, Model={model_size}, Lang={language}, AudioDuration={duration:.2f}s")
@@ -171,8 +204,24 @@ class Transcriber:
         result.elapsed_seconds = time.perf_counter() - t0
         print(f"WHISPER: Inference finished in {result.elapsed_seconds:.2f}s. RTF={(result.elapsed_seconds/duration) if duration>0 else 0:.3f}")
 
-        # Guard: replace known hallucinations with a clear message
-        if _is_hallucination(result.text):
+        # 幻覺過濾：優先逐段過濾（保留合法段），沒 segments 資訊才退回整段檢查
+        if result.segments:
+            kept = [
+                s for s in result.segments
+                if not _is_hallucination(s.get("text", "").strip())
+            ]
+            removed = len(result.segments) - len(kept)
+            if removed > 0:
+                print(
+                    f"WHISPER: Guard - Removed {removed}/{len(result.segments)} "
+                    f"hallucination segment(s), kept {len(kept)}."
+                )
+                result.segments = kept
+                if kept:
+                    result.text = "".join(s["text"].strip() for s in kept).strip()
+                else:
+                    result.text = "（未偵測到語音內容）"
+        elif _is_hallucination(result.text):
             print(f"WHISPER: Guard - Detected hallucination in result: '{result.text[:50]}...'")
             result.text = "（未偵測到語音內容）"
 
@@ -200,6 +249,9 @@ class Transcriber:
         if audio.max() > 1.0:
             audio = audio / 32768.0
 
+        # 音量正規化 — 和 transcribe() 同策略
+        audio = _normalize_volume(audio)
+
         duration = len(audio) / 16_000
         t0 = time.perf_counter()
 
@@ -218,10 +270,12 @@ class Transcriber:
                 initial_prompt=prompts.WHISPER_INITIAL_PROMPT,
                 condition_on_previous_text=False,
                 vad_filter=True,
+                # 寬鬆 VAD：threshold 降低讓小聲也偵測到；silence 拉長避免句中停頓
+                # 被切段；min_speech 降到 50ms 保留短詞。
                 vad_parameters={
-                    "threshold": 0.6,
-                    "min_silence_duration_ms": 200,
-                    "min_speech_duration_ms": 100,
+                    "threshold": 0.3,
+                    "min_silence_duration_ms": 800,
+                    "min_speech_duration_ms": 50,
                 },
                 word_timestamps=False,
                 temperature=0,
@@ -351,6 +405,12 @@ class Transcriber:
     ) -> TranscriptionResult:
         model = self._ensure_model(model_size)
 
+        # 長音訊（≥ 30s）開啟 condition_on_previous_text，讓模型利用前文
+        # 上下文，減少長錄音的斷裂與不一致。短音訊維持關閉，避免 bad
+        # start 造成 cascading error。
+        long_audio = len(audio) >= 30 * 16_000
+        condition = long_audio
+
         with self._transcription_lock:
             segments_iter, info = model.transcribe(
                 audio,
@@ -358,12 +418,16 @@ class Transcriber:
                 beam_size=5,
                 repetition_penalty=1.1,
                 initial_prompt=prompts.WHISPER_INITIAL_PROMPT,
-                condition_on_previous_text=False,
+                condition_on_previous_text=condition,
                 vad_filter=True,
+                # 寬鬆 VAD — 避免漏字/漏段：
+                #   threshold 0.5→0.3：更包容弱訊號
+                #   silence 300→800ms：句中小停頓不切段
+                #   speech 150→50ms：短詞（如「是」「對」）也保留
                 vad_parameters={
-                    "threshold": 0.5,
-                    "min_silence_duration_ms": 300,
-                    "min_speech_duration_ms": 150,
+                    "threshold": 0.3,
+                    "min_silence_duration_ms": 800,
+                    "min_speech_duration_ms": 50,
                 },
                 word_timestamps=False,
                 temperature=0,
