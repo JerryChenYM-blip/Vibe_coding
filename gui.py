@@ -547,22 +547,32 @@ class AppWindow(ctk.CTkFrame):
     _FAST_THRESHOLD = 8 * 16_000
 
     def _run_transcription(self, audio, model: str, lang) -> None:
+        """最終轉錄：一律用使用者選擇的模型跑完整錄音。
+
+        `_stream_chunks` 僅作為「完整轉錄失敗」時的 fallback，
+        **不再與完整結果拼接**（否則會發生內容重複）。
+        """
+        # 短音訊也用使用者選擇的模型，維持一致的準確度。
+        # 對 8 秒以下音訊，若無串流片段可用 transcribe_fast 加速；
+        # 但要傳入 model_size 讓 fast path 也跟隨使用者設定。
         if len(audio) <= self._FAST_THRESHOLD and not self._stream_chunks:
-            result = self.transcriber.transcribe_fast(audio, language=lang)
+            result = self.transcriber.transcribe_fast(
+                audio, language=lang, model_size=model
+            )
         else:
             result = self.transcriber.transcribe(audio, model_size=model, language=lang)
 
-        prior = list(self._stream_chunks)
-        if prior:
-            tail = result.text if result.text != "（未偵測到語音內容）" else ""
-            combined = "".join(prior) + tail
-            result = result.__class__(
-                text=combined.strip() or "（未偵測到語音內容）",
-                language=result.language,
-                duration_seconds=result.duration_seconds,
-                elapsed_seconds=result.elapsed_seconds,
-                segments=result.segments,
-            )
+        # Fallback：完整轉錄判空/無語音時，才用串流累積的片段
+        if result.text in ("", "（未偵測到語音內容）") and self._stream_chunks:
+            combined = "".join(self._stream_chunks).strip()
+            if combined:
+                result = result.__class__(
+                    text=combined,
+                    language=result.language,
+                    duration_seconds=result.duration_seconds,
+                    elapsed_seconds=result.elapsed_seconds,
+                    segments=result.segments,
+                )
         self.after(0, self._on_transcription_done, result)
 
     def _on_transcription_done(self, result: TranscriptionResult) -> None:
@@ -799,19 +809,40 @@ class AppWindow(ctk.CTkFrame):
         SettingsWindow(self, self.cfg, self._on_settings_saved)
 
     def _on_settings_saved(self, cfg: Config) -> None:
-        self.cfg = cfg
-        self._start_hotkey_listener()
-        self._hotkey_hint.configure(text=f"按住 {cfg.format_hotkey_display()} 即時錄音")
-        self._hotkey_status.configure(text=cfg.format_hotkey_display())
-        self._model_var.set(cfg.model)
-        self._lang_var.set(cfg.language)
-        on = cfg.auto_paste
-        self._ap_btn.configure(
-            fg_color=INDIGO if on else SURF1,
-            border_color=INDIGO if on else SURF3,
-            text_color=TEXT1 if on else TEXT3,
-            hover_color="#4745C8" if on else SURF2,
-        )
+        """設定視窗存檔後的回呼。
+
+        拆分為兩階段，避免在設定視窗 destroy 的同一個 Tk 事件迴圈 tick 內
+        重啟 pynput Listener — 這會在 macOS Cocoa 層發生 CFRunLoop race，
+        造成程式閃退（無 Python traceback）。
+        """
+        try:
+            old_hotkey = self.cfg.hotkey
+            self.cfg = cfg
+
+            # 立即可做的 UI 更新（純 Tk，無 native thread 風險）
+            self._hotkey_hint.configure(text=f"按住 {cfg.format_hotkey_display()} 即時錄音")
+            self._hotkey_status.configure(text=cfg.format_hotkey_display())
+            self._model_var.set(cfg.model)
+            self._lang_var.set(cfg.language)
+            self._status_label.configure(text=f"  就緒 ({cfg.model})")
+
+            on = cfg.auto_paste
+            self._ap_btn.configure(
+                fg_color=INDIGO if on else SURF1,
+                border_color=INDIGO if on else SURF3,
+                text_color=TEXT1 if on else TEXT3,
+                hover_color="#4745C8" if on else SURF2,
+            )
+
+            # 延遲到下一個事件迴圈 tick 再重啟熱鍵，讓設定視窗完成 destroy、
+            # 讓 pynput 舊的 Listener 徹底 teardown，避免 macOS native crash。
+            # 同時只在熱鍵真的變動時才 restart（減少不必要的 teardown）。
+            if cfg.hotkey != old_hotkey:
+                self.after(100, self._start_hotkey_listener)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            self._show_toast("⚠️  套用設定時發生錯誤（請查看終端日誌）")
 
     # ═══════════════════════════════════════════════════════════════════════
     #  HELPERS
@@ -1089,14 +1120,27 @@ class SettingsWindow(ctk.CTkToplevel):
         self._hk_label.configure(text=format_hotkey(combo))
 
     def _save(self) -> None:
-        self.cfg.model          = self._model_var.get()
-        self.cfg.language       = self._lang_var.get()
-        self.cfg.append_results = self._append_var.get()
-        self.cfg.auto_copy      = self._autocopy_var.get()
-        self.cfg.auto_paste     = self._autopaste_var.get()
-        self.cfg.save()
-        self._on_save_cb(self.cfg)
-        self.destroy()
+        """收集表單值、寫入設定，再通知主視窗並關閉設定視窗。
+
+        任何例外都必須印出 traceback，避免 macOS 下閃退無紀錄。
+        """
+        try:
+            self.cfg.model          = self._model_var.get()
+            self.cfg.language       = self._lang_var.get()
+            self.cfg.append_results = self._append_var.get()
+            self.cfg.auto_copy      = self._autocopy_var.get()
+            self.cfg.auto_paste     = self._autopaste_var.get()
+            self.cfg.save()
+            self._on_save_cb(self.cfg)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        finally:
+            # 無論存檔成敗都關閉視窗，避免使用者被卡住
+            try:
+                self.destroy()
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────

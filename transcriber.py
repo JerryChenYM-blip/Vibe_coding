@@ -38,9 +38,12 @@ def _detect_backend() -> str:
 BACKEND = _detect_backend()
 
 # MLX model IDs (mapped from faster-whisper model size names)
+# 注意：tiny/base 的 `mlx-community/whisper-tiny`、`whisper-base` repo
+# 已於 2026 年改名/下架，會回 401。全部統一使用 `-mlx-4bit` 量化版本，
+# 若 MLX 載入失敗，transcribe() 會自動 fallback 到 CTranslate2 CPU。
 _MLX_MODEL_MAP: dict[str, str] = {
-    "tiny":           "mlx-community/whisper-tiny",
-    "base":           "mlx-community/whisper-base",
+    "tiny":           "mlx-community/whisper-tiny-mlx-4bit",
+    "base":           "mlx-community/whisper-base-mlx-4bit",
     "small":          "mlx-community/whisper-small-mlx-4bit",
     "medium":         "mlx-community/whisper-medium-mlx-4bit",
     "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
@@ -179,9 +182,13 @@ class Transcriber:
         self,
         audio,
         language: Optional[str] = None,
+        model_size: str = "small",
     ) -> TranscriptionResult:
         """
-        Low-latency transcription optimised for short clips (≤ 8 s).
+        Low-latency transcription optimised for short clips (≤ 8 s) and
+        streaming previews. Always uses the CTranslate2 CPU backend with
+        greedy decoding. Default model is "small" to keep streaming fast;
+        callers can override for higher accuracy.
         """
         import numpy as np
 
@@ -201,7 +208,7 @@ class Transcriber:
             return TranscriptionResult(text="（未偵測到語音內容）", language="",
                                        duration_seconds=duration, elapsed_seconds=0.0)
 
-        model = self._ensure_model("small")
+        model = self._ensure_model(model_size)
 
         with self._transcription_lock:
             segments_iter, info = model.transcribe(
