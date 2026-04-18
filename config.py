@@ -10,6 +10,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from logger import get_logger, log_error
+
+log = get_logger("config")
+
 CONFIG_DIR = Path.home() / ".whisper_app"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
@@ -60,16 +64,21 @@ class Config:
             
             # 安全檢查：強制修復會導致 macOS 衝突的熱鍵
             if cfg.hotkey == "cmd+shift+space":
-                print("CONFIG: Detecting unstable hotkey 'cmd+shift+space', auto-resetting to 'cmd+alt+r'")
+                log.warning(
+                    "CONFIG: Detecting unstable hotkey 'cmd+shift+space', "
+                    "auto-resetting to 'cmd+alt+r'"
+                )
                 cfg.hotkey = "cmd+alt+r"
                 cfg.save()
-                
+
             return cfg
         except Exception as e:
-            print(f"CRITICAL: Config corrupt ({e}). Backing up and resetting.")
+            log.critical(f"CONFIG: corrupt ({e}). Backing up and resetting.")
+            log_error("config_corrupt", path=str(CONFIG_PATH))
             try:
                 CONFIG_PATH.rename(CONFIG_PATH.with_suffix(".json.bak"))
-            except: pass
+            except Exception:
+                log_error("config_backup_rename_failed")
             cfg = cls()
             cfg.save()
             return cfg
@@ -84,8 +93,9 @@ class Config:
             )
             # 原子性替換，防止寫入一半斷電或崩潰
             temp_path.replace(CONFIG_PATH)
-        except Exception as e:
-            print(f"ERROR: Failed to save config: {e}")
+            log.debug(f"CONFIG: saved to {CONFIG_PATH}")
+        except Exception:
+            log_error("config_save_failed", path=str(CONFIG_PATH))
             # 不拋出異常，避免 UI 因設定儲存失敗而卡死
 
     # ── helpers ───────────────────────────────────────────────────────────────

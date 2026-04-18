@@ -32,10 +32,13 @@ from hotkey_manager import (
     HotkeyManager, capture_hotkey, format_hotkey,
     is_pynput_available, check_accessibility,
 )
+from logger import get_logger, log_action, log_error, log_settings, log_state
 from ollama_client import OllamaClient
 from recorder import AudioRecorder
 from transcriber import Transcriber, TranscriptionResult
 import auto_paste as _ap
+
+log = get_logger("gui")
 
 # ── Appearance — force Apple dark aesthetic ───────────────────────────────────
 ctk.set_appearance_mode("Dark")
@@ -412,7 +415,14 @@ class AppWindow(ctk.CTkFrame):
 
     def _transition_to_recording(self) -> None:
         if self._state != "idle":
+            log.debug(f"_transition_to_recording ignored (state={self._state})")
             return
+        log_state(
+            "idle->recording",
+            model=self._model_var.get(),
+            language=self._lang_var.get(),
+            auto_paste=self.cfg.auto_paste,
+        )
         self._state       = "recording"
         self._rec_start   = time.perf_counter()
         self._hotkey_held = True
@@ -453,7 +463,10 @@ class AppWindow(ctk.CTkFrame):
 
     def _transition_to_processing(self) -> None:
         if self._state != "recording":
+            log.debug(f"_transition_to_processing ignored (state={self._state})")
             return
+        duration = time.perf_counter() - self._rec_start
+        log_state("recording->processing", duration_s=f"{duration:.2f}")
         self._state       = "processing"
         self._hotkey_held = False
 
@@ -490,6 +503,16 @@ class AppWindow(ctk.CTkFrame):
         ).start()
 
     def _transition_to_idle(self, result: Optional[TranscriptionResult] = None) -> None:
+        if result is not None:
+            log_state(
+                "processing->idle",
+                text_len=len(result.text),
+                language=result.language,
+                elapsed_s=f"{result.elapsed_seconds:.2f}",
+                audio_s=f"{result.duration_seconds:.2f}",
+            )
+        else:
+            log_state("->idle")
         self._state = "idle"
 
         self._record_btn.configure(
@@ -547,6 +570,10 @@ class AppWindow(ctk.CTkFrame):
     _FAST_THRESHOLD = 8 * 16_000
 
     def _run_transcription(self, audio, model: str, lang) -> None:
+        log.debug(
+            f"TRANSCRIBE: start audio_samples={len(audio)} "
+            f"model={model} lang={lang} stream_chunks={len(self._stream_chunks)}"
+        )
         if len(audio) <= self._FAST_THRESHOLD and not self._stream_chunks:
             result = self.transcriber.transcribe_fast(audio, language=lang)
         else:
@@ -579,12 +606,14 @@ class AppWindow(ctk.CTkFrame):
             try:
                 import pyperclip
                 pyperclip.copy(text)
+                log_action("auto_copy_succeeded", text_len=len(text))
             except Exception:
-                pass
+                log_error("auto_copy_failed", text_len=len(text))
 
         if self.cfg.auto_paste and valid and self._paste_target:
             target = self._paste_target
             self._paste_target = None
+            log_action("auto_paste_scheduled", target=target, text_len=len(text))
             threading.Thread(
                 target=self._do_auto_paste,
                 args=(text, target),
@@ -594,8 +623,11 @@ class AppWindow(ctk.CTkFrame):
     def _do_auto_paste(self, text: str, target: str) -> None:
         success = _ap.paste_to_app(text, target)
         if success:
+            log_action("auto_paste_succeeded", target=target, text_len=len(text))
             self.after(0, lambda: self._show_toast(f"⌨  已貼入 {target}"))
         else:
+            log_error("auto_paste_failed", target=target,
+                      text_len=len(text), exc_info=False)
             self.after(0, lambda: self._show_toast("⌨  自動貼上失敗（請確認輔助使用權限）"))
 
     def _display_result(self, result: TranscriptionResult) -> None:
@@ -695,6 +727,7 @@ class AppWindow(ctk.CTkFrame):
     # ═══════════════════════════════════════════════════════════════════════
 
     def _on_record_btn(self) -> None:
+        log_action("record_button_clicked", state=self._state)
         if   self._state == "idle":      self._transition_to_recording()
         elif self._state == "recording": self._transition_to_processing()
 
@@ -706,26 +739,32 @@ class AppWindow(ctk.CTkFrame):
 
     def _on_hotkey_press(self) -> None:
         if self._state == "idle" and not self._hotkey_held:
+            log_action("hotkey_triggered_recording", combo=self.cfg.hotkey)
             self._transition_to_recording()
 
     def _on_hotkey_release(self) -> None:
         if self._state == "recording":
+            log_action("hotkey_triggered_stop", combo=self.cfg.hotkey)
             self._transition_to_processing()
 
     def _on_copy(self) -> None:
         text = self._get_result_text()
         if not text:
+            log_action("copy_clicked_empty")
             return
         try:
             import pyperclip
             pyperclip.copy(text)
+            log_action("copy_succeeded", text_len=len(text))
             self._show_toast("📋  已複製到剪貼簿")
         except Exception as e:
+            log_error("copy_failed", text_len=len(text))
             self._show_toast(f"複製失敗: {e}")
 
     def _on_save(self) -> None:
         text = self._get_result_text()
         if not text:
+            log_action("save_clicked_empty")
             return
         path = fd.asksaveasfilename(
             defaultextension=".txt",
@@ -736,11 +775,16 @@ class AppWindow(ctk.CTkFrame):
             try:
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(text)
+                log_action("save_succeeded", path=path, text_len=len(text))
                 self._show_toast("💾  已儲存")
             except Exception as e:
+                log_error("save_file_failed", path=path)
                 self._show_toast(f"儲存失敗: {e}")
+        else:
+            log_action("save_cancelled")
 
     def _on_clear(self) -> None:
+        log_action("clear_clicked")
         self._textbox.configure(state="normal")
         self._textbox.delete("1.0", "end")
         self._textbox.configure(state="disabled")
@@ -748,8 +792,10 @@ class AppWindow(ctk.CTkFrame):
         self._show_placeholder()
 
     def _toggle_auto_paste(self) -> None:
+        old = self.cfg.auto_paste
         self.cfg.auto_paste = not self.cfg.auto_paste
         self.cfg.save()
+        log_settings("changed", field="auto_paste", old=old, new=self.cfg.auto_paste)
         on = self.cfg.auto_paste
         self._ap_btn.configure(
             fg_color=INDIGO if on else SURF1,
@@ -762,7 +808,9 @@ class AppWindow(ctk.CTkFrame):
     def _on_ollama(self) -> None:
         text = self._get_result_text()
         if not text:
+            log_action("ollama_clicked_empty")
             return
+        log_action("ollama_clicked", text_len=len(text))
         self._ollama_btn.configure(state="disabled", text="✨  處理中…")
 
         def _run():
@@ -772,8 +820,10 @@ class AppWindow(ctk.CTkFrame):
         def _done(result):
             self._ollama_btn.configure(state="normal", text="✨  潤飾")
             if result.error:
+                log_error("ollama_failed", reason=result.error, exc_info=False)
                 self._show_toast(f"Ollama 錯誤: {result.error}")
                 return
+            log_action("ollama_succeeded", out_len=len(result.text))
             self._textbox.configure(state="normal")
             self._textbox.delete("1.0", "end")
             self._textbox.insert("end", result.text)
@@ -783,35 +833,52 @@ class AppWindow(ctk.CTkFrame):
         threading.Thread(target=_run, daemon=True).start()
 
     def _on_model_change(self, value: str) -> None:
+        old = self.cfg.model
         self.cfg.model = value
         self.cfg.save()
+        log_settings("changed", field="model", old=old, new=value, source="dropdown")
         self._status_label.configure(text=f"  就緒 ({value})")
 
     def _on_language_change(self, value: str) -> None:
+        old = self.cfg.language
         self.cfg.language = value
         self.cfg.save()
+        log_settings("changed", field="language", old=old, new=value, source="dropdown")
 
     # ═══════════════════════════════════════════════════════════════════════
     #  SETTINGS
     # ═══════════════════════════════════════════════════════════════════════
 
     def _open_settings(self) -> None:
+        log_action("settings_opened")
         SettingsWindow(self, self.cfg, self._on_settings_saved)
 
     def _on_settings_saved(self, cfg: Config) -> None:
-        self.cfg = cfg
-        self._start_hotkey_listener()
-        self._hotkey_hint.configure(text=f"按住 {cfg.format_hotkey_display()} 即時錄音")
-        self._hotkey_status.configure(text=cfg.format_hotkey_display())
-        self._model_var.set(cfg.model)
-        self._lang_var.set(cfg.language)
-        on = cfg.auto_paste
-        self._ap_btn.configure(
-            fg_color=INDIGO if on else SURF1,
-            border_color=INDIGO if on else SURF3,
-            text_color=TEXT1 if on else TEXT3,
-            hover_color="#4745C8" if on else SURF2,
-        )
+        try:
+            old = self.cfg
+            # 逐欄位紀錄變動
+            for field in ("model", "language", "hotkey", "auto_copy",
+                          "auto_paste", "append_results", "ollama_enabled"):
+                ov, nv = getattr(old, field), getattr(cfg, field)
+                if ov != nv:
+                    log_settings("changed", field=field, old=ov, new=nv,
+                                 source="settings_window")
+
+            self.cfg = cfg
+            self._start_hotkey_listener()
+            self._hotkey_hint.configure(text=f"按住 {cfg.format_hotkey_display()} 即時錄音")
+            self._hotkey_status.configure(text=cfg.format_hotkey_display())
+            self._model_var.set(cfg.model)
+            self._lang_var.set(cfg.language)
+            on = cfg.auto_paste
+            self._ap_btn.configure(
+                fg_color=INDIGO if on else SURF1,
+                border_color=INDIGO if on else SURF3,
+                text_color=TEXT1 if on else TEXT3,
+                hover_color="#4745C8" if on else SURF2,
+            )
+        except Exception:
+            log_error("on_settings_saved_failed")
 
     # ═══════════════════════════════════════════════════════════════════════
     #  HELPERS
@@ -824,6 +891,7 @@ class AppWindow(ctk.CTkFrame):
 
     def _warmup_model(self) -> None:
         model = self._model_var.get()
+        log.info(f"WARMUP: starting for model={model}")
 
         def _load():
             try:
@@ -831,11 +899,13 @@ class AppWindow(ctk.CTkFrame):
                 self.transcriber.warmup("small")
                 backend = self.transcriber.active_backend()
                 label   = "⚡ Metal" if backend == "mlx" else "CPU"
+                log.info(f"WARMUP: complete (model={model} backend={backend})")
                 self.after(0, lambda: self._status_label.configure(
                     text=f"  就緒 ({model} · {label})"
                 ))
                 self.after(0, lambda: self._status_dot.configure(text_color=GREEN))
             except Exception:
+                log_error("warmup_failed", model=model)
                 self.after(0, lambda: self._status_label.configure(text="  模型載入失敗"))
                 self.after(0, lambda: self._status_dot.configure(text_color=RED))
 
@@ -866,9 +936,17 @@ class AppWindow(ctk.CTkFrame):
         self.after(2800, toast.destroy)
 
     def on_close(self) -> None:
-        self.hotkey_mgr.stop()
+        log.info("GUI: on_close")
+        try:
+            self.hotkey_mgr.stop()
+        except Exception:
+            log_error("hotkey_mgr_stop_on_close_failed")
         if self.recorder.is_recording():
-            self.recorder.stop()
+            log.info("GUI: recorder still active on close — stopping")
+            try:
+                self.recorder.stop()
+            except Exception:
+                log_error("recorder_stop_on_close_failed")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1082,21 +1160,33 @@ class SettingsWindow(ctk.CTkToplevel):
         self._model_desc.configure(text=MODEL_INFO.get(value, ""))
 
     def _rebind_hotkey(self) -> None:
+        log_action("rebind_hotkey_dialog_opened")
         HotkeyBindDialog(self, self.cfg.hotkey, self._apply_hotkey).focus()
 
     def _apply_hotkey(self, combo: str) -> None:
+        old = self.cfg.hotkey
         self.cfg.hotkey = combo
         self._hk_label.configure(text=format_hotkey(combo))
+        log_settings("pending", field="hotkey", old=old, new=combo,
+                     note="pending_save_button")
 
     def _save(self) -> None:
-        self.cfg.model          = self._model_var.get()
-        self.cfg.language       = self._lang_var.get()
-        self.cfg.append_results = self._append_var.get()
-        self.cfg.auto_copy      = self._autocopy_var.get()
-        self.cfg.auto_paste     = self._autopaste_var.get()
-        self.cfg.save()
-        self._on_save_cb(self.cfg)
-        self.destroy()
+        log_action("settings_save_clicked")
+        try:
+            self.cfg.model          = self._model_var.get()
+            self.cfg.language       = self._lang_var.get()
+            self.cfg.append_results = self._append_var.get()
+            self.cfg.auto_copy      = self._autocopy_var.get()
+            self.cfg.auto_paste     = self._autopaste_var.get()
+            self.cfg.save()
+            self._on_save_cb(self.cfg)
+        except Exception:
+            log_error("settings_save_failed")
+        finally:
+            try:
+                self.destroy()
+            except Exception:
+                log_error("settings_window_destroy_failed")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

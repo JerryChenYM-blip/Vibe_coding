@@ -13,6 +13,10 @@ from typing import Callable, Iterator, Optional
 import requests
 import prompts
 
+from logger import get_logger, log_error
+
+log = get_logger("ollama")
+
 DEFAULT_BASE_URL = "http://localhost:11434"
 DEFAULT_MODEL = "llama3.2"
 DEFAULT_PROMPT = prompts.OLLAMA_SYSTEM_PROMPT
@@ -126,7 +130,7 @@ class OllamaClient:
                     done=data.get("done", True),
                 )
         except Exception as e:
-            print(f"Ollama Error: {e}")
+            log_error("ollama_request_failed", model=self.config.model)
             return OllamaResponse(
                 text=text, # 防呆：發生錯誤時回傳原始文字而非空字串
                 model=self.config.model,

@@ -45,6 +45,10 @@ try:
 except ImportError:
     sd = None
 
+from logger import get_logger, log_error
+
+log = get_logger("recorder")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -84,20 +88,23 @@ class AudioRecorder:
         Returns True if successful, False otherwise.
         """
         if sd is None:
-            print("RECORD: ERROR - sounddevice is not available.")
+            log.error("RECORD: sounddevice is not available.")
             return False
 
         with self._lock:
             if self._is_recording:
-                print("RECORD: Already recording, ignoring start request.")
+                log.warning("RECORD: Already recording, ignoring start request.")
                 return True
-            
+
             self._frames = []
             self._rms_level = 0.0
             blocksize = int(BLOCK_MS / 1000 * SAMPLE_RATE)
-            
+
             try:
-                print(f"RECORD: Attempting to start microphone. Device={self._device_index}, Samplerate={SAMPLE_RATE}, Blocksize={blocksize}")
+                log.info(
+                    f"RECORD: Attempting to start microphone. "
+                    f"Device={self._device_index}, Samplerate={SAMPLE_RATE}, Blocksize={blocksize}"
+                )
                 self._stream = sd.InputStream(
                     samplerate=SAMPLE_RATE,
                     channels=CHANNELS,
@@ -108,18 +115,13 @@ class AudioRecorder:
                 )
                 self._stream.start()
                 self._is_recording = True
-                print(f"RECORD: Stream active. Latency={self._stream.latency:.4f}s, CPU Load={self._stream.cpu_load:.2%}")
-                
-                # _auto_stop_monitor is currently not implemented, skipping thread creation
-                # if self._monitor_thread is None or not self._monitor_thread.is_alive():
-                #     self._monitor_thread = threading.Thread(target=self._auto_stop_monitor, daemon=True)
-                #     self._monitor_thread.start()
-                
+                log.info(
+                    f"RECORD: Stream active. Latency={self._stream.latency:.4f}s, "
+                    f"CPU Load={self._stream.cpu_load:.2%}"
+                )
                 return True
-            except Exception as e:
-                print(f"RECORD ERROR: Initialization failed. Exception: {str(e)}")
-                import traceback
-                traceback.print_exc()
+            except Exception:
+                log_error("recorder_init_failed", device=self._device_index)
                 self._stream = None
                 self._is_recording = False
                 return False
@@ -131,29 +133,32 @@ class AudioRecorder:
         """
         with self._lock:
             if not self._is_recording:
-                print("RECORD: stop() called while already idle.")
+                log.debug("RECORD: stop() called while already idle.")
                 return np.zeros(0, dtype=np.float32)
-            
-            print("RECORD: Stopping audio stream...")
+
+            log.info("RECORD: Stopping audio stream...")
             self._is_recording = False
             if self._stream is not None:
                 try:
                     self._stream.stop()
                     self._stream.close()
-                    print("RECORD: PortAudio stream closed cleanly.")
-                except Exception as e:
-                    print(f"RECORD ERROR: Error while closing stream: {e}")
+                    log.info("RECORD: PortAudio stream closed cleanly.")
+                except Exception:
+                    log_error("recorder_close_failed")
                 self._stream = None
-            
+
             frames = list(self._frames)
-            self._frames = [] # 徹底釋放記憶體
+            self._frames = []  # 徹底釋放記憶體
 
         if not frames:
-            print("RECORD: Warning - No audio data captured.")
+            log.warning("RECORD: No audio data captured.")
             return np.zeros(0, dtype=np.float32)
-            
+
         full_audio = np.concatenate(frames, axis=0).flatten()
-        print(f"RECORD: Session complete. Total samples={len(full_audio)}, Duration={len(full_audio)/SAMPLE_RATE:.2f}s")
+        log.info(
+            f"RECORD: Session complete. Total samples={len(full_audio)}, "
+            f"Duration={len(full_audio)/SAMPLE_RATE:.2f}s"
+        )
         return full_audio
 
     def get_rms_level(self) -> float:
@@ -197,8 +202,8 @@ class AudioRecorder:
                 if d.get("max_input_channels", 0) > 0:
                     devices.append({"id": i, "name": d["name"]})
             return devices
-        except Exception as e:
-            print(f"WARNING: Cannot query audio devices: {e}")
+        except Exception:
+            log_error("query_audio_devices_failed")
             return []
 
     # ── private ───────────────────────────────────────────────────────────────
@@ -212,8 +217,8 @@ class AudioRecorder:
     ) -> None:
         """Called on PortAudio thread — must be fast, no blocking."""
         if status:
-            print(f"SD STATUS: {status}")
-        
+            log.warning(f"SD STATUS: {status}")
+
         try:
             chunk = indata.copy()
             with self._lock:
@@ -221,6 +226,6 @@ class AudioRecorder:
                     self._frames.append(chunk)
             # RMS amplitude
             self._rms_level = float(np.sqrt(np.mean(chunk ** 2)))
-        except Exception as e:
-            print(f"CALLBACK ERROR: {e}")
+        except Exception:
+            log_error("audio_callback_failed")
             self._is_recording = False

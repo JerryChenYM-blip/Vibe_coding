@@ -14,6 +14,10 @@ import subprocess
 import time
 from typing import Optional
 
+from logger import get_logger, log_error
+
+log = get_logger("auto_paste")
+
 
 def get_frontmost_app() -> Optional[str]:
     """
@@ -32,9 +36,10 @@ def get_frontmost_app() -> Optional[str]:
             timeout=2,
         )
         name = result.stdout.strip()
+        log.debug(f"AUTO-PASTE: frontmost app = '{name}'")
         return name or None
-    except Exception as e:
-        print(f"AUTO-PASTE: get_frontmost_app failed: {e}")
+    except Exception:
+        log_error("get_frontmost_app_failed")
         return None
 
 
@@ -55,8 +60,8 @@ def paste_to_app(
     try:
         import pyperclip
         pyperclip.copy(text)
-    except Exception as e:
-        print(f"AUTO-PASTE: clipboard write failed: {e}")
+    except Exception:
+        log_error("auto_paste_clipboard_failed", text_len=len(text))
         return False
 
     # ── 2. Activate target app ────────────────────────────────────────────────
@@ -67,8 +72,8 @@ def paste_to_app(
                 timeout=3,
             )
             time.sleep(activate_delay)   # give the app time to come to front
-        except Exception as e:
-            print(f"AUTO-PASTE: activate '{app_name}' failed: {e}")
+        except Exception:
+            log_error("auto_paste_activate_failed", app=app_name)
             # Continue anyway — paste into whatever window is now focused
 
     # ── 3. Send ⌘V ───────────────────────────────────────────────────────────
@@ -77,8 +82,8 @@ def paste_to_app(
         kb = Controller()
         with kb.pressed(Key.cmd):
             kb.tap("v")
-        print(f"AUTO-PASTE: ⌘V sent → '{app_name}'")
+        log.info(f"AUTO-PASTE: ⌘V sent → '{app_name}' (text_len={len(text)})")
         return True
-    except Exception as e:
-        print(f"AUTO-PASTE: keyboard simulation failed: {e}")
+    except Exception:
+        log_error("auto_paste_keyboard_failed", app=app_name)
         return False

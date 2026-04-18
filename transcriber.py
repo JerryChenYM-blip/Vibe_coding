@@ -22,6 +22,10 @@ from typing import Optional
 
 import prompts
 
+from logger import get_logger, log_error
+
+log = get_logger("transcriber")
+
 # ── Backend detection ─────────────────────────────────────────────────────────
 
 def _detect_backend() -> str:
@@ -129,7 +133,7 @@ class Transcriber:
         import numpy as np
 
         if audio is None or len(audio) == 0:
-            print("WHISPER: ERROR - Empty audio buffer received.")
+            log.error("WHISPER: Empty audio buffer received.")
             return TranscriptionResult(
                 text="（沒有偵測到音訊，請確認麥克風是否正常運作）",
                 language="",
@@ -143,11 +147,14 @@ class Transcriber:
 
         duration = len(audio) / 16_000
         t0 = time.perf_counter()
-        print(f"WHISPER: Starting transcription. Backend={BACKEND}, Model={model_size}, Lang={language}, AudioDuration={duration:.2f}s")
+        log.info(
+            f"WHISPER: Starting transcription. Backend={BACKEND}, Model={model_size}, "
+            f"Lang={language}, AudioDuration={duration:.2f}s"
+        )
 
         # Guard: skip Whisper entirely if audio is silent
         if _is_silence(audio):
-            print("WHISPER: Guard - Audio level below threshold, skipping inference.")
+            log.info("WHISPER: Guard - Audio level below threshold, skipping inference.")
             return TranscriptionResult(
                 text="（未偵測到語音內容）",
                 language="",
@@ -158,20 +165,30 @@ class Transcriber:
         if BACKEND == "mlx":
             try:
                 result = self._transcribe_mlx(audio, model_size, language)
-            except Exception as e:
-                print(f"WHISPER ERROR: MLX Backend failed: {e}. Falling back to CPU.")
+            except Exception:
+                log_error("mlx_backend_failed", model=model_size)
+                log.warning("WHISPER: Falling back to CPU CTranslate2 backend.")
                 result = self._transcribe_ctranslate(audio, model_size, language)
         else:
             result = self._transcribe_ctranslate(audio, model_size, language)
 
         result.duration_seconds = duration
         result.elapsed_seconds = time.perf_counter() - t0
-        print(f"WHISPER: Inference finished in {result.elapsed_seconds:.2f}s. RTF={(result.elapsed_seconds/duration) if duration>0 else 0:.3f}")
+        rtf = (result.elapsed_seconds / duration) if duration > 0 else 0
+        log.info(
+            f"WHISPER: Inference finished in {result.elapsed_seconds:.2f}s. RTF={rtf:.3f}"
+        )
 
         # Guard: replace known hallucinations with a clear message
         if _is_hallucination(result.text):
-            print(f"WHISPER: Guard - Detected hallucination in result: '{result.text[:50]}...'")
+            log.warning(
+                f"WHISPER: Guard - Detected hallucination: '{result.text[:50]}...'"
+            )
             result.text = "（未偵測到語音內容）"
+
+        # 記錄轉錄結果（前 100 字，方便未來 debug hallucination / 準確度）
+        preview = result.text[:100].replace("\n", " ")
+        log.info(f"WHISPER: Result (lang={result.language}) text='{preview}'")
 
         return result
 
@@ -252,8 +269,9 @@ class Transcriber:
             with self._transcription_lock:
                 segs, _ = model.transcribe(silence, beam_size=1, temperature=0)
                 list(segs)
-        except Exception as e:
-            print(f"Warmup CTranslate failed: {e}")
+            log.info(f"WHISPER: Warmup CTranslate complete (model={model_size})")
+        except Exception:
+            log_error("warmup_ctranslate_failed", model=model_size)
 
     def unload(self) -> None:
         """Release models from memory (CPU and MLX)."""
@@ -291,8 +309,9 @@ class Transcriber:
                     language="zh",
                     verbose=False,
                 )
-            except Exception as e:
-                print(f"Warmup MLX failed: {e}")
+                log.info(f"WHISPER: Warmup MLX complete (repo={hf_repo})")
+            except Exception:
+                log_error("warmup_mlx_failed", model=model_size, repo=hf_repo)
 
     def _transcribe_mlx(
         self,
@@ -386,15 +405,18 @@ class Transcriber:
             if self._model is None or self._loaded_model_size != model_size:
                 t_start = time.perf_counter()
                 if self._model is not None:
-                    print(f"WHISPER: Unloading old model '{self._loaded_model_size}'...")
+                    log.info(f"WHISPER: Unloading old model '{self._loaded_model_size}'...")
                     try:
                         del self._model
-                    except: pass
+                    except Exception:
+                        log_error("whisper_model_del_failed")
                     gc.collect()
-                    
+
                 from faster_whisper import WhisperModel
                 cpu_threads = min(4, os.cpu_count() or 4)
-                print(f"WHISPER: Loading CPU model '{model_size}' with {cpu_threads} threads...")
+                log.info(
+                    f"WHISPER: Loading CPU model '{model_size}' with {cpu_threads} threads..."
+                )
                 try:
                     self._model = WhisperModel(
                         model_size,
@@ -405,8 +427,10 @@ class Transcriber:
                     )
                     self._loaded_model_size = model_size
                     elapsed = time.perf_counter() - t_start
-                    print(f"WHISPER: Model '{model_size}' loaded successfully in {elapsed:.2f}s.")
-                except Exception as e:
-                    print(f"WHISPER ERROR: Failed to load model '{model_size}'. Detail: {e}")
-                    raise RuntimeError(f"無法載入 Whisper 模型 {model_size}: {e}")
+                    log.info(
+                        f"WHISPER: Model '{model_size}' loaded successfully in {elapsed:.2f}s."
+                    )
+                except Exception:
+                    log_error("whisper_model_load_failed", model=model_size)
+                    raise RuntimeError(f"無法載入 Whisper 模型 {model_size}")
             return self._model

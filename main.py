@@ -7,48 +7,27 @@ then launches the main GUI window.
 
 from __future__ import annotations
 
+import datetime
+import os
 import sys
 import threading
-import os
-import datetime
 
-# ── Logging Setup ─────────────────────────────────────────────────────
-class Logger:
-    def __init__(self, filename="app.log"):
-        self.terminal = sys.stdout
-        self.log = open(filename, "a", encoding="utf-8")
+# 匯入 logger（import 時會自動 setup_logging，log 會寫到
+# ~/.whisper_app/logs/whisper_app.log 並同時輸出到終端）
+from logger import get_logger, log_error
 
-    def write(self, message):
-        # 避免為單純的換行符號加上時間戳
-        if message.strip():
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            formatted_message = f"[{timestamp}] {message}"
-            self.terminal.write(formatted_message)
-            self.log.write(formatted_message)
-        else:
-            self.terminal.write(message)
-            self.log.write(message)
-        self.log.flush()
+log = get_logger("main")
 
-    def flush(self):
-        self.terminal.flush()
-        self.log.flush()
-
-# 啟動日誌重新導向
-sys.stdout = Logger("app.log")
-sys.stderr = sys.stdout
-
-print("\n" + "="*60)
-print(f"NEW SESSION: Whisper Pro started at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-print("="*60)
+log.info("=" * 60)
+log.info(f"NEW SESSION: Whisper Pro started at {datetime.datetime.now():%Y-%m-%d %H:%M:%S}")
+log.info("=" * 60)
 
 import customtkinter as ctk
 import gui
-import os
 
-print(f"DIAG: Current Working Directory: {os.getcwd()}")
-print(f"DIAG: gui.py location: {gui.__file__}")
-print(f"DIAG: Python executable: {sys.executable}")
+log.debug(f"DIAG: Current Working Directory: {os.getcwd()}")
+log.debug(f"DIAG: gui.py location: {gui.__file__}")
+log.debug(f"DIAG: Python executable: {sys.executable}")
 
 from config import Config
 from gui import WIN_W, WIN_H, AppWindow, AccessibilityDialog
@@ -70,46 +49,63 @@ def main() -> None:
     # ── Dependency check ──────────────────────────────────────────────────
     missing = check_dependencies()
     if missing:
-        print("❌ 缺少以下套件，請先執行安裝：")
-        print("   pip install " + " ".join(missing))
+        log.error("MISSING_DEPENDENCIES: " + " ".join(missing))
+        log.error("Install via: pip install " + " ".join(missing))
         sys.exit(1)
 
     # ── Load config ───────────────────────────────────────────────────────
     cfg = Config.load()
+    log.info(
+        f"CONFIG: loaded model={cfg.model} language={cfg.language} "
+        f"hotkey={cfg.hotkey} auto_paste={cfg.auto_paste} auto_copy={cfg.auto_copy}"
+    )
 
     # ── Root window ───────────────────────────────────────────────────────
     root = ctk.CTk()
     root.title("🎙 Whisper Pro")
-    # Use constants from gui.py for consistency
     root.geometry(f"{WIN_W}x{WIN_H}")
-    root.minsize(640, 750) 
+    root.minsize(640, 750)
     root.resizable(True, True)
 
     # macOS: set dock icon title
     try:
         root.tk.call("wm", "iconphoto", root._w)
     except Exception:
-        pass
+        log_error("set_dock_icon_failed")
 
     # ── Main app ──────────────────────────────────────────────────────────
     app = AppWindow(root, cfg)
+    log.info("GUI: AppWindow initialized")
 
     # ── Accessibility check (non-blocking) ────────────────────────────────
     def _check_access():
         if is_pynput_available() and not check_accessibility():
+            log.warning("ACCESSIBILITY: permission NOT granted — global hotkey disabled")
             if root.winfo_exists():
                 root.after(800, lambda: AccessibilityDialog(root) if root.winfo_exists() else None)
+        else:
+            log.info("ACCESSIBILITY: permission granted or pynput unavailable")
 
     threading.Thread(target=_check_access, daemon=True).start()
 
     # ── Cleanup on close ─────────────────────────────────────────────────
     def _on_close():
-        app.on_close()
+        log.info("SESSION: user requested close")
+        try:
+            app.on_close()
+        except Exception:
+            log_error("app_on_close_failed")
         root.destroy()
+        log.info("SESSION: ended")
 
     root.protocol("WM_DELETE_WINDOW", _on_close)
 
-    root.mainloop()
+    log.info("GUI: entering mainloop")
+    try:
+        root.mainloop()
+    except Exception:
+        log_error("mainloop_crashed")
+        raise
 
 
 if __name__ == "__main__":

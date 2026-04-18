@@ -40,9 +40,11 @@ Icon
 .VolumeIcon.icns
 .com.apple.timemachine.donotpresent
 
-# App logs
+# App logs (legacy location — current log path is ~/.whisper_app/logs/)
 app.log
 app.pid
+logs/
+*.log
 
 # Local settings
 .claude/

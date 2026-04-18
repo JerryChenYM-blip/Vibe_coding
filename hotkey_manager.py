@@ -22,6 +22,10 @@ try:
 except ImportError:
     _PYNPUT_AVAILABLE = False
 
+from logger import get_logger, log_action, log_error
+
+log = get_logger("hotkey")
+
 
 def is_pynput_available() -> bool:
     return _PYNPUT_AVAILABLE
@@ -182,7 +186,8 @@ class HotkeyManager:
     def restart(self, combo: str) -> None:
         self.stop()
         self._hotkeys = parse_hotkey(combo)
-        print(f"HOTKEY: Starting listener for {self._hotkeys}")
+        self._combo_str = combo
+        log.info(f"HOTKEY: Starting listener for combo='{combo}' keys={self._hotkeys}")
         self._listener = _kb.Listener(
             on_press=self._on_p,
             on_release=self._on_r,
@@ -202,11 +207,11 @@ class HotkeyManager:
             self._pressed.clear()
             self._combo_active = False
         if listener_to_stop is not None:
-            print("HOTKEY: Stopping listener...")
+            log.info("HOTKEY: Stopping listener...")
             try:
                 listener_to_stop.stop()
             except Exception:
-                pass
+                log_error("hotkey_stop_failed")
 
     def _normalize(self, key) -> object:
         return _normalize_key(key)
@@ -220,7 +225,8 @@ class HotkeyManager:
                 self._combo_active = True
                 fire = True
         if fire:
-            print("HOTKEY: Triggered!")
+            combo = getattr(self, "_combo_str", "?")
+            log_action("hotkey_pressed", combo=combo)
             self._on_press_cb()   # called OUTSIDE lock
 
     def _on_r(self, key) -> None:
@@ -232,5 +238,6 @@ class HotkeyManager:
                 fire = True
             self._pressed.discard(nk)
         if fire:
-            print("HOTKEY: Released!")
+            combo = getattr(self, "_combo_str", "?")
+            log_action("hotkey_released", combo=combo)
             self._on_release_cb()  # called OUTSIDE lock
