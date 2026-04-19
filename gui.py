@@ -100,6 +100,56 @@ def _blend(fg_hex: str, bg_hex: str, alpha: float) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Ambient Chamber — geometry & animation constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+CHAMBER_SIZE   = 280
+CHAMBER_CENTER = CHAMBER_SIZE // 2          # (140, 140)
+DISC_RADIUS    = 60                         # central clickable disc
+
+RING_RADII_5   = (80, 96, 112, 128, 140)    # idle / recording
+RING_RADII_4   = (80, 100, 120, 140)        # processing (one less = "收斂")
+RING_STROKE    = 2
+
+RING_ALPHA_IDLE       = (0.25, 0.18, 0.12, 0.07, 0.03)
+RING_ALPHA_RECORDING  = (0.35, 0.24, 0.15, 0.08, 0.04)
+RING_ALPHA_PROCESSING = (0.30, 0.18, 0.10, 0.05)
+
+# RMS-driven expansion + ripple emission
+RMS_EXPAND_GAIN   = 0.18     # max +18 % radius at full RMS
+RMS_RIPPLE_THR    = 0.15     # trigger when rms > 0.15 AND > prev × 1.5
+RIPPLE_R0         = 140
+RIPPLE_R1         = 180
+RIPPLE_DURATION   = 1.2      # seconds
+RIPPLE_ALPHA0     = 0.4
+RIPPLE_MAX        = 3
+
+# Processing state — rotating particle belt
+PROC_PARTICLES        = 12
+PROC_PARTICLE_RADIUS  = 4
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Reduced-motion detection (macOS system preference)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def system_reduce_motion() -> bool:
+    """Read macOS Reduce Motion preference once at app start.
+
+    Changes to the system pref require an app restart per macOS convention.
+    Falls back to False on any error (key absent, timeout, non-Darwin).
+    """
+    try:
+        r = subprocess.run(
+            ["defaults", "read", "com.apple.universalaccess", "reduceMotion"],
+            capture_output=True, text=True, timeout=0.5,
+        )
+        return r.stdout.strip() == "1"
+    except Exception:
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  AppWindow
 # ─────────────────────────────────────────────────────────────────────────────
 
