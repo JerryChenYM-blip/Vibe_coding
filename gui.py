@@ -43,38 +43,31 @@ ctk.set_default_color_theme("blue")
 
 WIN_W, WIN_H = 760, 800
 
-# ── Apple MacBook Pro colour palette (forced dark) ────────────────────────────
-# Sourced from apple.com/tw/macbook-pro/ computed styles
+# ── Design tokens (imported — do not redefine locally) ────────────────────────
+# Canonical names + legacy aliases, all sourced from tokens.py
+from tokens import (  # noqa: F401  (legacy aliases used across this module)
+    # Surfaces
+    BG, SURF_1, SURF_2, SURF_3, SURF_4,
+    SURF1, SURF2, SURF3,            # legacy aliases
+    # Text
+    TEXT_1, TEXT_2, TEXT_3, TEXT_4,
+    TEXT1, TEXT2, TEXT3,            # legacy aliases
+    # Accents
+    ACCENT, ACCENT_HV, ACCENT_BG,
+    BLUE, BLUE_HV, BLUE_DIM,        # legacy aliases (→ ACCENT)
+    SUCCESS, SUCCESS_DIM,
+    GREEN, GREEN_DIM,               # legacy aliases
+    DANGER, DANGER_DIM,
+    RED, RED_DIM,                   # legacy aliases
+    WARN,
+    ORANGE,                         # legacy alias
+    INDIGO, INDIGO_DIM,
+    # Waveform
+    WAVE_IDLE_COL, WAVE_LIVE_COL,
+    # Misc
+    SPINNER,
+)
 
-BG       = "#000000"   # void black — window body
-SURF1    = "#1D1D1F"   # primary surface — cards, bars
-SURF2    = "#2C2C2E"   # secondary surface — inset, hover
-SURF3    = "#3A3A3C"   # separators, borders, disabled
-
-TEXT1    = "#F5F5F7"   # primary label (warm white)
-TEXT2    = "#EBEBF5"   # secondary label
-TEXT3    = "#8E8E93"   # tertiary / hint / muted
-
-BLUE     = "#0071E3"   # Apple CTA blue
-BLUE_HV  = "#2997FF"   # blue hover (brighter)
-BLUE_DIM = "#0A2744"   # blue-tinted surface
-
-GREEN    = "#30D158"   # system green (idle)
-GREEN_DIM = "#0A2B1A"  # green-tinted surface
-
-RED      = "#FF453A"   # system red (recording)
-RED_DIM  = "#3A0800"   # red-tinted surface
-
-ORANGE   = "#FF9F0A"   # system orange (processing)
-
-INDIGO   = "#5E5CE6"   # auto-paste active
-INDIGO_DIM = "#1A1A40" # indigo-tinted surface
-
-# Waveform
-WAVE_IDLE_COL = "#3A3A3C"
-WAVE_LIVE_COL = "#F5F5F7"
-
-SPINNER   = ["⠋", "⠙", "⠸", "⠴", "⠦", "⠇"]
 WAVE_BARS = 44
 
 # Breathing glow — record button
