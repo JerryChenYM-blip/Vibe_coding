@@ -35,6 +35,7 @@ from hotkey_manager import (
 from ollama_client import OllamaClient
 from recorder import AudioRecorder
 from transcriber import Transcriber, TranscriptionResult
+from icons import get_icon
 import auto_paste as _ap
 
 # ── Appearance — force Apple dark aesthetic ───────────────────────────────────
@@ -292,19 +293,31 @@ class AppWindow(ctk.CTkFrame):
         hdr.pack(fill="x", padx=20, pady=(14, 0))
         hdr.pack_propagate(False)
 
+        # Title with leading icon
+        title_wrap = ctk.CTkFrame(hdr, fg_color="transparent")
+        title_wrap.pack(side="left")
+
+        ctk.CTkLabel(
+            title_wrap, text="",
+            image=get_icon("file-text", 16, TEXT_1),
+            width=18,
+        ).pack(side="left", padx=(0, 8))
+
         self._result_title = ctk.CTkLabel(
-            hdr, text="📝  轉錄結果",
+            title_wrap, text="轉錄結果",
             font=ctk.CTkFont("SF Pro Display", 14, "bold"),
-            text_color=TEXT1, anchor="w",
+            text_color=TEXT_1, anchor="w",
         )
         self._result_title.pack(side="left")
 
         ctk.CTkButton(
-            hdr, text="清除", width=52, height=26,
+            hdr, text="清除", width=64, height=26,
+            image=get_icon("x", 12, TEXT_3),
+            compound="left",
             fg_color="transparent",
-            border_width=1, border_color=SURF3,
-            text_color=TEXT3,
-            hover_color=SURF2,
+            border_width=1, border_color=SURF_3,
+            text_color=TEXT_3,
+            hover_color=SURF_2,
             font=ctk.CTkFont("SF Pro Text", 12),
             corner_radius=6,
             command=self._on_clear,
@@ -352,44 +365,67 @@ class AppWindow(ctk.CTkFrame):
             hover_color=SURF2,
         )
 
-        ctk.CTkButton(row, text="📋  複製", width=90,
-                      command=self._on_copy, **ghost).pack(side="left", padx=4)
-        ctk.CTkButton(row, text="💾  存檔", width=90,
-                      command=self._on_save, **ghost).pack(side="left", padx=4)
+        # Ghost buttons use TEXT_2-tinted icons
+        icon_size = 15
 
-        # Auto-paste chip
+        ctk.CTkButton(
+            row, text="複製", width=96,
+            image=get_icon("copy", icon_size, TEXT_2),
+            compound="left",
+            command=self._on_copy, **ghost,
+        ).pack(side="left", padx=4)
+
+        ctk.CTkButton(
+            row, text="存檔", width=96,
+            image=get_icon("download", icon_size, TEXT_2),
+            compound="left",
+            command=self._on_save, **ghost,
+        ).pack(side="left", padx=4)
+
+        # Auto-paste chip — icon colour tracks active state
+        ap_on = self.cfg.auto_paste
         self._ap_btn = ctk.CTkButton(
             row,
-            text="⌨  自動貼上",
-            width=106, height=32, corner_radius=8,
+            text="自動貼上",
+            image=get_icon("keyboard", icon_size,
+                           TEXT_1 if ap_on else TEXT_3),
+            compound="left",
+            width=116, height=32, corner_radius=8,
             font=ctk.CTkFont("SF Pro Text", 13),
-            fg_color=INDIGO if self.cfg.auto_paste else SURF1,
+            fg_color=INDIGO if ap_on else SURF_1,
             border_width=1,
-            border_color=INDIGO if self.cfg.auto_paste else SURF3,
-            text_color=TEXT1 if self.cfg.auto_paste else TEXT3,
-            hover_color="#4745C8" if self.cfg.auto_paste else SURF2,
+            border_color=INDIGO if ap_on else SURF_3,
+            text_color=TEXT_1 if ap_on else TEXT_3,
+            hover_color="#4745C8" if ap_on else SURF_2,
             command=self._toggle_auto_paste,
         )
         self._ap_btn.pack(side="left", padx=4)
 
-        # Ollama
+        # Ollama polish
         ollama_ok = self.ollama.is_available()
         self._ollama_btn = ctk.CTkButton(
-            row, text="✨  潤飾", width=90,
+            row, text="潤飾", width=96,
+            image=get_icon("sparkles", icon_size,
+                           TEXT_1 if ollama_ok else TEXT_3),
+            compound="left",
             state="normal" if ollama_ok else "disabled",
-            fg_color=BLUE if ollama_ok else SURF1,
-            hover_color=BLUE_HV if ollama_ok else SURF2,
+            fg_color=ACCENT if ollama_ok else SURF_1,
+            hover_color=ACCENT_HV if ollama_ok else SURF_2,
             border_width=1,
-            border_color=BLUE if ollama_ok else SURF3,
-            text_color=TEXT1 if ollama_ok else TEXT3,
+            border_color=ACCENT if ollama_ok else SURF_3,
+            text_color=TEXT_1 if ollama_ok else TEXT_3,
             height=32, corner_radius=8,
             font=ctk.CTkFont("SF Pro Text", 13),
             command=self._on_ollama,
         )
         self._ollama_btn.pack(side="left", padx=4)
 
-        ctk.CTkButton(row, text="⚙  設定", width=90,
-                      command=self._open_settings, **ghost).pack(side="left", padx=4)
+        ctk.CTkButton(
+            row, text="設定", width=96,
+            image=get_icon("settings", icon_size, TEXT_2),
+            compound="left",
+            command=self._open_settings, **ghost,
+        ).pack(side="left", padx=4)
 
     # ── Status bar ───────────────────────────────────────────────────────────
 
@@ -586,7 +622,7 @@ class AppWindow(ctk.CTkFrame):
 
     def _on_transcription_done(self, result: TranscriptionResult) -> None:
         self._transition_to_idle(result)
-        self._show_toast(f"✅  轉錄完成（{result.elapsed_seconds:.1f}s）")
+        self._show_toast(f"轉錄完成 · {result.elapsed_seconds:.1f}s")
 
         text  = result.text
         valid = text and text not in (
@@ -622,7 +658,7 @@ class AppWindow(ctk.CTkFrame):
         lang  = result.language.upper() if result.language else "?"
         model = self._model_var.get()
         self._result_title.configure(
-            text=f"📝  轉錄結果  ({dur}s · {lang} · {model})"
+            text=f"轉錄結果  ({dur}s · {lang} · {model})"
         )
         self._textbox.configure(state="normal")
         existing = self._textbox.get("1.0", "end").strip()
@@ -803,7 +839,7 @@ class AppWindow(ctk.CTkFrame):
         try:
             import pyperclip
             pyperclip.copy(text)
-            self._show_toast("📋  已複製到剪貼簿")
+            self._show_toast("已複製到剪貼簿")
         except Exception as e:
             self._show_toast(f"複製失敗: {e}")
 
@@ -820,7 +856,7 @@ class AppWindow(ctk.CTkFrame):
             try:
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(text)
-                self._show_toast("💾  已儲存")
+                self._show_toast("已儲存")
             except Exception as e:
                 self._show_toast(f"儲存失敗: {e}")
 
@@ -828,7 +864,7 @@ class AppWindow(ctk.CTkFrame):
         self._textbox.configure(state="normal")
         self._textbox.delete("1.0", "end")
         self._textbox.configure(state="disabled")
-        self._result_title.configure(text="📝  轉錄結果")
+        self._result_title.configure(text="轉錄結果")
         self._show_placeholder()
 
     def _toggle_auto_paste(self) -> None:
@@ -836,25 +872,26 @@ class AppWindow(ctk.CTkFrame):
         self.cfg.save()
         on = self.cfg.auto_paste
         self._ap_btn.configure(
-            fg_color=INDIGO if on else SURF1,
-            border_color=INDIGO if on else SURF3,
-            text_color=TEXT1 if on else TEXT3,
-            hover_color="#4745C8" if on else SURF2,
+            fg_color=INDIGO if on else SURF_1,
+            border_color=INDIGO if on else SURF_3,
+            text_color=TEXT_1 if on else TEXT_3,
+            hover_color="#4745C8" if on else SURF_2,
+            image=get_icon("keyboard", 15, TEXT_1 if on else TEXT_3),
         )
-        self._show_toast("⌨  自動貼上已開啟" if on else "⌨  自動貼上已關閉")
+        self._show_toast("自動貼上已開啟" if on else "自動貼上已關閉")
 
     def _on_ollama(self) -> None:
         text = self._get_result_text()
         if not text:
             return
-        self._ollama_btn.configure(state="disabled", text="✨  處理中…")
+        self._ollama_btn.configure(state="disabled", text="處理中…")
 
         def _run():
             result = self.ollama.process(text)
             self.after(0, _done, result)
 
         def _done(result):
-            self._ollama_btn.configure(state="normal", text="✨  潤飾")
+            self._ollama_btn.configure(state="normal", text="潤飾")
             if result.error:
                 self._show_toast(f"Ollama 錯誤: {result.error}")
                 return
@@ -862,7 +899,7 @@ class AppWindow(ctk.CTkFrame):
             self._textbox.delete("1.0", "end")
             self._textbox.insert("end", result.text)
             self._textbox.configure(state="disabled")
-            self._show_toast("✨  潤飾完成")
+            self._show_toast("潤飾完成")
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -891,10 +928,11 @@ class AppWindow(ctk.CTkFrame):
         self._lang_var.set(cfg.language)
         on = cfg.auto_paste
         self._ap_btn.configure(
-            fg_color=INDIGO if on else SURF1,
-            border_color=INDIGO if on else SURF3,
-            text_color=TEXT1 if on else TEXT3,
-            hover_color="#4745C8" if on else SURF2,
+            fg_color=INDIGO if on else SURF_1,
+            border_color=INDIGO if on else SURF_3,
+            text_color=TEXT_1 if on else TEXT_3,
+            hover_color="#4745C8" if on else SURF_2,
+            image=get_icon("keyboard", 15, TEXT_1 if on else TEXT_3),
         )
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -1124,11 +1162,13 @@ class SettingsWindow(ctk.CTkToplevel):
                          text_color=TEXT3).pack(side="right")
 
         ctk.CTkButton(
-            about, text="開啟設定資料夾", width=140, height=28,
+            about, text="開啟設定資料夾", width=156, height=28,
+            image=get_icon("folder", 14, ACCENT_HV),
+            compound="left",
             fg_color="transparent",
-            border_width=1, border_color=SURF3,
-            text_color=BLUE_HV,
-            hover_color=SURF2,
+            border_width=1, border_color=SURF_3,
+            text_color=ACCENT_HV,
+            hover_color=SURF_2,
             font=ctk.CTkFont("SF Pro Text", 12),
             corner_radius=8,
             command=lambda: subprocess.run(
@@ -1270,11 +1310,18 @@ class AccessibilityDialog(ctk.CTkToplevel):
         self.configure(fg_color=BG)
         self.grab_set()
 
+        header_row = ctk.CTkFrame(self, fg_color="transparent")
+        header_row.pack(pady=(32, 12))
         ctk.CTkLabel(
-            self, text="🔐  需要「輔助使用」權限",
+            header_row, text="",
+            image=get_icon("lock", 20, TEXT_1),
+            width=22,
+        ).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(
+            header_row, text="需要「輔助使用」權限",
             font=ctk.CTkFont("SF Pro Display", 17, "bold"),
-            text_color=TEXT1,
-        ).pack(pady=(32, 12))
+            text_color=TEXT_1,
+        ).pack(side="left")
 
         ctk.CTkLabel(
             self,
