@@ -179,6 +179,11 @@ def _i_mic(p: _Pen) -> None:
     p.line(8, 21, 16, 21)            # base
 
 
+def _i_square(p: _Pen) -> None:
+    """Lucide 'square' — stop icon, slightly rounded corners."""
+    p.rect(6, 6, 18, 18, r=1.5)
+
+
 # ─── Registry ────────────────────────────────────────────────────────────────
 
 _REGISTRY: dict[str, Callable[[_Pen], None]] = {
@@ -193,6 +198,7 @@ _REGISTRY: dict[str, Callable[[_Pen], None]] = {
     "folder":     _i_folder,
     "check":      _i_check,
     "mic":        _i_mic,
+    "square":     _i_square,
 }
 
 ICON_NAMES = list(_REGISTRY.keys())
