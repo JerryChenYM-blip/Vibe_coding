@@ -35,7 +35,8 @@ from hotkey_manager import (
 from ollama_client import OllamaClient
 from recorder import AudioRecorder
 from transcriber import Transcriber, TranscriptionResult
-from icons import get_icon
+from icons import get_icon, get_canvas_icon
+from animation import blend, breathe, ease_in_out_cubic, Ripple
 import auto_paste as _ap
 
 # ── Appearance — force Apple dark aesthetic ───────────────────────────────────
@@ -61,42 +62,63 @@ from tokens import (  # noqa: F401  (legacy aliases used across this module)
     DANGER, DANGER_DIM,
     RED, RED_DIM,                   # legacy aliases
     WARN,
-    ORANGE,                         # legacy alias
-    INDIGO, INDIGO_DIM,
-    # Waveform
-    WAVE_IDLE_COL, WAVE_LIVE_COL,
-    # Misc
-    SPINNER,
+    INDIGO, INDIGO_HV,
+    # Typography + spacing
+    FONT_FAMILY_TEXT, FONT_FAMILY_MONO,
+    SPACE_XS, SPACE_SM, SPACE_MD, SPACE_LG,
+    # Motion
+    BREATHE_IDLE_MS, BREATHE_RECORDING_MS, BREATHE_PROCESSING_MS,
+    ROTATE_PROCESSING_MS, RENDER_TICK_MS,
 )
 
-WAVE_BARS = 44
+# ─────────────────────────────────────────────────────────────────────────────
+#  Ambient Chamber — geometry & animation constants
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Breathing glow — record button
-GLOW_SIZE       = 240   # Canvas size (must exceed button+glow radius)
-GLOW_CENTER     = GLOW_SIZE // 2
-BTN_RADIUS      = 82    # Button visual radius
-GLOW_FPS        = 30
-GLOW_TICK_MS    = 1000 // GLOW_FPS
+CHAMBER_SIZE   = 280
+CHAMBER_CENTER = CHAMBER_SIZE // 2          # (140, 140)
+DISC_RADIUS    = 60                         # central clickable disc
+
+RING_RADII_5   = (80, 96, 112, 128, 140)    # idle / recording
+RING_RADII_4   = (80, 100, 120, 140)        # processing (one less = "收斂")
+RING_STROKE    = 2
+
+RING_ALPHA_IDLE       = (0.25, 0.18, 0.12, 0.07, 0.03)
+RING_ALPHA_RECORDING  = (0.35, 0.24, 0.15, 0.08, 0.04)
+RING_ALPHA_PROCESSING = (0.30, 0.18, 0.10, 0.05)
+
+# RMS-driven expansion + ripple emission
+RMS_EXPAND_GAIN   = 0.18     # max +18 % radius at full RMS
+RMS_RIPPLE_THR    = 0.15     # trigger when rms > 0.15 AND > prev × 1.5
+RIPPLE_R0         = 140
+RIPPLE_R1         = 180
+RIPPLE_DURATION   = 1.2      # seconds
+RIPPLE_ALPHA0     = 0.4
+RIPPLE_MAX        = 3
+
+# Processing state — rotating particle belt
+PROC_PARTICLES        = 12
+PROC_PARTICLE_RADIUS  = 4
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Colour blending helpers (simulate alpha on tk.Canvas)
+#  Reduced-motion detection (macOS system preference)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _hex_to_rgb(h: str) -> tuple[int, int, int]:
-    h = h.lstrip("#")
-    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+def system_reduce_motion() -> bool:
+    """Read macOS Reduce Motion preference once at app start.
 
-
-def _blend(fg_hex: str, bg_hex: str, alpha: float) -> str:
-    """Alpha-composite fg over bg. alpha=1.0 → pure fg; alpha=0 → pure bg."""
-    alpha = max(0.0, min(1.0, alpha))
-    r1, g1, b1 = _hex_to_rgb(fg_hex)
-    r2, g2, b2 = _hex_to_rgb(bg_hex)
-    r = int(r2 + (r1 - r2) * alpha)
-    g = int(g2 + (g1 - g2) * alpha)
-    b = int(b2 + (b1 - b2) * alpha)
-    return f"#{r:02X}{g:02X}{b:02X}"
+    Changes to the system pref require an app restart per macOS convention.
+    Falls back to False on any error (key absent, timeout, non-Darwin).
+    """
+    try:
+        r = subprocess.run(
+            ["defaults", "read", "com.apple.universalaccess", "reduceMotion"],
+            capture_output=True, text=True, timeout=0.5,
+        )
+        return r.stdout.strip() == "1"
+    except Exception:
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -123,8 +145,6 @@ class AppWindow(ctk.CTkFrame):
         self._state:       str   = "idle"
         self._hotkey_held: bool  = False
         self._rec_start:   float = 0.0
-        self._spin_idx:    int   = 0
-        self._wave_phase:  float = 0.0
 
         # Auto-paste
         self._paste_target: Optional[str] = None
@@ -221,63 +241,66 @@ class AppWindow(ctk.CTkFrame):
     def _build_record_card(self) -> None:
         card = ctk.CTkFrame(
             self, corner_radius=16,
-            fg_color=SURF1,
+            fg_color=SURF_1,
         )
-        card.pack(fill="x", padx=16, pady=(14, 6))
+        card.pack(fill="x", padx=SPACE_LG, pady=(SPACE_MD + 2, SPACE_SM - 2))
 
-        # Waveform
-        self._wave_canvas = tk.Canvas(
-            card, height=72, bg=SURF1, highlightthickness=0,
+        # Ambient chamber — single canvas replacing waveform + outer ring + button
+        self._chamber = tk.Canvas(
+            card,
+            width=CHAMBER_SIZE, height=CHAMBER_SIZE,
+            bg=SURF_1, highlightthickness=0, bd=0,
         )
-        self._wave_canvas.pack(fill="x", padx=24, pady=(20, 8))
-        self._draw_idle_wave()
+        self._chamber.pack(pady=(SPACE_MD, SPACE_XS))
 
-        # Button zone — Canvas hosts the breathing glow; button is overlaid on top
-        zone = ctk.CTkFrame(card, fg_color="transparent")
-        zone.pack(pady=(4, 6))
+        # Canvas event bindings — 注意：tkinter 的 <Button-1> == <ButtonPress-1>，
+        # 不能同時綁兩者，後者會覆蓋前者。一律走 press/release 處理。
+        self._chamber.bind("<Enter>",           self._on_chamber_enter)
+        self._chamber.bind("<Leave>",           self._on_chamber_leave)
+        self._chamber.bind("<Motion>",          self._on_chamber_motion)
+        self._chamber.bind("<ButtonPress-1>",   self._on_chamber_press)
+        self._chamber.bind("<ButtonRelease-1>", self._on_chamber_release)
 
-        self._glow_canvas = tk.Canvas(
-            zone,
-            width=GLOW_SIZE, height=GLOW_SIZE,
-            bg=SURF1, highlightthickness=0,
+        # Timer — visible only during recording, SF Mono for tabular digits
+        self._timer_label = ctk.CTkLabel(
+            card, text="",
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 18, "bold"),
+            text_color=TEXT_2,
         )
-        self._glow_canvas.pack()
+        self._timer_label.pack(pady=(0, SPACE_XS))
 
-        self._record_btn = ctk.CTkButton(
-            self._glow_canvas,
-            text="🎤\n點擊錄音",
-            width=BTN_RADIUS * 2, height=BTN_RADIUS * 2,
-            corner_radius=BTN_RADIUS,
-            fg_color=GREEN,
-            hover_color="#28B84A",
-            text_color="#FFFFFF",
-            font=ctk.CTkFont("SF Pro Text", 14, "bold"),
-            border_width=0,
-            command=self._on_record_btn,
-        )
-        self._record_btn.place(x=GLOW_CENTER, y=GLOW_CENTER, anchor="center")
-
-        # Glow animation state
-        self._glow_phase: float = 0.0
-        self._glow_running: bool = False
-        self._start_glow()
-
-        # Auto-paste target label
+        # Auto-paste target label (reused)
         self._target_label = ctk.CTkLabel(
             card, text="",
-            font=ctk.CTkFont("SF Pro Text", 12),
-            text_color=BLUE_HV,
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 12),
+            text_color=INDIGO,
         )
-        self._target_label.pack(pady=(4, 2))
+        self._target_label.pack()
 
-        # Hotkey hint
+        # Hotkey hint (text changes per state)
         self._hotkey_hint = ctk.CTkLabel(
             card,
-            text=f"按住 {self.cfg.format_hotkey_display()} 即時錄音",
-            font=ctk.CTkFont("SF Pro Text", 12),
-            text_color=TEXT3,
+            text=f"按下 {self.cfg.format_hotkey_display()} 即時錄音",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 12),
+            text_color=TEXT_3,
         )
-        self._hotkey_hint.pack(pady=(0, 18))
+        self._hotkey_hint.pack(pady=(0, SPACE_MD + 2))
+
+        # Pre-render icons for each state (tk.Canvas needs PhotoImage, not CTkImage)
+        self._icon_mic_idle = get_canvas_icon("mic",    36, TEXT_2)
+        self._icon_square   = get_canvas_icon("square", 28, TEXT_1)
+        self._icon_mic_proc = get_canvas_icon("mic",    36, blend(WARN, SURF_2, 0.6))
+
+        # Chamber animation state
+        self._state_start_time = time.perf_counter()
+        self._ripples: list[Ripple] = []
+        self._prev_rms         = 0.0
+        self._pressed          = False
+        self._hovering         = False
+        self._reduce_motion    = system_reduce_motion()
+
+        # Kick off the render loop (runs for the life of the window)
+        self._render_tick()
 
     # ── Result card ──────────────────────────────────────────────────────────
 
@@ -396,7 +419,7 @@ class AppWindow(ctk.CTkFrame):
             border_width=1,
             border_color=INDIGO if ap_on else SURF_3,
             text_color=TEXT_1 if ap_on else TEXT_3,
-            hover_color="#4745C8" if ap_on else SURF_2,
+            hover_color=INDIGO_HV if ap_on else SURF_2,
             command=self._toggle_auto_paste,
         )
         self._ap_btn.pack(side="left", padx=4)
@@ -451,12 +474,8 @@ class AppWindow(ctk.CTkFrame):
         )
         self._status_label.pack(side="left")
 
-        self._timer_label = ctk.CTkLabel(
-            inner, text="",
-            font=ctk.CTkFont("SF Pro Text", 12, "bold"),
-            text_color=RED,
-        )
-        self._timer_label.pack(side="right")
+        # Timer is rendered under the chamber (see _build_record_card); status
+        # bar no longer carries a redundant mm:ss label.
 
         self._hotkey_status = ctk.CTkLabel(
             inner, text=self.cfg.format_hotkey_display(),
@@ -472,47 +491,54 @@ class AppWindow(ctk.CTkFrame):
     def _transition_to_recording(self) -> None:
         if self._state != "idle":
             return
-        self._state       = "recording"
-        self._rec_start   = time.perf_counter()
-        self._hotkey_held = True
-        self._stream_samples = 0
-        self._stream_chunks  = []
+        self._state            = "recording"
+        self._state_start_time = time.perf_counter()
+        self._rec_start        = self._state_start_time
+        self._hotkey_held      = True
+        self._stream_samples   = 0
+        self._stream_chunks    = []
+        self._ripples.clear()
+        self._prev_rms         = 0.0
 
-        # Capture frontmost app for auto-paste
+        # Capture frontmost app for auto-paste —— 背景執行緒執行，避免 2 秒
+        # osascript timeout 卡住 recorder.start()。短錄音也夠時間在轉錄前完成。
+        self._paste_target = None
+        self._target_label.configure(text="")
         if self.cfg.auto_paste:
-            self._paste_target = _ap.get_frontmost_app()
-            if self._paste_target and self._paste_target not in ("Python", "python3"):
-                self._target_label.configure(
-                    text=f"⌨  → {self._paste_target}"
-                )
-            else:
-                self._paste_target = None
-                self._target_label.configure(text="")
-        else:
-            self._paste_target = None
-            self._target_label.configure(text="")
+            def _capture_frontmost():
+                app = _ap.get_frontmost_app()
+                if not app or app in ("Python", "python3"):
+                    return
+                def _apply():
+                    if self._state == "recording":   # 仍在錄，才更新
+                        self._paste_target = app
+                        self._target_label.configure(text=f"→ {app}")
+                self.after(0, _apply)
+            threading.Thread(target=_capture_frontmost, daemon=True).start()
 
         self.recorder.start()
 
-        self._record_btn.configure(
-            text="●\n錄音中…",
-            fg_color=RED,
-            hover_color="#CC3630",
+        # UI: chamber render loop picks up new state automatically
+        self._timer_label.configure(text="00:00")
+        self._hotkey_hint.configure(
+            text=f"放開 {self.cfg.format_hotkey_display()} 停止錄音"
         )
         self._model_menu.configure(state="disabled")
         self._lang_menu.configure(state="disabled")
-        self._status_dot.configure(text_color=RED)
+        self._status_dot.configure(text_color=DANGER)
         self._status_label.configure(text="  錄音中")
 
-        self._update_wave()
         self._update_timer()
-        self._stream_tick_id = self.after(5000, self._stream_tick)
+        # Streaming 中段轉錄目前暫停：small 模型品質拖累主模型最終輸出，等 Ollama
+        # 接上後再評估是否重啟。_stream_tick 方法保留備用。
+        self._stream_tick_id = None
 
     def _transition_to_processing(self) -> None:
         if self._state != "recording":
             return
-        self._state       = "processing"
-        self._hotkey_held = False
+        self._state            = "processing"
+        self._state_start_time = time.perf_counter()
+        self._hotkey_held      = False
 
         if self._stream_tick_id is not None:
             self.after_cancel(self._stream_tick_id)
@@ -520,19 +546,12 @@ class AppWindow(ctk.CTkFrame):
 
         full_audio = self.recorder.stop()
 
-        self._record_btn.configure(
-            text=f"{SPINNER[0]}\n轉錄中…",
-            fg_color=ORANGE,
-            hover_color=ORANGE,
-            state="disabled",
-        )
-        self._target_label.configure(text="")
-        self._status_dot.configure(text_color=ORANGE)
-        self._status_label.configure(text="  轉錄中，請稍候…")
+        # UI: chamber render loop will switch to WARN palette + particle belt
         self._timer_label.configure(text="")
-
-        self._draw_idle_wave()
-        self._animate_spinner()
+        self._hotkey_hint.configure(text="轉錄中…")
+        self._target_label.configure(text="")
+        self._status_dot.configure(text_color=WARN)
+        self._status_label.configure(text="  轉錄中，請稍候…")
 
         tail  = full_audio[self._stream_samples:]
         model = self._model_var.get()
@@ -546,20 +565,20 @@ class AppWindow(ctk.CTkFrame):
         ).start()
 
     def _transition_to_idle(self, result: Optional[TranscriptionResult] = None) -> None:
-        self._state = "idle"
+        self._state            = "idle"
+        self._state_start_time = time.perf_counter()
+        self._ripples.clear()
 
-        self._record_btn.configure(
-            text="🎤\n點擊錄音",
-            fg_color=GREEN,
-            hover_color="#28B84A",
-            state="normal",
+        self._timer_label.configure(text="")
+        self._hotkey_hint.configure(
+            text=f"按下 {self.cfg.format_hotkey_display()} 即時錄音"
         )
         self._model_menu.configure(state="normal")
         self._lang_menu.configure(state="normal")
         self._target_label.configure(text="")
 
         model = self._model_var.get()
-        self._status_dot.configure(text_color=GREEN)
+        self._status_dot.configure(text_color=SUCCESS)
         self._status_label.configure(text=f"  就緒 ({model})")
 
         if result is not None:
@@ -599,13 +618,10 @@ class AppWindow(ctk.CTkFrame):
     #  TRANSCRIPTION
     # ═══════════════════════════════════════════════════════════════════════
 
-    _FAST_THRESHOLD = 8 * 16_000
-
     def _run_transcription(self, audio, model: str, lang) -> None:
-        if len(audio) <= self._FAST_THRESHOLD and not self._stream_chunks:
-            result = self.transcriber.transcribe_fast(audio, language=lang)
-        else:
-            result = self.transcriber.transcribe(audio, model_size=model, language=lang)
+        # 一律用使用者選的模型做最終轉錄，不再因短音檔退化到 transcribe_fast
+        # （那條路徑寫死 small，會嚴重拖垮品質）。
+        result = self.transcriber.transcribe(audio, model_size=model, language=lang)
 
         prior = list(self._stream_chunks)
         if prior:
@@ -671,134 +687,202 @@ class AppWindow(ctk.CTkFrame):
         self._textbox.configure(state="disabled")
 
     # ═══════════════════════════════════════════════════════════════════════
-    #  ANIMATIONS
+    #  AMBIENT CHAMBER — render loop + draw + events
     # ═══════════════════════════════════════════════════════════════════════
 
-    # ── Breathing glow (always-on, 30fps) ────────────────────────────────────
-    def _start_glow(self) -> None:
-        if self._glow_running:
+    def _render_tick(self) -> None:
+        """Main render loop — 50 ms cadence, owns the chamber canvas."""
+        try:
+            self._draw_chamber()
+        except tk.TclError:
+            # Canvas destroyed during app shutdown — stop the loop silently.
             return
-        self._glow_running = True
-        self._draw_glow()
+        self.after(RENDER_TICK_MS, self._render_tick)
 
-    def _draw_glow(self) -> None:
-        """Single glow tick. Renders state-aware concentric halo or spinning arc."""
-        if not self._glow_running:
-            return
+    def _draw_chamber(self) -> None:
+        """Render ambient rings + central disc + icon for the current state."""
+        now = time.perf_counter()
+        c   = self._chamber
+        c.delete("all")
 
-        c  = self._glow_canvas
-        cx = cy = GLOW_CENTER
-        c.delete("glow")
+        state = self._state
+        rm    = self._reduce_motion
 
-        phase = self._glow_phase
-
-        if self._state == "processing":
-            # Rotating conic-arc ring — 12 segments, each fading tail-to-head
-            r_outer = BTN_RADIUS + 16        # 98
-            rotation = (phase * 4.5) % 360    # ~13.5°/frame → fast spin
-            segments  = 12
-            seg_ext   = 26
-            seg_gap   = 30 - seg_ext
-            for i in range(segments):
-                alpha = 1.0 - (i / segments) * 0.85   # 1.0 → 0.15 across tail
-                col   = _blend(ORANGE, SURF1, alpha * 0.9)
-                start = rotation + i * (seg_ext + seg_gap)
-                c.create_arc(
-                    cx - r_outer, cy - r_outer,
-                    cx + r_outer, cy + r_outer,
-                    start=start, extent=seg_ext,
-                    style="arc", outline=col, width=4,
-                    tags="glow",
-                )
+        # ─── State-dependent palette and geometry ────────────────────────
+        if state == "idle":
+            color  = ACCENT
+            period = BREATHE_IDLE_MS / 1000.0
+            alphas = RING_ALPHA_IDLE
+            radii  = RING_RADII_5
+            rms    = 0.0
+        elif state == "recording":
+            color  = DANGER
+            period = BREATHE_RECORDING_MS / 1000.0
+            alphas = RING_ALPHA_RECORDING
+            radii  = RING_RADII_5
+            rms    = self.recorder.get_rms_level() if self.recorder.is_recording() else 0.0
+        elif state == "processing":
+            color  = WARN
+            period = BREATHE_PROCESSING_MS / 1000.0
+            alphas = RING_ALPHA_PROCESSING
+            radii  = RING_RADII_4
+            rms    = 0.0
         else:
-            # Breathing halo — 6 concentric layers, outer = dimmer
-            if self._state == "recording":
-                base         = RED
-                speed        = 0.105          # ~2.5s breath cycle
-                halo_layers  = 7
-                base_radius  = BTN_RADIUS + 6  # start right outside button
-                spread       = 26             # max expansion at peak
-                strength     = 0.78
-            else:  # idle
-                base         = GREEN
-                speed        = 0.045          # ~6s slow breath
-                halo_layers  = 6
-                base_radius  = BTN_RADIUS + 6
-                spread       = 14
-                strength     = 0.42
+            return
 
-            # breath = 0.0 (compressed) → 1.0 (expanded)
-            breath = 0.5 + 0.5 * math.sin(phase * speed)
+        # ─── Breathing scale ─────────────────────────────────────────────
+        if rm:
+            scale = 1.0
+        else:
+            phase = ((now - self._state_start_time) % period) / period
+            b     = breathe(phase)
+            if state == "idle":
+                scale = 0.97 + b * 0.06                        # 0.97 ↔ 1.03
+            elif state == "recording":
+                scale = 1.0 + b * 0.04 + rms * RMS_EXPAND_GAIN
+            else:  # processing
+                scale = 0.98 + b * 0.04
 
-            for i in range(halo_layers):
-                t = i / (halo_layers - 1)               # 0 (inner) → 1 (outer)
-                r = base_radius + t * spread + breath * (spread * 0.35)
-                # Alpha: inner ring brightest, outer fades out; breath modulates overall
-                layer_alpha = (1.0 - t) ** 1.8          # exponential falloff
-                alpha = strength * layer_alpha * (0.55 + 0.45 * breath)
-                col   = _blend(base, SURF1, alpha)
+        if self._pressed and state == "idle":
+            scale *= 0.97
+
+        cx = cy = CHAMBER_CENTER
+
+        # ─── Ripples (recording, non-reduced-motion) ─────────────────────
+        if state == "recording" and not rm:
+            if rms > RMS_RIPPLE_THR and rms > self._prev_rms * 1.5:
+                self._ripples.append(Ripple(
+                    start_time=now,
+                    duration=RIPPLE_DURATION,
+                    r0=RIPPLE_R0, r1=RIPPLE_R1, a0=RIPPLE_ALPHA0,
+                ))
+                if len(self._ripples) > RIPPLE_MAX:
+                    self._ripples = self._ripples[-RIPPLE_MAX:]
+
+            alive: list[Ripple] = []
+            for rip in self._ripples:
+                st = rip.state(now)
+                if st is None:
+                    continue
+                r_rip, a_rip = st
+                col = blend(DANGER, SURF_1, a_rip)
                 c.create_oval(
-                    cx - r, cy - r, cx + r, cy + r,
-                    outline=col, width=2,
-                    tags="glow",
+                    cx - r_rip, cy - r_rip, cx + r_rip, cy + r_rip,
+                    outline=col, width=RING_STROKE,
+                )
+                alive.append(rip)
+            self._ripples = alive
+        self._prev_rms = rms
+
+        # ─── Ambient concentric rings (outside-in so inner draws on top) ─
+        for radius, a in zip(reversed(radii), reversed(alphas)):
+            r = radius * scale
+            col = blend(color, SURF_1, a)
+            c.create_oval(
+                cx - r, cy - r, cx + r, cy + r,
+                outline=col, width=RING_STROKE,
+            )
+
+        # ─── Processing rotating particle belt ───────────────────────────
+        if state == "processing":
+            outer_r = radii[-1] * scale
+            if rm:
+                head = 0.0
+            else:
+                t_norm = ((now - self._state_start_time) %
+                          (ROTATE_PROCESSING_MS / 1000.0)) \
+                         / (ROTATE_PROCESSING_MS / 1000.0)
+                head = ease_in_out_cubic(t_norm) * 360.0
+
+            pr = PROC_PARTICLE_RADIUS
+            for i in range(PROC_PARTICLES):
+                ang = math.radians(head + i * (360.0 / PROC_PARTICLES))
+                px = cx + outer_r * math.cos(ang)
+                py = cy + outer_r * math.sin(ang)
+                # Brightness gradient: head particle brightest → fades around belt
+                idx_from_head = (i % PROC_PARTICLES) / PROC_PARTICLES
+                a_p = 1.0 - idx_from_head * 0.85              # 1.0 → 0.15
+                if rm:
+                    a_p = 0.6
+                col_p = blend(WARN, SURF_1, a_p)
+                c.create_oval(
+                    px - pr, py - pr, px + pr, py + pr,
+                    fill=col_p, outline="",
                 )
 
-        self._glow_phase += 1
-        self.after(GLOW_TICK_MS, self._draw_glow)
+        # ─── Central disc ────────────────────────────────────────────────
+        dr = DISC_RADIUS * (scale if self._pressed and state == "idle" else 1.0)
+        if state == "idle":
+            disc_fill   = SURF_2
+            disc_border = ACCENT if self._hovering else SURF_4
+            disc_width  = 1.5
+        elif state == "recording":
+            disc_fill   = blend(DANGER, SURF_1, 0.12)
+            disc_border = DANGER
+            disc_width  = 2.0
+        else:  # processing
+            disc_fill   = SURF_2
+            disc_border = WARN
+            disc_width  = 1.5
 
-    def _update_wave(self) -> None:
-        if self._state != "recording":
-            self._draw_idle_wave()
-            return
-        self._draw_live_wave(self.recorder.get_rms_level())
-        self.after(50, self._update_wave)
-
-    def _draw_idle_wave(self) -> None:
-        c  = self._wave_canvas
-        c.delete("all")
-        w  = c.winfo_width() or WIN_W - 80
-        h  = 72
-        bw = max(2, w // WAVE_BARS - 3)
-        gp = w // WAVE_BARS
-        for i in range(WAVE_BARS):
-            x  = i * gp + gp // 2
-            bh = 3 + int(5 * abs(math.sin(i * 0.25)))
-            y0 = (h - bh) // 2
-            c.create_rectangle(x, y0, x + bw, y0 + bh,
-                                fill=WAVE_IDLE_COL, outline="")
-
-    def _draw_live_wave(self, rms: float) -> None:
-        import random
-        c  = self._wave_canvas
-        c.delete("all")
-        w  = c.winfo_width() or WIN_W - 80
-        h  = 72
-        bw = max(2, w // WAVE_BARS - 3)
-        gp = w // WAVE_BARS
-        self._wave_phase = (self._wave_phase + 0.20) % (2 * math.pi)
-        for i in range(WAVE_BARS):
-            x    = i * gp + gp // 2
-            wave = 0.5 + 0.5 * math.sin(self._wave_phase + i * 0.32)
-            jit  = random.uniform(0.88, 1.12)
-            bh   = max(3, int((h - 12) * rms * 5 * wave * jit))
-            bh   = min(bh, h - 12)
-            y0   = (h - bh) // 2
-            # White → red-tinted by amplitude
-            t   = min(1.0, rms * 7)
-            r_c = int(0xF5 + t * (0xFF - 0xF5))
-            g_c = int(0xF5 + t * (0x45 - 0xF5))
-            b_c = int(0xF7 + t * (0x3A - 0xF7))
-            c.create_rectangle(x, y0, x + bw, y0 + bh,
-                                fill=f"#{r_c:02X}{g_c:02X}{b_c:02X}", outline="")
-
-    def _animate_spinner(self) -> None:
-        if self._state != "processing":
-            return
-        self._record_btn.configure(
-            text=f"{SPINNER[self._spin_idx % len(SPINNER)]}\n轉錄中…"
+        c.create_oval(
+            cx - dr, cy - dr, cx + dr, cy + dr,
+            fill=disc_fill, outline=disc_border, width=disc_width,
         )
-        self._spin_idx += 1
-        self.after(120, self._animate_spinner)
+
+        # ─── Central icon ────────────────────────────────────────────────
+        if state == "idle":
+            icon = self._icon_mic_idle
+        elif state == "recording":
+            icon = self._icon_square
+        else:
+            icon = self._icon_mic_proc
+
+        c.create_image(cx, cy, image=icon)
+
+    # ── Canvas event handlers ────────────────────────────────────────────
+
+    def _in_disc(self, x: int, y: int) -> bool:
+        dx = x - CHAMBER_CENTER
+        dy = y - CHAMBER_CENTER
+        return dx * dx + dy * dy <= DISC_RADIUS * DISC_RADIUS
+
+    def _on_chamber_enter(self, event) -> None:
+        self._hovering = self._in_disc(event.x, event.y) and self._state == "idle"
+
+    def _on_chamber_leave(self, event) -> None:
+        self._hovering = False
+        self._pressed  = False
+        try:
+            self._chamber.configure(cursor="")
+        except tk.TclError:
+            pass
+
+    def _on_chamber_motion(self, event) -> None:
+        inside = self._in_disc(event.x, event.y)
+        self._hovering = inside and self._state == "idle"
+        try:
+            self._chamber.configure(cursor="hand2" if self._hovering else "")
+        except tk.TclError:
+            pass
+
+    def _on_chamber_press(self, event) -> None:
+        # idle → 即將開始錄音；recording → 即將停止（轉 processing）
+        if self._in_disc(event.x, event.y) and self._state in ("idle", "recording"):
+            self._pressed = True
+        print(f"CHAMBER: press  at ({event.x},{event.y}) state={self._state} pressed={self._pressed}")
+
+    def _on_chamber_release(self, event) -> None:
+        was_pressed = self._pressed
+        self._pressed = False
+        print(f"CHAMBER: release at ({event.x},{event.y}) state={self._state} was_pressed={was_pressed}")
+        # 只在「按下時命中 disc、放開時還在 disc 內、狀態允許」時觸發
+        if (
+            was_pressed
+            and self._in_disc(event.x, event.y)
+            and self._state in ("idle", "recording")
+        ):
+            self._on_record_btn()
 
     def _update_timer(self) -> None:
         if self._state != "recording":
@@ -807,7 +891,6 @@ class AppWindow(ctk.CTkFrame):
         elapsed = int(time.perf_counter() - self._rec_start)
         mm, ss  = divmod(elapsed, 60)
         self._timer_label.configure(text=f"{mm:02d}:{ss:02d}")
-        self._record_btn.configure(text=f"●\n錄音中…\n{mm:02d}:{ss:02d}")
         self.after(1000, self._update_timer)
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -875,7 +958,7 @@ class AppWindow(ctk.CTkFrame):
             fg_color=INDIGO if on else SURF_1,
             border_color=INDIGO if on else SURF_3,
             text_color=TEXT_1 if on else TEXT_3,
-            hover_color="#4745C8" if on else SURF_2,
+            hover_color=INDIGO_HV if on else SURF_2,
             image=get_icon("keyboard", 15, TEXT_1 if on else TEXT_3),
         )
         self._show_toast("自動貼上已開啟" if on else "自動貼上已關閉")
@@ -920,8 +1003,12 @@ class AppWindow(ctk.CTkFrame):
         SettingsWindow(self, self.cfg, self._on_settings_saved)
 
     def _on_settings_saved(self, cfg: Config) -> None:
+        old_hotkey = self.cfg.hotkey
         self.cfg = cfg
-        self._start_hotkey_listener()
+        # 只有 hotkey 真正變更才重啟 pynput listener——反覆 stop/start 在 macOS
+        # 上曾與 MLX/Metal 並存時觸發 native 層不穩定，能避免就避免。
+        if cfg.hotkey != old_hotkey:
+            self._start_hotkey_listener()
         self._hotkey_hint.configure(text=f"按住 {cfg.format_hotkey_display()} 即時錄音")
         self._hotkey_status.configure(text=cfg.format_hotkey_display())
         self._model_var.set(cfg.model)
@@ -931,7 +1018,7 @@ class AppWindow(ctk.CTkFrame):
             fg_color=INDIGO if on else SURF_1,
             border_color=INDIGO if on else SURF_3,
             text_color=TEXT_1 if on else TEXT_3,
-            hover_color="#4745C8" if on else SURF_2,
+            hover_color=INDIGO_HV if on else SURF_2,
             image=get_icon("keyboard", 15, TEXT_1 if on else TEXT_3),
         )
 
@@ -950,7 +1037,6 @@ class AppWindow(ctk.CTkFrame):
         def _load():
             try:
                 self.transcriber.warmup(model)
-                self.transcriber.warmup("small")
                 backend = self.transcriber.active_backend()
                 label   = "⚡ Metal" if backend == "mlx" else "CPU"
                 self.after(0, lambda: self._status_label.configure(

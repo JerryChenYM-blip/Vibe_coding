@@ -51,7 +51,9 @@ _MLX_MODEL_MAP: dict[str, str] = {
 
 # Minimum RMS energy to bother calling Whisper.
 # Audio quieter than this is treated as silence.
-_MIN_RMS = 0.004
+# 0.002 是實測下可以抓到「嗯」「好」「對」這類短促輕音的下限；再低就會把真靜音
+# 也送進 Whisper 引發幻覺。
+_MIN_RMS = 0.002
 
 # Known Whisper hallucination substrings (model outputs these on silence/noise).
 # Matching is case-insensitive and strips whitespace.

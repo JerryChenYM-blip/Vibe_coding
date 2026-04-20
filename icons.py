@@ -22,7 +22,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Callable
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageTk
 import customtkinter as ctk
 
 # ─── Constants ───────────────────────────────────────────────────────────────
@@ -179,6 +179,11 @@ def _i_mic(p: _Pen) -> None:
     p.line(8, 21, 16, 21)            # base
 
 
+def _i_square(p: _Pen) -> None:
+    """Lucide 'square' — stop icon, slightly rounded corners."""
+    p.rect(6, 6, 18, 18, r=1.5)
+
+
 # ─── Registry ────────────────────────────────────────────────────────────────
 
 _REGISTRY: dict[str, Callable[[_Pen], None]] = {
@@ -193,6 +198,7 @@ _REGISTRY: dict[str, Callable[[_Pen], None]] = {
     "folder":     _i_folder,
     "check":      _i_check,
     "mic":        _i_mic,
+    "square":     _i_square,
 }
 
 ICON_NAMES = list(_REGISTRY.keys())
@@ -233,3 +239,25 @@ def get_icon(name: str, size: int = 16, color: str = "#FFFFFF") -> ctk.CTkImage:
                       size=(size, size))
     _CK_CACHE[key] = ck
     return ck
+
+
+# ─── Canvas-compatible icons (tk.Canvas.create_image uses PhotoImage) ────────
+
+_CANVAS_CACHE: dict[tuple[str, int, str], ImageTk.PhotoImage] = {}
+
+
+def get_canvas_icon(name: str, size: int = 16,
+                    color: str = "#FFFFFF") -> ImageTk.PhotoImage:
+    """Return a PhotoImage for `name` suitable for `tk.Canvas.create_image`.
+
+    CTkImage does not work with raw tk.Canvas; use this for canvas glyphs.
+    Caller MUST retain a reference to the returned object (held here).
+    """
+    key = (name, size, color)
+    cached = _CANVAS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    pil = _render_pil(name, size, color)
+    photo = ImageTk.PhotoImage(pil)
+    _CANVAS_CACHE[key] = photo
+    return photo

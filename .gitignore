@@ -43,6 +43,14 @@ Icon
 # App logs
 app.log
 app.pid
+fault.log
+*.log
+
+# Node (不該被版控的依賴)
+node_modules/
 
 # Local settings
 .claude/
+
+# macOS 截圖等本機 artefact
+image/iShot_*.png

@@ -13,7 +13,12 @@ Fixes applied vs previous version:
 from __future__ import annotations
 
 import threading
+import time
 from typing import Callable, Optional, Set
+
+# 若 _combo_active=True 已持續超過此秒數仍未見 release，視為 pynput 漏收事件，
+# 下次 press 時自我修復。2 秒足以涵蓋正常「按住說話」場景而不誤觸發重置。
+_STALE_COMBO_SEC = 2.0
 
 try:
     from pynput import keyboard as _kb
@@ -176,6 +181,8 @@ class HotkeyManager:
         self._hotkeys:      set = set()
         self._pressed:      Set = set()
         self._combo_active: bool = False
+        self._combo_active_at: float = 0.0    # monotonic timestamp
+        self._last_event_at:   float = 0.0
         self._listener:     Optional[_kb.Listener] = None
         self._lock = threading.Lock()
 
@@ -213,24 +220,44 @@ class HotkeyManager:
 
     def _on_p(self, key) -> None:
         nk = self._normalize(key)
+        now = time.monotonic()
         fire = False
+        healed = False
         with self._lock:
+            # Self-heal: combo_active 卡太久 = pynput 漏收 release，重置
+            if (
+                self._combo_active
+                and (now - self._combo_active_at) > _STALE_COMBO_SEC
+            ):
+                healed = True
+                self._combo_active = False
+                self._pressed.clear()
             self._pressed.add(nk)
+            self._last_event_at = now
             if not self._combo_active and self._hotkeys.issubset(self._pressed):
                 self._combo_active = True
+                self._combo_active_at = now
                 fire = True
+        if healed:
+            print(f"HOTKEY: self-heal — stale combo_active cleared")
+        if nk in self._hotkeys:
+            print(f"HOTKEY: press   {nk!r:>10}  pressed={sorted(self._pressed, key=str)}")
         if fire:
             print("HOTKEY: Triggered!")
             self._on_press_cb()   # called OUTSIDE lock
 
     def _on_r(self, key) -> None:
         nk = self._normalize(key)
+        now = time.monotonic()
         fire = False
         with self._lock:
             if self._combo_active and nk in self._hotkeys:
                 self._combo_active = False
                 fire = True
             self._pressed.discard(nk)
+            self._last_event_at = now
+        if nk in self._hotkeys:
+            print(f"HOTKEY: release {nk!r:>10}  pressed={sorted(self._pressed, key=str)}")
         if fire:
             print("HOTKEY: Released!")
             self._on_release_cb()  # called OUTSIDE lock

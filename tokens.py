@@ -126,6 +126,17 @@ DUR_FAST   = 120   # hover, tap feedback
 DUR_NORMAL = 240   # state transitions
 DUR_SLOW   = 400   # card enter, modal
 
+# Breathing periods for the record chamber's three states.
+BREATHE_IDLE_MS       = 6000   # calm
+BREATHE_RECORDING_MS  = 2500   # alive
+BREATHE_PROCESSING_MS = 1800   # working
+
+# Rotating particle belt used in the processing state.
+ROTATE_PROCESSING_MS  = 1500
+
+# Canvas render loop cadence — 20 FPS, matches prior _update_wave budget.
+RENDER_TICK_MS        = 50
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SPINNER (Unicode Braille animation)
