@@ -11,6 +11,15 @@ import sys
 import threading
 import os
 import datetime
+import faulthandler
+import traceback
+
+# ── Native crash dump（獨立檔，避免被 Logger 時間戳切碎） ──────────────
+# 捕捉 SIGSEGV / SIGABRT / SIGBUS 等 C-level 崩潰（例如 MLX/Metal mutex 失敗），
+# 這些情況下 Python 例外機制抓不到，只會在 stderr 被 kill 前留一段文字。
+_fault_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fault.log")
+_fault_log_fh = open(_fault_log_path, "a", encoding="utf-8")
+faulthandler.enable(file=_fault_log_fh, all_threads=True)
 
 # ── Logging Setup ─────────────────────────────────────────────────────
 class Logger:
@@ -113,4 +122,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        # 任何 Python 例外都落地到 app.log，避免下次又只留一段靜默
+        print("FATAL: Uncaught exception in main()")
+        traceback.print_exc()
+        raise

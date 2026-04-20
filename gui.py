@@ -253,8 +253,8 @@ class AppWindow(ctk.CTkFrame):
         )
         self._chamber.pack(pady=(SPACE_MD, SPACE_XS))
 
-        # Canvas event bindings (no CTkButton → handle clicks ourselves)
-        self._chamber.bind("<Button-1>",        self._on_chamber_click)
+        # Canvas event bindings — 注意：tkinter 的 <Button-1> == <ButtonPress-1>，
+        # 不能同時綁兩者，後者會覆蓋前者。一律走 press/release 處理。
         self._chamber.bind("<Enter>",           self._on_chamber_enter)
         self._chamber.bind("<Leave>",           self._on_chamber_leave)
         self._chamber.bind("<Motion>",          self._on_chamber_motion)
@@ -500,19 +500,21 @@ class AppWindow(ctk.CTkFrame):
         self._ripples.clear()
         self._prev_rms         = 0.0
 
-        # Capture frontmost app for auto-paste
+        # Capture frontmost app for auto-paste —— 背景執行緒執行，避免 2 秒
+        # osascript timeout 卡住 recorder.start()。短錄音也夠時間在轉錄前完成。
+        self._paste_target = None
+        self._target_label.configure(text="")
         if self.cfg.auto_paste:
-            self._paste_target = _ap.get_frontmost_app()
-            if self._paste_target and self._paste_target not in ("Python", "python3"):
-                self._target_label.configure(
-                    text=f"→ {self._paste_target}"
-                )
-            else:
-                self._paste_target = None
-                self._target_label.configure(text="")
-        else:
-            self._paste_target = None
-            self._target_label.configure(text="")
+            def _capture_frontmost():
+                app = _ap.get_frontmost_app()
+                if not app or app in ("Python", "python3"):
+                    return
+                def _apply():
+                    if self._state == "recording":   # 仍在錄，才更新
+                        self._paste_target = app
+                        self._target_label.configure(text=f"→ {app}")
+                self.after(0, _apply)
+            threading.Thread(target=_capture_frontmost, daemon=True).start()
 
         self.recorder.start()
 
@@ -527,7 +529,9 @@ class AppWindow(ctk.CTkFrame):
         self._status_label.configure(text="  錄音中")
 
         self._update_timer()
-        self._stream_tick_id = self.after(5000, self._stream_tick)
+        # Streaming 中段轉錄目前暫停：small 模型品質拖累主模型最終輸出，等 Ollama
+        # 接上後再評估是否重啟。_stream_tick 方法保留備用。
+        self._stream_tick_id = None
 
     def _transition_to_processing(self) -> None:
         if self._state != "recording":
@@ -614,13 +618,10 @@ class AppWindow(ctk.CTkFrame):
     #  TRANSCRIPTION
     # ═══════════════════════════════════════════════════════════════════════
 
-    _FAST_THRESHOLD = 8 * 16_000
-
     def _run_transcription(self, audio, model: str, lang) -> None:
-        if len(audio) <= self._FAST_THRESHOLD and not self._stream_chunks:
-            result = self.transcriber.transcribe_fast(audio, language=lang)
-        else:
-            result = self.transcriber.transcribe(audio, model_size=model, language=lang)
+        # 一律用使用者選的模型做最終轉錄，不再因短音檔退化到 transcribe_fast
+        # （那條路徑寫死 small，會嚴重拖垮品質）。
+        result = self.transcriber.transcribe(audio, model_size=model, language=lang)
 
         prior = list(self._stream_chunks)
         if prior:
@@ -846,13 +847,6 @@ class AppWindow(ctk.CTkFrame):
         dy = y - CHAMBER_CENTER
         return dx * dx + dy * dy <= DISC_RADIUS * DISC_RADIUS
 
-    def _on_chamber_click(self, event) -> None:
-        if not self._in_disc(event.x, event.y):
-            return
-        if self._state == "processing":
-            return
-        self._on_record_btn()      # delegate to existing state-machine entry
-
     def _on_chamber_enter(self, event) -> None:
         self._hovering = self._in_disc(event.x, event.y) and self._state == "idle"
 
@@ -873,11 +867,22 @@ class AppWindow(ctk.CTkFrame):
             pass
 
     def _on_chamber_press(self, event) -> None:
-        if self._in_disc(event.x, event.y) and self._state == "idle":
+        # idle → 即將開始錄音；recording → 即將停止（轉 processing）
+        if self._in_disc(event.x, event.y) and self._state in ("idle", "recording"):
             self._pressed = True
+        print(f"CHAMBER: press  at ({event.x},{event.y}) state={self._state} pressed={self._pressed}")
 
     def _on_chamber_release(self, event) -> None:
+        was_pressed = self._pressed
         self._pressed = False
+        print(f"CHAMBER: release at ({event.x},{event.y}) state={self._state} was_pressed={was_pressed}")
+        # 只在「按下時命中 disc、放開時還在 disc 內、狀態允許」時觸發
+        if (
+            was_pressed
+            and self._in_disc(event.x, event.y)
+            and self._state in ("idle", "recording")
+        ):
+            self._on_record_btn()
 
     def _update_timer(self) -> None:
         if self._state != "recording":
@@ -998,8 +1003,12 @@ class AppWindow(ctk.CTkFrame):
         SettingsWindow(self, self.cfg, self._on_settings_saved)
 
     def _on_settings_saved(self, cfg: Config) -> None:
+        old_hotkey = self.cfg.hotkey
         self.cfg = cfg
-        self._start_hotkey_listener()
+        # 只有 hotkey 真正變更才重啟 pynput listener——反覆 stop/start 在 macOS
+        # 上曾與 MLX/Metal 並存時觸發 native 層不穩定，能避免就避免。
+        if cfg.hotkey != old_hotkey:
+            self._start_hotkey_listener()
         self._hotkey_hint.configure(text=f"按住 {cfg.format_hotkey_display()} 即時錄音")
         self._hotkey_status.configure(text=cfg.format_hotkey_display())
         self._model_var.set(cfg.model)
@@ -1028,7 +1037,6 @@ class AppWindow(ctk.CTkFrame):
         def _load():
             try:
                 self.transcriber.warmup(model)
-                self.transcriber.warmup("small")
                 backend = self.transcriber.active_backend()
                 label   = "⚡ Metal" if backend == "mlx" else "CPU"
                 self.after(0, lambda: self._status_label.configure(
