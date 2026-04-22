@@ -1813,13 +1813,98 @@ class HotkeyBindDialog(ctk.CTkToplevel):
         )
         self._apply_btn.pack(side="left", padx=6)
 
+    # ── 按鍵擷取（Tk 原生，不用 pynput） ────────────────────────────────
+    # 為什麼不用 pynput：macOS 26.4+ 把 TSMGetInputSourceProperty 改成「僅
+    # 限主執行緒」的硬斷言。pynput Listener 在背景執行緒透過 ctypes 呼叫
+    # TSM 解析鍵碼 → SIGTRAP 閃退。主 HotkeyManager 啟動早、流程穩沒炸；
+    # 但此處 capture_hotkey() 新開 Listener 必炸。
+    # 解法：改用 Tk 的 <KeyPress>/<KeyRelease> binding，事件在主執行緒回
+    # 調，完全不碰 TSM。唯一代價是對話框必須持續擁有鍵盤焦點（grab_set
+    # 已保證）。
     def _start_capture(self) -> None:
-        def _cap():
-            combo = capture_hotkey(timeout=15)
-            if combo:
+        self._current_keys: set[str] = set()
+        self._max_combo:    set[str] = set()
+        # 對話框必須搶到焦點，否則 KeyPress 事件不會進來
+        self.focus_force()
+        self.bind("<KeyPress>",   self._on_tk_key_press)
+        self.bind("<KeyRelease>", self._on_tk_key_release)
+        self._capture_timeout_id = self.after(15_000, self._on_capture_timeout)
+
+    def _unbind_capture(self) -> None:
+        try:
+            self.unbind("<KeyPress>")
+            self.unbind("<KeyRelease>")
+        except tk.TclError:
+            pass
+        if getattr(self, "_capture_timeout_id", None):
+            try:
+                self.after_cancel(self._capture_timeout_id)
+            except Exception:
+                pass
+            self._capture_timeout_id = None
+
+    def _on_tk_key_press(self, event) -> None:
+        if self._captured:
+            return
+        name = self._keysym_to_name(event.keysym)
+        if not name:
+            return
+        self._current_keys.add(name)
+        if len(self._current_keys) > len(self._max_combo):
+            self._max_combo = set(self._current_keys)
+        # 即時預覽使用者目前按住的組合
+        self._detect_label.configure(text=format_hotkey(self._combo_str(self._max_combo)))
+
+    def _on_tk_key_release(self, event) -> None:
+        if self._captured:
+            return
+        if self._max_combo:
+            combo = self._combo_str(self._max_combo)
+            # 過濾掉純修飾鍵的組合（例如只按 ⌘⌥ 沒接字母）
+            if any(k not in ("cmd", "ctrl", "alt", "shift") for k in self._max_combo):
                 self._captured = combo
-                self.after(0, self._on_captured, combo)
-        threading.Thread(target=_cap, daemon=True).start()
+                self._unbind_capture()
+                self._on_captured(combo)
+                return
+        name = self._keysym_to_name(event.keysym)
+        if name:
+            self._current_keys.discard(name)
+
+    def _on_capture_timeout(self) -> None:
+        self._capture_timeout_id = None
+        if not self._captured:
+            self._detect_label.configure(text="逾時，請重新開啟")
+            self._unbind_capture()
+
+    @staticmethod
+    def _keysym_to_name(keysym: str) -> Optional[str]:
+        """Tk keysym → 我們的 combo 命名（'cmd' / 'alt' / 'r' …）。
+
+        回 None 表示此鍵不納入 combo（避免 F-keys、方向鍵等產生奇怪 combo）。
+        """
+        ks = keysym.lower()
+        mod_map = {
+            "meta_l": "cmd",   "meta_r": "cmd",
+            "command_l": "cmd","command_r": "cmd",
+            "super_l": "cmd",  "super_r": "cmd",  # 非 Mac 備援
+            "control_l": "ctrl","control_r": "ctrl",
+            "alt_l": "alt",    "alt_r": "alt",
+            "option_l": "alt", "option_r": "alt",
+            "shift_l": "shift","shift_r": "shift",
+            "space": "space",
+        }
+        if ks in mod_map:
+            return mod_map[ks]
+        if len(ks) == 1 and ks.isalnum():
+            return ks
+        return None
+
+    @staticmethod
+    def _combo_str(keys: set[str]) -> str:
+        order = ["cmd", "ctrl", "alt", "shift"]
+        mods    = [m for m in order if m in keys]
+        letters = sorted(k for k in keys if k not in order)
+        return "+".join(mods + letters)
 
     def _on_captured(self, combo: str) -> None:
         self._detect_label.configure(text=format_hotkey(combo))
@@ -1829,6 +1914,11 @@ class HotkeyBindDialog(ctk.CTkToplevel):
         if self._captured:
             self._on_apply_cb(self._captured)
         self.destroy()
+
+    def destroy(self) -> None:
+        # 確保對話框關閉時解除綁定與 timer，避免 Tcl 錯誤訊息
+        self._unbind_capture()
+        super().destroy()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
