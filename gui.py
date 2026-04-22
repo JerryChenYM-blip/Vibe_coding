@@ -209,6 +209,7 @@ class AppWindow(ctk.CTkFrame):
     # ═══════════════════════════════════════════════════════════════════════
 
     def _build_ui(self) -> None:
+        """依序建立五大 UI 區塊（由上到下）。"""
         self._build_topbar()
         self._build_record_card()
         self._build_result_card()
@@ -218,6 +219,7 @@ class AppWindow(ctk.CTkFrame):
     # ── Top bar ──────────────────────────────────────────────────────────────
 
     def _build_topbar(self) -> None:
+        """建立頂部工具列：左側品牌 logo、右側語言與模型選單。"""
         bar = ctk.CTkFrame(self, height=60, corner_radius=0, fg_color=SURF1)
         bar.pack(fill="x")
         bar.pack_propagate(False)
@@ -285,6 +287,7 @@ class AppWindow(ctk.CTkFrame):
     # ── Record card ──────────────────────────────────────────────────────────
 
     def _build_record_card(self) -> None:
+        """建立錄音卡片：Ambient Chamber 畫布、計時器、自動貼上目標標籤、快捷鍵提示。"""
         card = ctk.CTkFrame(
             self, corner_radius=16,
             fg_color=SURF_1,
@@ -351,6 +354,7 @@ class AppWindow(ctk.CTkFrame):
     # ── Result card ──────────────────────────────────────────────────────────
 
     def _build_result_card(self) -> None:
+        """建立轉錄結果卡片：標題列（含原文/潤飾切換）、文字區、清除按鈕。"""
         card = ctk.CTkFrame(
             self, corner_radius=16,
             fg_color=SURF1,
@@ -440,6 +444,7 @@ class AppWindow(ctk.CTkFrame):
     # ── Action bar ───────────────────────────────────────────────────────────
 
     def _build_action_bar(self) -> None:
+        """建立動作列：複製、存檔、自動貼上、AI 潤飾、設定五顆按鈕。"""
         # Top separator
         ctk.CTkFrame(self, height=1, fg_color=SURF3, corner_radius=0).pack(fill="x")
 
@@ -526,6 +531,7 @@ class AppWindow(ctk.CTkFrame):
     # ── Status bar ───────────────────────────────────────────────────────────
 
     def _build_status_bar(self) -> None:
+        """建立底部狀態列：狀態點、狀態文字、右側快捷鍵顯示。"""
         ctk.CTkFrame(self, height=1, fg_color=SURF3, corner_radius=0).pack(fill="x")
         bar = ctk.CTkFrame(self, height=32, corner_radius=0, fg_color=SURF1)
         bar.pack(fill="x", side="bottom")
@@ -562,6 +568,7 @@ class AppWindow(ctk.CTkFrame):
     # ═══════════════════════════════════════════════════════════════════════
 
     def _transition_to_recording(self) -> None:
+        """狀態機：idle → recording。啟動麥克風錄音並更新全部 UI。"""
         if self._state != "idle":
             return
         self._state            = "recording"
@@ -613,6 +620,7 @@ class AppWindow(ctk.CTkFrame):
         self._stream_tick_id = None
 
     def _transition_to_processing(self) -> None:
+        """狀態機：recording → processing。停止麥克風並在背景執行緒跑 Whisper。"""
         if self._state != "recording":
             return
         self._state            = "processing"
@@ -644,6 +652,7 @@ class AppWindow(ctk.CTkFrame):
         ).start()
 
     def _transition_to_idle(self, result: Optional[TranscriptionResult] = None) -> None:
+        """狀態機：任何狀態 → idle。恢復 UI 操作性；若 result 非 None 則顯示結果。"""
         self._state            = "idle"
         self._state_start_time = time.perf_counter()
         self._ripples.clear()
@@ -670,6 +679,10 @@ class AppWindow(ctk.CTkFrame):
     _STREAM_CHUNK_SAMPLES = 5 * 16_000
 
     def _stream_tick(self) -> None:
+        """中段串流轉錄（目前暫停使用）：每秒取最新 chunk 送 transcribe_fast。
+
+        保留此方法以備 Phase 3 啟用；主迴圈不再排程此函式。
+        """
         self._stream_tick_id = None
         if self._state != "recording":
             return
@@ -698,6 +711,10 @@ class AppWindow(ctk.CTkFrame):
     # ═══════════════════════════════════════════════════════════════════════
 
     def _run_transcription(self, audio, model: str, lang) -> None:
+        """背景執行緒：呼叫 Whisper 做最終轉錄，完成後 marshal 到主執行緒。
+
+        若有中段串流結果，將其與最終文字合併後一起回傳。
+        """
         # 一律用使用者選的模型做最終轉錄，不再因短音檔退化到 transcribe_fast
         # （那條路徑寫死 small，會嚴重拖垮品質）。
         result = self.transcriber.transcribe(audio, model_size=model, language=lang)
@@ -716,6 +733,7 @@ class AppWindow(ctk.CTkFrame):
         self.after(0, self._on_transcription_done, result)
 
     def _on_transcription_done(self, result: TranscriptionResult) -> None:
+        """主執行緒：轉錄完成後決定是否走潤飾流程，並觸發剪貼簿 / 自動貼上。"""
         self._transition_to_idle(result)
         self._show_toast(f"轉錄完成 · {result.elapsed_seconds:.1f}s")
 
@@ -972,6 +990,7 @@ class AppWindow(ctk.CTkFrame):
         self._result_title.configure(text="".join(parts))
 
     def _do_auto_paste(self, text: str, target: str) -> None:
+        """背景執行緒：呼叫 auto_paste，完成後以 toast 通知使用者。"""
         success = _ap.paste_to_app(text, target)
         if success:
             self.after(0, lambda: self._show_toast(f"⌨  已貼入 {target}"))
@@ -979,6 +998,7 @@ class AppWindow(ctk.CTkFrame):
             self.after(0, lambda: self._show_toast("⌨  自動貼上失敗（請確認輔助使用權限）"))
 
     def _display_result(self, result: TranscriptionResult) -> None:
+        """將轉錄結果插入 textbox，並以 tk mark 圈住最新一段供後續精準替換。"""
         dur   = int(result.duration_seconds)
         lang  = result.language.upper() if result.language else "?"
         model = self._model_var.get()
@@ -1162,14 +1182,17 @@ class AppWindow(ctk.CTkFrame):
     # ── Canvas event handlers ────────────────────────────────────────────
 
     def _in_disc(self, x: int, y: int) -> bool:
+        """以畢氏定理判斷座標是否落在中央圓盤內（半徑 DISC_RADIUS）。"""
         dx = x - CHAMBER_CENTER
         dy = y - CHAMBER_CENTER
         return dx * dx + dy * dy <= DISC_RADIUS * DISC_RADIUS
 
     def _on_chamber_enter(self, event) -> None:
+        """滑鼠進入 Canvas 時，若進入 disc 且為 idle 狀態則設 hover 效果。"""
         self._hovering = self._in_disc(event.x, event.y) and self._state == "idle"
 
     def _on_chamber_leave(self, event) -> None:
+        """滑鼠離開 Canvas 時清除 hover / pressed 狀態與自訂游標。"""
         self._hovering = False
         self._pressed  = False
         try:
@@ -1178,6 +1201,7 @@ class AppWindow(ctk.CTkFrame):
             pass
 
     def _on_chamber_motion(self, event) -> None:
+        """滑鼠在 Canvas 移動時，動態切換 hover 狀態與手形游標。"""
         inside = self._in_disc(event.x, event.y)
         self._hovering = inside and self._state == "idle"
         try:
@@ -1186,12 +1210,14 @@ class AppWindow(ctk.CTkFrame):
             pass
 
     def _on_chamber_press(self, event) -> None:
+        """滑鼠在 disc 內按下時設 pressed 旗標（視覺按壓回饋）。"""
         # idle → 即將開始錄音；recording → 即將停止（轉 processing）
         if self._in_disc(event.x, event.y) and self._state in ("idle", "recording"):
             self._pressed = True
         print(f"CHAMBER: press  at ({event.x},{event.y}) state={self._state} pressed={self._pressed}")
 
     def _on_chamber_release(self, event) -> None:
+        """滑鼠在 disc 內放開時觸發錄音切換（按下且放開都在 disc 內才算點擊）。"""
         was_pressed = self._pressed
         self._pressed = False
         print(f"CHAMBER: release at ({event.x},{event.y}) state={self._state} was_pressed={was_pressed}")
@@ -1204,6 +1230,7 @@ class AppWindow(ctk.CTkFrame):
             self._on_record_btn()
 
     def _update_timer(self) -> None:
+        """每秒更新錄音計時器標籤（MM:SS），非 recording 狀態自動停止。"""
         if self._state != "recording":
             self._timer_label.configure(text="")
             return
@@ -1217,24 +1244,30 @@ class AppWindow(ctk.CTkFrame):
     # ═══════════════════════════════════════════════════════════════════════
 
     def _on_record_btn(self) -> None:
+        """Chamber 點擊 → 依目前狀態切換錄音（idle↔recording）。"""
         if   self._state == "idle":      self._transition_to_recording()
         elif self._state == "recording": self._transition_to_processing()
 
     def _hotkey_press(self) -> None:
+        """pynput 執行緒 → 安全 marshal 到主執行緒。"""
         self.after(0, self._on_hotkey_press)
 
     def _hotkey_release(self) -> None:
+        """pynput 執行緒 → 安全 marshal 到主執行緒。"""
         self.after(0, self._on_hotkey_release)
 
     def _on_hotkey_press(self) -> None:
+        """主執行緒：快捷鍵按下時若為 idle 則開始錄音。"""
         if self._state == "idle" and not self._hotkey_held:
             self._transition_to_recording()
 
     def _on_hotkey_release(self) -> None:
+        """主執行緒：快捷鍵放開時若為 recording 則停止轉錄。"""
         if self._state == "recording":
             self._transition_to_processing()
 
     def _on_copy(self) -> None:
+        """複製按鈕：將目前 textbox 內容複製到剪貼簿。"""
         text = self._get_result_text()
         if not text:
             return
@@ -1246,6 +1279,7 @@ class AppWindow(ctk.CTkFrame):
             self._show_toast(f"複製失敗: {e}")
 
     def _on_save(self) -> None:
+        """存檔按鈕：開啟 Save As 對話框，將結果寫成 .txt 檔。"""
         text = self._get_result_text()
         if not text:
             return
@@ -1263,6 +1297,7 @@ class AppWindow(ctk.CTkFrame):
                 self._show_toast(f"儲存失敗: {e}")
 
     def _on_clear(self) -> None:
+        """清除按鈕：清空 textbox，重置三段式標題與 toggle 狀態，顯示佔位符。"""
         self._textbox.configure(state="normal")
         self._textbox.delete("1.0", "end")
         self._textbox.configure(state="disabled")
@@ -1280,6 +1315,7 @@ class AppWindow(ctk.CTkFrame):
         self._show_placeholder()
 
     def _toggle_auto_paste(self) -> None:
+        """自動貼上按鈕：切換 auto_paste 開關並即時更新按鈕樣式。"""
         self.cfg.auto_paste = not self.cfg.auto_paste
         self.cfg.save()
         on = self.cfg.auto_paste
@@ -1420,11 +1456,13 @@ class AppWindow(ctk.CTkFrame):
         )
 
     def _on_model_change(self, value: str) -> None:
+        """頂部模型選單變更時：更新 cfg 並刷新狀態列文字。"""
         self.cfg.model = value
         self.cfg.save()
         self._status_label.configure(text=f"  就緒 ({value})")
 
     def _on_language_change(self, value: str) -> None:
+        """頂部語言選單變更時：更新 cfg 儲存（下次錄音生效）。"""
         self.cfg.language = value
         self.cfg.save()
 
@@ -1433,9 +1471,11 @@ class AppWindow(ctk.CTkFrame):
     # ═══════════════════════════════════════════════════════════════════════
 
     def _open_settings(self) -> None:
+        """開啟設定視窗（modal）。"""
         SettingsWindow(self, self.cfg, self._on_settings_saved)
 
     def _on_settings_saved(self, cfg: Config) -> None:
+        """設定視窗儲存後：同步 cfg、重啟 listener（若 hotkey 有變），刷新所有 UI。"""
         old_hotkey = self.cfg.hotkey
         self.cfg = cfg
         # 只有 hotkey 真正變更才重啟 pynput listener——反覆 stop/start 在 macOS
@@ -1481,11 +1521,13 @@ class AppWindow(ctk.CTkFrame):
     # ═══════════════════════════════════════════════════════════════════════
 
     def _start_hotkey_listener(self) -> None:
+        """（重）啟動 pynput 全域快捷鍵監聽器；pynput 不可用時靜默略過。"""
         if not is_pynput_available():
             return
         self.hotkey_mgr.restart(self.cfg.hotkey)
 
     def _warmup_model(self) -> None:
+        """背景預熱 Whisper 模型（延遲 1.5s 後執行，避免阻礙 UI 初始化）。"""
         model = self._model_var.get()
 
         def _load():
@@ -1504,16 +1546,19 @@ class AppWindow(ctk.CTkFrame):
         threading.Thread(target=_load, daemon=True).start()
 
     def _show_placeholder(self) -> None:
+        """若 textbox 為空，插入佔位符文字。"""
         self._textbox.configure(state="normal")
         if not self._textbox.get("1.0", "end").strip():
             self._textbox.insert("1.0", "（等待第一次錄音...）")
         self._textbox.configure(state="disabled")
 
     def _get_result_text(self) -> str:
+        """取得 textbox 的有效文字；佔位符或空白回傳空字串。"""
         t = self._textbox.get("1.0", "end").strip()
         return "" if t == "（等待第一次錄音...）" else t
 
     def _show_toast(self, message: str) -> None:
+        """在視窗右下角顯示一個浮動 toast，2.8 秒後自動消失。"""
         toast = ctk.CTkFrame(
             self, corner_radius=10,
             fg_color=SURF2,
@@ -1528,6 +1573,7 @@ class AppWindow(ctk.CTkFrame):
         self.after(2800, toast.destroy)
 
     def on_close(self) -> None:
+        """視窗關閉時：停止 pynput 監聽器與進行中的錄音，避免資源洩漏。"""
         self.hotkey_mgr.stop()
         if self.recorder.is_recording():
             self.recorder.stop()
@@ -1538,10 +1584,20 @@ class AppWindow(ctk.CTkFrame):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SettingsWindow(ctk.CTkToplevel):
+    """設定視窗（modal）。
+
+    涵蓋語音辨識（模型 / 語言）、快捷鍵重新綁定、輸出偏好
+    （追加 / 自動複製 / 自動貼上）、AI 潤飾（Ollama）、
+    情境路由（Phase 2 preset）、個人字典（#4）等所有設定項目。
+
+    使用者按「儲存」時呼叫 on_save_cb(new_cfg)；按「取消」不修改原 cfg。
+    """
+
     def __init__(self, parent, cfg: Config, on_save_cb) -> None:
+        """初始化設定視窗，深拷貝 cfg 以避免使用者取消時汙染原始設定。"""
         super().__init__(parent)
         self._parent     = parent                 # AppWindow（訪問 _prompt_reloader 用）
-        self.cfg         = Config(**cfg.__dict__)
+        self.cfg         = Config(**cfg.__dict__)  # 深拷貝：取消時不修改原 cfg
         self._on_save_cb = on_save_cb
         self.title("設定")
         self.geometry("440x580")
@@ -1551,6 +1607,7 @@ class SettingsWindow(ctk.CTkToplevel):
         self._build()
 
     def _build(self) -> None:
+        """建立所有設定 section 的 UI 元件與底部儲存 / 取消按鈕。"""
         scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
         scroll.pack(fill="both", expand=True)
 
@@ -1886,16 +1943,20 @@ class SettingsWindow(ctk.CTkToplevel):
         ).pack(side="left")
 
     def _on_model_preview(self, value: str) -> None:
+        """模型選單即時預覽：更新下方說明文字。"""
         self._model_desc.configure(text=MODEL_INFO.get(value, ""))
 
     def _rebind_hotkey(self) -> None:
+        """開啟 HotkeyBindDialog，讓使用者重新綁定快捷鍵。"""
         HotkeyBindDialog(self, self.cfg.hotkey, self._apply_hotkey).focus()
 
     def _apply_hotkey(self, combo: str) -> None:
+        """HotkeyBindDialog 完成後回呼：把新組合寫回暫存 cfg 並刷新標籤。"""
         self.cfg.hotkey = combo
         self._hk_label.configure(text=format_hotkey(combo))
 
     def _save(self) -> None:
+        """收集所有 UI 欄位值，寫入暫存 cfg、呼叫 on_save_cb，然後關閉視窗。"""
         self.cfg.model          = self._model_var.get()
         self.cfg.language       = self._lang_var.get()
         self.cfg.append_results = self._append_var.get()
@@ -1924,6 +1985,7 @@ class SettingsWindow(ctk.CTkToplevel):
         self.destroy()
 
     def _reload_prompts_now(self) -> None:
+        """立即觸發 PromptReloader.reload_now()，並以狀態標籤顯示結果。"""
         reloader = getattr(self._parent, "_prompt_reloader", None)
         if reloader is None:
             return
@@ -2005,7 +2067,19 @@ class SettingsWindow(ctk.CTkToplevel):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class HotkeyBindDialog(ctk.CTkToplevel):
+    """快捷鍵重新綁定對話框（modal）。
+
+    使用 Tk 原生的 <KeyPress> / <KeyRelease> 事件擷取按鍵組合，
+    而非 pynput——原因見 _start_capture 的說明。
+
+    流程：
+      1. _start_capture() 綁定 Tk 鍵盤事件
+      2. 使用者按下組合鍵並放開 → _on_captured() 鎖定結果
+      3. 使用者點「確認套用」→ _apply() 呼叫 on_apply_cb
+    """
+
     def __init__(self, parent, current_combo: str, on_apply_cb) -> None:
+        """初始化對話框並立即開始擷取按鍵。current_combo 目前未使用，保留供未來顯示用。"""
         super().__init__(parent)
         self._on_apply_cb = on_apply_cb
         self._captured: Optional[str] = None
@@ -2018,6 +2092,7 @@ class HotkeyBindDialog(ctk.CTkToplevel):
         self._start_capture()
 
     def _build(self) -> None:
+        """建立說明文字、偵測標籤、取消和確認套用按鈕。"""
         ctk.CTkLabel(
             self,
             text="請按下想要的快捷鍵組合\n（按下後鬆開確認）",
@@ -2075,6 +2150,7 @@ class HotkeyBindDialog(ctk.CTkToplevel):
         self.bind("<KeyRelease>", self._on_tk_key_release)
 
     def _unbind_capture(self) -> None:
+        """解除 KeyPress / KeyRelease 綁定，防止視窗銷毀後仍有回調觸發。"""
         try:
             self.unbind("<KeyPress>")
             self.unbind("<KeyRelease>")
@@ -2090,6 +2166,7 @@ class HotkeyBindDialog(ctk.CTkToplevel):
         self._detect_label.configure(text="等待按鍵…")
 
     def _on_tk_key_press(self, event) -> None:
+        """記錄目前按住的所有鍵，並即時更新偵測標籤（預覽組合）。"""
         name = self._keysym_to_name(event.keysym)
         if not name:
             return
@@ -2105,6 +2182,7 @@ class HotkeyBindDialog(ctk.CTkToplevel):
         )
 
     def _on_tk_key_release(self, event) -> None:
+        """放開鍵時：若組合含非修飾鍵則鎖定結果；否則提示需加字母鍵。"""
         name = self._keysym_to_name(event.keysym)
         if name:
             self._current_keys.discard(name)
@@ -2155,15 +2233,18 @@ class HotkeyBindDialog(ctk.CTkToplevel):
         return "+".join(mods + letters)
 
     def _on_captured(self, combo: str) -> None:
+        """鎖定組合後：更新標籤顯示，啟用「確認套用」按鈕。"""
         self._detect_label.configure(text=format_hotkey(combo))
         self._apply_btn.configure(state="normal")
 
     def _apply(self) -> None:
+        """使用者確認後：呼叫 on_apply_cb 回傳組合字串，然後關閉對話框。"""
         if self._captured:
             self._on_apply_cb(self._captured)
         self.destroy()
 
     def destroy(self) -> None:
+        """覆寫 destroy：先解除 Tk 鍵盤綁定，再呼叫 super().destroy()。"""
         # 確保對話框關閉時解除綁定，避免 Tcl 錯誤訊息
         self._unbind_capture()
         super().destroy()
@@ -2174,7 +2255,14 @@ class HotkeyBindDialog(ctk.CTkToplevel):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AccessibilityDialog(ctk.CTkToplevel):
+    """macOS 輔助使用權限引導對話框（modal）。
+
+    首次執行若 pynput 偵測到未取得輔助使用權限，由 main.py 的非同步執行緒
+    延遲 0.8s 後呼叫此對話框，告知使用者開啟系統設定的步驟。
+    """
+
     def __init__(self, parent) -> None:
+        """建立對話框並呈現步驟說明與「開啟系統設定」按鈕。"""
         super().__init__(parent)
         self.title("需要權限")
         self.geometry("500x300")
@@ -2231,6 +2319,7 @@ class AccessibilityDialog(ctk.CTkToplevel):
         ).pack(side="left", padx=6)
 
     def _open_prefs(self) -> None:
+        """以 macOS URL scheme 直接跳到「隱私權 > 輔助使用」設定頁，然後關閉對話框。"""
         subprocess.run([
             "open",
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",

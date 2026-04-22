@@ -23,11 +23,20 @@ faulthandler.enable(file=_fault_log_fh, all_threads=True)
 
 # ── Logging Setup ─────────────────────────────────────────────────────
 class Logger:
-    def __init__(self, filename="app.log"):
+    """同時寫入 terminal 與 app.log 的 stdout/stderr 替代器。
+
+    每一行訊息加上時間戳前綴；純換行符號不加時間戳，避免 log 裡
+    產生大量空行。啟動後取代 sys.stdout / sys.stderr，讓所有
+    print() 與 traceback 輸出都落地。
+    """
+
+    def __init__(self, filename: str = "app.log") -> None:
+        """開啟 log 檔（追加模式）並保留對原始 terminal 的參照。"""
         self.terminal = sys.stdout
         self.log = open(filename, "a", encoding="utf-8")
 
-    def write(self, message):
+    def write(self, message: str) -> None:
+        """寫入一段訊息；非空行加上 [YYYY-MM-DD HH:MM:SS] 前綴。"""
         # 避免為單純的換行符號加上時間戳
         if message.strip():
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -39,7 +48,8 @@ class Logger:
             self.log.write(message)
         self.log.flush()
 
-    def flush(self):
+    def flush(self) -> None:
+        """確保 terminal 與 log 檔的緩衝區都被清空。"""
         self.terminal.flush()
         self.log.flush()
 
