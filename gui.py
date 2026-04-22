@@ -1821,6 +1821,8 @@ class HotkeyBindDialog(ctk.CTkToplevel):
     # 解法：改用 Tk 的 <KeyPress>/<KeyRelease> binding，事件在主執行緒回
     # 調，完全不碰 TSM。唯一代價是對話框必須持續擁有鍵盤焦點（grab_set
     # 已保證）。
+    _MODIFIERS = frozenset({"cmd", "ctrl", "alt", "shift"})
+
     def _start_capture(self) -> None:
         self._current_keys: set[str] = set()
         self._max_combo:    set[str] = set()
@@ -1828,7 +1830,6 @@ class HotkeyBindDialog(ctk.CTkToplevel):
         self.focus_force()
         self.bind("<KeyPress>",   self._on_tk_key_press)
         self.bind("<KeyRelease>", self._on_tk_key_release)
-        self._capture_timeout_id = self.after(15_000, self._on_capture_timeout)
 
     def _unbind_capture(self) -> None:
         try:
@@ -1836,45 +1837,49 @@ class HotkeyBindDialog(ctk.CTkToplevel):
             self.unbind("<KeyRelease>")
         except tk.TclError:
             pass
-        if getattr(self, "_capture_timeout_id", None):
-            try:
-                self.after_cancel(self._capture_timeout_id)
-            except Exception:
-                pass
-            self._capture_timeout_id = None
+
+    def _reset_cycle(self) -> None:
+        """清掉上一輪的擷取狀態，讓使用者能按新組合。"""
+        self._captured = None
+        self._current_keys = set()
+        self._max_combo = set()
+        self._apply_btn.configure(state="disabled")
+        self._detect_label.configure(text="等待按鍵…")
 
     def _on_tk_key_press(self, event) -> None:
-        if self._captured:
-            return
         name = self._keysym_to_name(event.keysym)
         if not name:
             return
+        # 若上一輪已完成且使用者開始新按鍵 → 自動重置，開啟新一輪
+        if self._captured and not self._current_keys:
+            self._reset_cycle()
         self._current_keys.add(name)
         if len(self._current_keys) > len(self._max_combo):
             self._max_combo = set(self._current_keys)
         # 即時預覽使用者目前按住的組合
-        self._detect_label.configure(text=format_hotkey(self._combo_str(self._max_combo)))
+        self._detect_label.configure(
+            text=format_hotkey(self._combo_str(self._max_combo))
+        )
 
     def _on_tk_key_release(self, event) -> None:
-        if self._captured:
-            return
-        if self._max_combo:
-            combo = self._combo_str(self._max_combo)
-            # 過濾掉純修飾鍵的組合（例如只按 ⌘⌥ 沒接字母）
-            if any(k not in ("cmd", "ctrl", "alt", "shift") for k in self._max_combo):
-                self._captured = combo
-                self._unbind_capture()
-                self._on_captured(combo)
-                return
         name = self._keysym_to_name(event.keysym)
         if name:
             self._current_keys.discard(name)
-
-    def _on_capture_timeout(self) -> None:
-        self._capture_timeout_id = None
-        if not self._captured:
-            self._detect_label.configure(text="逾時，請重新開啟")
-            self._unbind_capture()
+        # 在 max_combo 有「至少一個非修飾鍵」且本輪還沒鎖定時 → 鎖定
+        if self._captured:
+            return
+        if not self._max_combo:
+            return
+        has_non_mod = any(k not in self._MODIFIERS for k in self._max_combo)
+        if not has_non_mod:
+            # 使用者目前只按了修飾鍵；提示但不鎖定
+            self._detect_label.configure(
+                text=format_hotkey(self._combo_str(self._max_combo)) + "   ← 需要加字母/數字/空白"
+            )
+            return
+        combo = self._combo_str(self._max_combo)
+        self._captured = combo
+        self._on_captured(combo)
 
     @staticmethod
     def _keysym_to_name(keysym: str) -> Optional[str]:
@@ -1916,7 +1921,7 @@ class HotkeyBindDialog(ctk.CTkToplevel):
         self.destroy()
 
     def destroy(self) -> None:
-        # 確保對話框關閉時解除綁定與 timer，避免 Tcl 錯誤訊息
+        # 確保對話框關閉時解除綁定，避免 Tcl 錯誤訊息
         self._unbind_capture()
         super().destroy()
 
