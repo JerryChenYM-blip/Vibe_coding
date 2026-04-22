@@ -1,170 +1,188 @@
 """
-Design tokens — Whisper Pro v2.0
+Whisper Pro v2.0 設計系統 Token。
 
-Single source of truth for colors, typography, spacing, radii, motion.
-All UI modules should import from here; no raw hex literals in components.
+UI 所有色彩、字型、間距、圓角、動畫時長的單一真相來源。
+所有 UI 模組必須從此檔匯入；任何地方都不應直接寫死十六進位色碼。
 
-Palette:      Zinc warm-gray (Linear-inspired) + Cyan accent (AI-tool feel)
-Elevation:    4-level surface hierarchy (dp 0 → 4)
-Reference:    UX_OPTIMIZATION_STRATEGY.md §3
+調色盤設計理念：
+  • 底色：Zinc 暖灰（Linear 風格靈感），OLED 最佳化
+  • 強調色：Cyan #06B6D4（AI 工具感，刻意避開 Apple 藍）
+  • 四層表面深度（dp 0-4），取代 tkinter 無法真正實現的陰影
+
+參考文件：UX_OPTIMIZATION_STRATEGY.md §3
 """
 
 from __future__ import annotations
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  SURFACE ELEVATION (dp 0-4)
-#  Dark-first, OLED-optimised. Use these to express visual depth without
-#  relying on shadows (tkinter has no real shadow support).
-# ═══════════════════════════════════════════════════════════════════════════
 
-BG        = "#000000"   # dp=0  void black (window body)
-SURF_1    = "#0E0E10"   # dp=1  primary card / bar
-SURF_2    = "#18181B"   # dp=2  secondary (status bar, hover base)
-SURF_3    = "#27272A"   # dp=3  tertiary (pressed, hover on surf-2)
-SURF_4    = "#3F3F46"   # dp=4  quaternary (borders, dividers, subtle strokes)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  表面層次（Surface Elevation, dp 0-4）
+#  深色優先、OLED 最佳化。用層次差異表達視覺深度，
+#  不依賴陰影（tkinter 不支援真正的 box-shadow）。
+# ═══════════════════════════════════════════════════════════════════════════════
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  TEXT HIERARCHY (warm white)
-# ═══════════════════════════════════════════════════════════════════════════
-
-TEXT_1    = "#FAFAFA"   # 100% — headlines, primary CTA labels
-TEXT_2    = "#E4E4E7"   # ~75% — body
-TEXT_3    = "#A1A1AA"   # ~55% — captions, hints, timestamps
-TEXT_4    = "#71717A"   # ~35% — disabled, tertiary meta
+BG        = "#000000"   # dp=0  虛空黑，視窗主體底色
+SURF_1    = "#0E0E10"   # dp=1  主卡片、頂部工具列
+SURF_2    = "#18181B"   # dp=2  次級區塊（狀態列、hover 底色）
+SURF_3    = "#27272A"   # dp=3  三級（pressed 狀態、hover on surf-2）
+SURF_4    = "#3F3F46"   # dp=4  四級（邊框、分隔線、細筆觸）
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  SEMANTIC ACCENTS
-#  Desaturated for dark backgrounds — avoid pure system colors which can
-#  feel "retail" on a developer tool.
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+#  文字層次（Text Hierarchy）
+#  暖白色系，避免純白 #FFFFFF 在黑背景上造成的刺眼對比。
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# Primary brand / CTA — Cyan 500 (AI / technical feel)
+TEXT_1    = "#FAFAFA"   # 100% — 標題、主要 CTA 標籤
+TEXT_2    = "#E4E4E7"   # ~75% — 內文、一般按鈕文字
+TEXT_3    = "#A1A1AA"   # ~55% — 說明文字、提示、時間戳
+TEXT_4    = "#71717A"   # ~35% — 停用狀態、三級 meta 資訊
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  語意強調色（Semantic Accents）
+#  去飽和以適配深色背景；避免使用 Apple 系統色（避免「零售感」）。
+#  每個語意色提供三個變體：
+#    _HV  = hover / active 狀態（稍亮）
+#    _DIM = 低調背景色（chip 背景、填滿色）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# 主品牌色 / CTA — Cyan 500（AI 技術感）
 ACCENT      = "#06B6D4"
-ACCENT_HV   = "#22D3EE"
-ACCENT_BG   = "#164E63"   # tinted chip background
+ACCENT_HV   = "#22D3EE"   # hover 狀態
+ACCENT_BG   = "#164E63"   # chip 背景（低調填滿）
 
-# Success / idle — Green 500
+# 成功 / 閒置 — Green 500
 SUCCESS     = "#22C55E"
 SUCCESS_HV  = "#16A34A"
 SUCCESS_DIM = "#14532D"
 
-# Danger / recording — Red 500
+# 危險 / 錄音中 — Red 500
 DANGER      = "#EF4444"
 DANGER_HV   = "#DC2626"
 DANGER_DIM  = "#7F1D1D"
 
-# Warn / processing — Amber 500
+# 警告 / 處理中 — Amber 500
 WARN        = "#F59E0B"
 WARN_HV     = "#D97706"
 WARN_DIM    = "#78350F"
 
-# Auto-paste — Indigo 400 (softer than system indigo on dark)
+# 自動貼上 — Indigo 400（比系統 Indigo 更柔和，適合深色底）
 INDIGO      = "#818CF8"
 INDIGO_HV   = "#6366F1"
 INDIGO_DIM  = "#312E81"
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  WAVEFORM
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+#  波形顏色（Waveform）
+# ═══════════════════════════════════════════════════════════════════════════════
 
-WAVE_IDLE_COL = SURF_4    # matches quaternary surface
-WAVE_LIVE_COL = TEXT_1    # bright white on live
+WAVE_IDLE_COL = SURF_4    # 閒置時波形：搭配四級表面，不搶眼
+WAVE_LIVE_COL = TEXT_1    # 錄音中波形：亮白，強調「活躍」感
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  TYPOGRAPHY
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+#  字型（Typography）
+#  SF Pro 為 macOS 原生字型，回退由系統自動處理。
+#  MONO 字型用於計時器、RMS 數值、設定欄位——等寬數字防止排版跳動。
+# ═══════════════════════════════════════════════════════════════════════════════
 
-FONT_FAMILY_UI   = "SF Pro Display"
-FONT_FAMILY_TEXT = "SF Pro Text"
-FONT_FAMILY_MONO = "SF Mono"
+FONT_FAMILY_UI   = "SF Pro Display"   # 標題、大字
+FONT_FAMILY_TEXT = "SF Pro Text"      # 內文、按鈕、說明
+FONT_FAMILY_MONO = "SF Mono"          # 計時器、數值、程式碼——等寬字型
 
-# Type scale — (size_pt, weight)
+# 字型比例尺（size_pt, weight）
+# 用 dict 統一管理，避免散落在各 UI 檔案的裸數字
 TYPE = {
-    "display":  (28, "bold"),
-    "title":    (17, "bold"),
-    "headline": (15, "bold"),
-    "body":     (14, "normal"),
-    "caption":  (12, "normal"),
-    "micro":    (11, "normal"),
-    "mono":     (13, "normal"),
+    "display":  (28, "bold"),    # 超大標題
+    "title":    (17, "bold"),    # 視窗標題
+    "headline": (15, "bold"),    # 區塊標題
+    "body":     (14, "normal"),  # 主要內文
+    "caption":  (12, "normal"),  # 說明文字
+    "micro":    (11, "normal"),  # 最小字（版本號、路徑）
+    "mono":     (13, "normal"),  # 等寬數值
 }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  SPACING (4pt baseline)
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+#  間距（Spacing）
+#  以 4pt 為基線單位，與 Tailwind / Material 對齊，
+#  方便換算且視覺上自然「對齊感」更強。
+# ═══════════════════════════════════════════════════════════════════════════════
 
-SPACE_XS  = 4
-SPACE_SM  = 8
-SPACE_MD  = 12
-SPACE_LG  = 16
-SPACE_XL  = 24
-SPACE_2XL = 32
-SPACE_3XL = 48
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  BORDER RADIUS
-# ═══════════════════════════════════════════════════════════════════════════
-
-RADIUS_SM   = 6
-RADIUS_MD   = 10
-RADIUS_LG   = 14
-RADIUS_XL   = 20
-RADIUS_PILL = 999
+SPACE_XS  = 4    # 極小：icon 與文字之間
+SPACE_SM  = 8    # 小：同組元件的內部間距
+SPACE_MD  = 12   # 中：卡片內的標準間距
+SPACE_LG  = 16   # 大：卡片與卡片之間
+SPACE_XL  = 24   # 超大：section 邊距
+SPACE_2XL = 32   # 2x：主要版面 padding
+SPACE_3XL = 48   # 3x：大型視覺間距
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  ANIMATION
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+#  圓角（Border Radius）
+# ═══════════════════════════════════════════════════════════════════════════════
 
-DUR_FAST   = 120   # hover, tap feedback
-DUR_NORMAL = 240   # state transitions
-DUR_SLOW   = 400   # card enter, modal
+RADIUS_SM   = 6     # 小元件：chip、小按鈕
+RADIUS_MD   = 10    # 中型元件：一般按鈕、輸入框
+RADIUS_LG   = 14    # 大型元件：卡片、設定列
+RADIUS_XL   = 20    # 超大：主卡片
+RADIUS_PILL = 999   # 膠囊形狀（完整圓角）
 
-# Breathing periods for the record chamber's three states.
-BREATHE_IDLE_MS       = 6000   # calm
-BREATHE_RECORDING_MS  = 2500   # alive
-BREATHE_PROCESSING_MS = 1800   # working
 
-# Rotating particle belt used in the processing state.
+# ═══════════════════════════════════════════════════════════════════════════════
+#  動畫時長（Animation Duration）
+#  單位：毫秒（ms）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DUR_FAST   = 120   # hover、tap 快速回饋
+DUR_NORMAL = 240   # 狀態切換
+DUR_SLOW   = 400   # 卡片進場、modal 開啟
+
+# Chamber 三態的呼吸週期（ms）：閒置最慢（平靜），錄音最快（緊張感）
+BREATHE_IDLE_MS       = 6000   # 閒置：6 秒一次，如深度休眠
+BREATHE_RECORDING_MS  = 2500   # 錄音中：2.5 秒，緊張感十足
+BREATHE_PROCESSING_MS = 1800   # 處理中：1.8 秒，「工作中」節奏
+
+# 處理中旋轉粒子環的轉速週期（ms）
 ROTATE_PROCESSING_MS  = 1500
 
-# Canvas render loop cadence — 20 FPS, matches prior _update_wave budget.
+# Canvas 渲染迴圈節拍（ms）：50ms = 20 FPS，在效能與流暢度間取平衡
 RENDER_TICK_MS        = 50
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  SPINNER (Unicode Braille animation)
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+#  載入指示字元（Braille Spinner）
+#  用於狀態列文字動畫，不依賴 image 資源。
+# ═══════════════════════════════════════════════════════════════════════════════
 
-SPINNER = ["⠋", "⠙", "⠸", "⠴", "⠦", "⠇"]
+SPINNER = ["⠋", "⠙", "⠸", "⠴", "⠦", "⠇"]   # 六格輪播，循環使用
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  LEGACY ALIASES
-#  Kept for backward-compatibility during gradual migration.
-#  Prefer canonical names above in new code.
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+#  向後相容別名（Legacy Aliases）
+#  過渡期保留，讓舊程式碼不需立即修改。
+#  新程式碼請使用上方的正式名稱，舊別名最終將移除。
+# ═══════════════════════════════════════════════════════════════════════════════
 
+# 表面層次舊名
 SURF1 = SURF_1
 SURF2 = SURF_2
 SURF3 = SURF_3
 SURF4 = SURF_4
 
+# 文字層次舊名
 TEXT1 = TEXT_1
 TEXT2 = TEXT_2
 TEXT3 = TEXT_3
 TEXT4 = TEXT_4
 
+# 強調色舊名（→ ACCENT 系列）
 BLUE      = ACCENT
 BLUE_HV   = ACCENT_HV
 BLUE_DIM  = ACCENT_BG
 
+# 語意色舊名
 GREEN     = SUCCESS
 GREEN_DIM = SUCCESS_DIM
 

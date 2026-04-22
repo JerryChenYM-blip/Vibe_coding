@@ -1,17 +1,24 @@
 """
-Main application window — Apple MacBook Pro aesthetic.
+主應用程式視窗——Apple MacBook Pro 美學設計。
 
-Design language:  apple.com/tw/macbook-pro/
-Colour system:    forced dark, void-black base + layered surfaces
-Typography:       SF Pro Display / Text (macOS native)
-Auto-paste:       captures frontmost app before recording, injects ⌘V after STT
+設計語言：  apple.com/tw/macbook-pro/（深色、簡潔、金屬感）
+色彩系統：  強制深色，虛空黑底色 + 四層表面深度
+字型：      SF Pro Display / Text（macOS 原生字型）
+自動貼上：  錄音開始前記錄前景 App，轉錄完成後模擬 ⌘V 注入文字
 
-Layout (760 × 800 px):
-  TopBar      — logo · model / language selectors
-  RecordCard  — waveform · circular button · ring indicator
-  ResultCard  — transcription textbox
-  ActionBar   — action buttons
-  StatusBar   — status · hotkey · timer
+視窗佈局（760 × 800 px，由上到下）：
+  TopBar      — 品牌 logo、模型選單、語言選單
+  RecordCard  — Ambient Chamber 畫布（呼吸光圈 + 錄音按鈕）、計時器
+  ResultCard  — 轉錄結果文字區（含原文／潤飾切換）
+  ActionBar   — 複製、存檔、自動貼上、AI 潤飾、設定按鈕
+  StatusBar   — 狀態點、狀態文字、快捷鍵顯示
+
+匯出：
+  AppWindow           主視窗元件
+  SettingsWindow      設定對話框
+  HotkeyBindDialog    快捷鍵重新綁定對話框
+  AccessibilityDialog 輔助使用權限引導對話框
+  WIN_W, WIN_H        視窗預設尺寸常數
 """
 
 from __future__ import annotations
@@ -42,15 +49,14 @@ from icons import get_icon, get_canvas_icon
 from animation import blend, breathe, ease_in_out_cubic, Ripple
 import auto_paste as _ap
 
-# ── Appearance — force Apple dark aesthetic ───────────────────────────────────
+# ── 強制套用 Apple 深色美學 ───────────────────────────────────────────────────
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-WIN_W, WIN_H = 760, 800
+WIN_W, WIN_H = 760, 800   # 視窗預設寬度 × 高度（像素）
 
-# ── Design tokens (imported — do not redefine locally) ────────────────────────
-# Canonical names + legacy aliases, all sourced from tokens.py
-from tokens import (  # noqa: F401  (legacy aliases used across this module)
+# ── 設計 Token（統一從 tokens.py 匯入，此模組內不重複定義任何 hex 色碼）────────
+from tokens import (  # noqa: F401  （legacy 別名在此模組各處使用，不可移除）
     # Surfaces
     BG, SURF_1, SURF_2, SURF_3, SURF_4,
     SURF1, SURF2, SURF3,            # legacy aliases
@@ -75,33 +81,34 @@ from tokens import (  # noqa: F401  (legacy aliases used across this module)
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Ambient Chamber — geometry & animation constants
+#  Ambient Chamber — 幾何與動畫常數
 # ─────────────────────────────────────────────────────────────────────────────
 
-CHAMBER_SIZE   = 280
-CHAMBER_CENTER = CHAMBER_SIZE // 2          # (140, 140)
-DISC_RADIUS    = 60                         # central clickable disc
+CHAMBER_SIZE   = 280                        # Canvas 寬高（像素，正方形）
+CHAMBER_CENTER = CHAMBER_SIZE // 2          # 圓心座標 (140, 140)
+DISC_RADIUS    = 60                         # 中央可點擊圓盤的半徑
 
-RING_RADII_5   = (80, 96, 112, 128, 140)    # idle / recording
-RING_RADII_4   = (80, 100, 120, 140)        # processing (one less = "收斂")
-RING_STROKE    = 2
+RING_RADII_5   = (80, 96, 112, 128, 140)    # 閒置 / 錄音：5 層同心圓半徑
+RING_RADII_4   = (80, 100, 120, 140)        # 處理中：4 層（少一層 = 視覺「收斂」感）
+RING_STROKE    = 2                           # 同心圓線寬（像素）
 
+# 各狀態下同心圓的透明度（由內到外遞減）
 RING_ALPHA_IDLE       = (0.25, 0.18, 0.12, 0.07, 0.03)
 RING_ALPHA_RECORDING  = (0.35, 0.24, 0.15, 0.08, 0.04)
 RING_ALPHA_PROCESSING = (0.30, 0.18, 0.10, 0.05)
 
-# RMS-driven expansion + ripple emission
-RMS_EXPAND_GAIN   = 0.18     # max +18 % radius at full RMS
-RMS_RIPPLE_THR    = 0.15     # trigger when rms > 0.15 AND > prev × 1.5
-RIPPLE_R0         = 140
-RIPPLE_R1         = 180
-RIPPLE_DURATION   = 1.2      # seconds
-RIPPLE_ALPHA0     = 0.4
-RIPPLE_MAX        = 3
+# RMS 音量驅動的圓環擴張 + 漣漪發射
+RMS_EXPAND_GAIN   = 0.18   # 最大擴張比例：RMS=1.0 時半徑增加 18%
+RMS_RIPPLE_THR    = 0.15   # 漣漪觸發閾值：RMS > 0.15 且 > 上一幀 × 1.5 時發射
+RIPPLE_R0         = 140    # 漣漪起始半徑（像素）
+RIPPLE_R1         = 180    # 漣漪終止半徑（像素）
+RIPPLE_DURATION   = 1.2    # 漣漪持續時間（秒）
+RIPPLE_ALPHA0     = 0.4    # 漣漪起始透明度
+RIPPLE_MAX        = 3      # 同時存在的最大漣漪數，防止畫面過於混亂
 
-# Processing state — rotating particle belt
-PROC_PARTICLES        = 12
-PROC_PARTICLE_RADIUS  = 4
+# 處理中狀態的旋轉粒子環
+PROC_PARTICLES        = 12  # 粒子總數（均勻分布在環上）
+PROC_PARTICLE_RADIUS  = 4   # 每個粒子的半徑（像素）
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -109,10 +116,10 @@ PROC_PARTICLE_RADIUS  = 4
 # ─────────────────────────────────────────────────────────────────────────────
 
 def system_reduce_motion() -> bool:
-    """Read macOS Reduce Motion preference once at app start.
+    """讀取 macOS「減少動態效果」系統偏好設定（啟動時讀取一次）。
 
-    Changes to the system pref require an app restart per macOS convention.
-    Falls back to False on any error (key absent, timeout, non-Darwin).
+    依 macOS 慣例，偏好設定變更需要重新啟動 App 才生效。
+    任何錯誤（鍵不存在、超時、非 Darwin 平台）都回傳 False（不限制動畫）。
     """
     try:
         r = subprocess.run(
@@ -129,7 +136,12 @@ def system_reduce_motion() -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AppWindow(ctk.CTkFrame):
-    """Root frame — Apple MacBook Pro aesthetic."""
+    """應用程式根框架——Apple MacBook Pro 美學風格。
+
+    包含完整的 UI 狀態機（idle → recording → processing → idle）、
+    錄音管線（recorder → transcriber → ollama_client）、
+    快捷鍵管理（pynput）、自動貼上（auto_paste）等所有核心邏輯。
+    """
 
     def __init__(self, master: ctk.CTk, cfg: Config) -> None:
         super().__init__(master, fg_color=BG, corner_radius=0)
@@ -302,15 +314,16 @@ class AppWindow(ctk.CTkFrame):
         )
         self._chamber.pack(pady=(SPACE_MD, SPACE_XS))
 
-        # Canvas event bindings — 注意：tkinter 的 <Button-1> == <ButtonPress-1>，
-        # 不能同時綁兩者，後者會覆蓋前者。一律走 press/release 處理。
+        # Canvas 事件綁定
+        # 注意：tkinter 的 <Button-1> 與 <ButtonPress-1> 是同一件事，
+        # 同時綁定時後者會覆蓋前者。一律使用 press/release 明確區分。
         self._chamber.bind("<Enter>",           self._on_chamber_enter)
         self._chamber.bind("<Leave>",           self._on_chamber_leave)
         self._chamber.bind("<Motion>",          self._on_chamber_motion)
         self._chamber.bind("<ButtonPress-1>",   self._on_chamber_press)
         self._chamber.bind("<ButtonRelease-1>", self._on_chamber_release)
 
-        # Timer — visible only during recording, SF Mono for tabular digits
+        # 錄音計時器：只在錄音中顯示；SF Mono 等寬字型防止數字跳動
         self._timer_label = ctk.CTkLabel(
             card, text="",
             font=ctk.CTkFont(FONT_FAMILY_MONO, 18, "bold"),
@@ -326,7 +339,7 @@ class AppWindow(ctk.CTkFrame):
         )
         self._target_label.pack()
 
-        # Hotkey hint (text changes per state)
+        # 快捷鍵提示文字：依目前狀態動態切換（「按下…」/「放開…」/「轉錄中…」）
         self._hotkey_hint = ctk.CTkLabel(
             card,
             text=f"按下 {self.cfg.format_hotkey_display()} 即時錄音",
@@ -335,12 +348,12 @@ class AppWindow(ctk.CTkFrame):
         )
         self._hotkey_hint.pack(pady=(0, SPACE_MD + 2))
 
-        # Pre-render icons for each state (tk.Canvas needs PhotoImage, not CTkImage)
+        # 預先渲染三種狀態的圖示（tk.Canvas 需要 PhotoImage，不接受 CTkImage）
         self._icon_mic_idle = get_canvas_icon("mic",    36, TEXT_2)
         self._icon_square   = get_canvas_icon("square", 28, TEXT_1)
         self._icon_mic_proc = get_canvas_icon("mic",    36, blend(WARN, SURF_2, 0.6))
 
-        # Chamber animation state
+        # Chamber 動畫狀態變數
         self._state_start_time = time.perf_counter()
         self._ripples: list[Ripple] = []
         self._prev_rms         = 0.0
@@ -348,7 +361,7 @@ class AppWindow(ctk.CTkFrame):
         self._hovering         = False
         self._reduce_motion    = system_reduce_motion()
 
-        # Kick off the render loop (runs for the life of the window)
+        # 啟動渲染迴圈（在視窗存活期間持續執行，每 50ms 更新一次 Canvas）
         self._render_tick()
 
     # ── Result card ──────────────────────────────────────────────────────────
@@ -455,7 +468,7 @@ class AppWindow(ctk.CTkFrame):
         row = ctk.CTkFrame(bar, fg_color="transparent")
         row.pack(expand=True, pady=13)
 
-        # Shared style for ghost buttons
+        # 幽靈按鈕共用樣式（透明底色 + 細邊框，低調不搶眼）
         ghost = dict(
             height=32, corner_radius=8,
             font=ctk.CTkFont("SF Pro Text", 13),
@@ -465,7 +478,7 @@ class AppWindow(ctk.CTkFrame):
             hover_color=SURF2,
         )
 
-        # Ghost buttons use TEXT_2-tinted icons
+        # 幽靈按鈕圖示尺寸（15px 在 13pt 字型旁的視覺平衡最佳）
         icon_size = 15
 
         ctk.CTkButton(
@@ -501,8 +514,8 @@ class AppWindow(ctk.CTkFrame):
         )
         self._ap_btn.pack(side="left", padx=4)
 
-        # Ollama polish —— 初始以 cfg 為準，不在此做網路探測（會阻塞 UI）。
-        # 實際連線狀態由 _refresh_ollama_health() 於啟動 2s 後非同步更新。
+        # AI 潤飾按鈕初始外觀依 cfg 設定，不在此時做網路探測（會阻塞 UI 建構）。
+        # 實際 Ollama 連線狀態由 _refresh_ollama_health() 在啟動 2 秒後非同步更新。
         self._ollama_btn = ctk.CTkButton(
             row, text="潤飾", width=96,
             image=get_icon("sparkles", icon_size, TEXT_3),
@@ -553,8 +566,8 @@ class AppWindow(ctk.CTkFrame):
         )
         self._status_label.pack(side="left")
 
-        # Timer is rendered under the chamber (see _build_record_card); status
-        # bar no longer carries a redundant mm:ss label.
+        # 計時器已移至 Chamber 下方（見 _build_record_card）；
+        # 狀態列不再重複顯示 mm:ss，避免資訊重複。
 
         self._hotkey_status = ctk.CTkLabel(
             inner, text=self.cfg.format_hotkey_display(),
@@ -604,7 +617,7 @@ class AppWindow(ctk.CTkFrame):
 
         self.recorder.start()
 
-        # UI: chamber render loop picks up new state automatically
+        # UI：Chamber 渲染迴圈會在下次 tick 時自動依新狀態重繪，不需手動觸發
         self._timer_label.configure(text="00:00")
         self._hotkey_hint.configure(
             text=f"放開 {self.cfg.format_hotkey_display()} 停止錄音"
@@ -615,8 +628,9 @@ class AppWindow(ctk.CTkFrame):
         self._status_label.configure(text="  錄音中")
 
         self._update_timer()
-        # Streaming 中段轉錄目前暫停：small 模型品質拖累主模型最終輸出，等 Ollama
-        # 接上後再評估是否重啟。_stream_tick 方法保留備用。
+        # 中段串流轉錄目前暫停使用：實測 small 模型的中段結果品質拖累
+        # 最終主模型輸出，等 Ollama 整合穩定後再評估是否重啟。
+        # _stream_tick 方法已保留，未來啟用時直接排程即可。
         self._stream_tick_id = None
 
     def _transition_to_processing(self) -> None:
@@ -633,7 +647,7 @@ class AppWindow(ctk.CTkFrame):
 
         full_audio = self.recorder.stop()
 
-        # UI: chamber render loop will switch to WARN palette + particle belt
+        # UI：Chamber 渲染迴圈下一 tick 會自動切換到 WARN 配色 + 粒子旋轉環
         self._timer_label.configure(text="")
         self._hotkey_hint.configure(text="轉錄中…")
         self._target_label.configure(text="")
@@ -1030,11 +1044,11 @@ class AppWindow(ctk.CTkFrame):
     # ═══════════════════════════════════════════════════════════════════════
 
     def _render_tick(self) -> None:
-        """Main render loop — 50 ms cadence, owns the chamber canvas."""
+        """主渲染迴圈——每 50ms 執行一次，負責 Chamber Canvas 的全部繪製。"""
         try:
             self._draw_chamber()
         except tk.TclError:
-            # Canvas destroyed during app shutdown — stop the loop silently.
+            # App 關閉時 Canvas 已被銷毀，靜默結束迴圈
             return
         self.after(RENDER_TICK_MS, self._render_tick)
 
@@ -1047,7 +1061,7 @@ class AppWindow(ctk.CTkFrame):
         state = self._state
         rm    = self._reduce_motion
 
-        # ─── State-dependent palette and geometry ────────────────────────
+        # ─── 依狀態決定配色與幾何參數 ───────────────────────────────────────
         if state == "idle":
             color  = ACCENT
             period = BREATHE_IDLE_MS / 1000.0
@@ -1069,7 +1083,7 @@ class AppWindow(ctk.CTkFrame):
         else:
             return
 
-        # ─── Breathing scale ─────────────────────────────────────────────
+        # ─── 呼吸縮放係數（reduce-motion 模式下固定為 1.0）─────────────────
         if rm:
             scale = 1.0
         else:
@@ -1087,7 +1101,7 @@ class AppWindow(ctk.CTkFrame):
 
         cx = cy = CHAMBER_CENTER
 
-        # ─── Ripples (recording, non-reduced-motion) ─────────────────────
+        # ─── 漣漪效果（僅錄音狀態 + 非減少動態模式）────────────────────────
         if state == "recording" and not rm:
             if rms > RMS_RIPPLE_THR and rms > self._prev_rms * 1.5:
                 self._ripples.append(Ripple(
@@ -1113,7 +1127,7 @@ class AppWindow(ctk.CTkFrame):
             self._ripples = alive
         self._prev_rms = rms
 
-        # ─── Ambient concentric rings (outside-in so inner draws on top) ─
+        # ─── 環境同心圓（由外到內繪製，讓內圓覆蓋在外圓上方）──────────────
         for radius, a in zip(reversed(radii), reversed(alphas)):
             r = radius * scale
             col = blend(color, SURF_1, a)
@@ -1122,7 +1136,7 @@ class AppWindow(ctk.CTkFrame):
                 outline=col, width=RING_STROKE,
             )
 
-        # ─── Processing rotating particle belt ───────────────────────────
+        # ─── 處理中旋轉粒子環 ────────────────────────────────────────────────
         if state == "processing":
             outer_r = radii[-1] * scale
             if rm:
@@ -1138,7 +1152,7 @@ class AppWindow(ctk.CTkFrame):
                 ang = math.radians(head + i * (360.0 / PROC_PARTICLES))
                 px = cx + outer_r * math.cos(ang)
                 py = cy + outer_r * math.sin(ang)
-                # Brightness gradient: head particle brightest → fades around belt
+                # 亮度漸層：領頭粒子最亮，沿環方向逐漸暗淡（彗星尾巴效果）
                 idx_from_head = (i % PROC_PARTICLES) / PROC_PARTICLES
                 a_p = 1.0 - idx_from_head * 0.85              # 1.0 → 0.15
                 if rm:
@@ -1149,7 +1163,7 @@ class AppWindow(ctk.CTkFrame):
                     fill=col_p, outline="",
                 )
 
-        # ─── Central disc ────────────────────────────────────────────────
+        # ─── 中央可點擊圓盤 ──────────────────────────────────────────────────
         dr = DISC_RADIUS * (scale if self._pressed and state == "idle" else 1.0)
         if state == "idle":
             disc_fill   = SURF_2
@@ -1169,7 +1183,7 @@ class AppWindow(ctk.CTkFrame):
             fill=disc_fill, outline=disc_border, width=disc_width,
         )
 
-        # ─── Central icon ────────────────────────────────────────────────
+        # ─── 中央狀態圖示（閒置=麥克風、錄音=停止方塊、處理中=暗麥克風）────
         if state == "idle":
             icon = self._icon_mic_idle
         elif state == "recording":
@@ -2131,14 +2145,16 @@ class HotkeyBindDialog(ctk.CTkToplevel):
         )
         self._apply_btn.pack(side="left", padx=6)
 
-    # ── 按鍵擷取（Tk 原生，不用 pynput） ────────────────────────────────
-    # 為什麼不用 pynput：macOS 26.4+ 把 TSMGetInputSourceProperty 改成「僅
-    # 限主執行緒」的硬斷言。pynput Listener 在背景執行緒透過 ctypes 呼叫
-    # TSM 解析鍵碼 → SIGTRAP 閃退。主 HotkeyManager 啟動早、流程穩沒炸；
-    # 但此處 capture_hotkey() 新開 Listener 必炸。
-    # 解法：改用 Tk 的 <KeyPress>/<KeyRelease> binding，事件在主執行緒回
-    # 調，完全不碰 TSM。唯一代價是對話框必須持續擁有鍵盤焦點（grab_set
-    # 已保證）。
+    # ── 按鍵擷取（使用 Tk 原生事件，不用 pynput）────────────────────────
+    #
+    # 為何不用 pynput capture_hotkey()：
+    #   macOS 26.4+ 將 TSMGetInputSourceProperty 改為「僅限主執行緒」的硬斷言。
+    #   pynput Listener 在背景執行緒透過 ctypes 呼叫 TSM 解析鍵碼 → SIGTRAP 閃退。
+    #   主 HotkeyManager 啟動早、流程穩定所以沒崩；但此處新開 Listener 必然崩潰。
+    #
+    # 解決方案：
+    #   改用 Tk 的 <KeyPress> / <KeyRelease> binding，事件在主執行緒回調，
+    #   完全不觸碰 TSM API。唯一代價是對話框必須持續擁有鍵盤焦點（grab_set 已保證）。
     _MODIFIERS = frozenset({"cmd", "ctrl", "alt", "shift"})
 
     def _start_capture(self) -> None:
@@ -2332,5 +2348,5 @@ class AccessibilityDialog(ctk.CTkToplevel):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def cfg_val(v):
-    """Return value as-is (helper to keep topbar loop readable)."""
+    """原樣回傳值（輔助函式，讓 topbar 初始化迴圈可讀性更高）。"""
     return v
