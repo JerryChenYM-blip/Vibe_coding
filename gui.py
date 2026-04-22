@@ -164,6 +164,9 @@ class AppWindow(ctk.CTkFrame):
         self._last_raw:          str              = ""
         self._last_polished:     Optional[str]    = None
         self._polish_busy:       bool             = False
+        # toggle chip 狀態：True=顯示潤飾版、False=顯示原文
+        # 新一段轉錄進來會重置為 True；沒有潤飾版時兩顆都灰態
+        self._showing_polished:  bool             = True
 
         self._build_ui()
         self._start_hotkey_listener()
@@ -358,6 +361,32 @@ class AppWindow(ctk.CTkFrame):
             corner_radius=6,
             command=self._on_clear,
         ).pack(side="right")
+
+        # 原文 / 潤飾 切換 chip（分段控制）
+        # 只在「最新一段」成功產出潤飾版時可用；無潤飾時兩顆都變灰。
+        # 狀態由 self._showing_polished 與 self._last_polished 決定。
+        toggle_wrap = ctk.CTkFrame(hdr, fg_color="transparent")
+        toggle_wrap.pack(side="right", padx=(0, SPACE_SM))
+
+        _seg_common = dict(
+            width=52, height=26, corner_radius=6,
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 12),
+            border_width=1,
+        )
+        self._seg_raw_btn = ctk.CTkButton(
+            toggle_wrap, text="原文",
+            command=lambda: self._set_showing_polished(False),
+            **_seg_common,
+        )
+        self._seg_raw_btn.pack(side="left", padx=(0, 2))
+        self._seg_polished_btn = ctk.CTkButton(
+            toggle_wrap, text="潤飾",
+            command=lambda: self._set_showing_polished(True),
+            **_seg_common,
+        )
+        self._seg_polished_btn.pack(side="left")
+        # 初始樣式：沒有任何結果也沒有潤飾版，兩顆都灰
+        self._apply_toggle_style()
 
         # Divider
         ctk.CTkFrame(card, height=1, fg_color=SURF3, corner_radius=0).pack(
@@ -665,6 +694,8 @@ class AppWindow(ctk.CTkFrame):
         gen = self._polish_generation
         self._last_raw       = text if valid else ""
         self._last_polished  = None
+        self._showing_polished = True          # 預設顯示潤飾版（有的話）
+        self._apply_toggle_style()             # 新結果暫無潤飾版 → 兩顆灰
 
         # 決定路徑：能潤飾就走潤飾流程，失敗自動降級回原文。
         # 規劃書 6.4「策略 B」：等潤飾完再貼，因此 auto-paste 也延到潤飾後。
@@ -744,6 +775,8 @@ class AppWindow(ctk.CTkFrame):
             polished = resp.text
             self._last_polished = polished
             self._replace_latest_with(polished, expect_current=raw_text)
+            self._showing_polished = True
+            self._apply_toggle_style()          # 現在有潤飾版了 → 兩顆點亮
             self._replace_result_title_suffix(
                 f"  · 已潤飾 · {resp.elapsed_seconds:.1f}s"
             )
@@ -765,6 +798,68 @@ class AppWindow(ctk.CTkFrame):
                 args=(paste_text, target),
                 daemon=True,
             ).start()
+
+    # ── 原文 / 潤飾 分段切換 ─────────────────────────────────────────────
+
+    def _apply_toggle_style(self) -> None:
+        """依目前狀態重繪兩顆分段按鈕。
+
+        狀態矩陣：
+          _last_polished is None           → 兩顆都灰（無潤飾可切）
+          _showing_polished == True        → 「潤飾」active
+          _showing_polished == False       → 「原文」active
+        """
+        has_polished = self._last_polished is not None
+
+        def _style(active: bool, enabled: bool):
+            if not enabled:
+                return dict(
+                    state="disabled",
+                    fg_color="transparent",
+                    border_color=SURF_3,
+                    text_color=TEXT_4,
+                    hover_color=SURF_1,
+                )
+            if active:
+                return dict(
+                    state="normal",
+                    fg_color=SURF_2,
+                    border_color=ACCENT,
+                    text_color=TEXT_1,
+                    hover_color=SURF_3,
+                )
+            return dict(
+                state="normal",
+                fg_color="transparent",
+                border_color=SURF_3,
+                text_color=TEXT_3,
+                hover_color=SURF_2,
+            )
+
+        self._seg_raw_btn.configure(
+            **_style(active=not self._showing_polished, enabled=has_polished)
+        )
+        self._seg_polished_btn.configure(
+            **_style(active=self._showing_polished, enabled=has_polished)
+        )
+
+    def _set_showing_polished(self, show_polished: bool) -> None:
+        """切換 textbox 最新一段的顯示內容（原文 / 潤飾）。
+
+        若最新段的內容與 _last_raw / _last_polished 不符（使用者手動編輯過），
+        沉默放棄切換，避免踩壞編輯。
+        """
+        if self._last_polished is None:
+            return  # 沒有潤飾版可切
+        if show_polished == self._showing_polished:
+            return  # 已經是這個狀態
+
+        target_text = self._last_polished if show_polished else self._last_raw
+        current_expected = self._last_raw if show_polished else self._last_polished
+        self._replace_latest_with(target_text, expect_current=current_expected)
+
+        self._showing_polished = show_polished
+        self._apply_toggle_style()
 
     def _replace_latest_with(self, new_text: str, expect_current: str) -> None:
         """以 new_text 替換 textbox 最新一段的內容。
@@ -1099,6 +1194,11 @@ class AppWindow(ctk.CTkFrame):
         self._textbox.delete("1.0", "end")
         self._textbox.configure(state="disabled")
         self._result_title.configure(text="轉錄結果")
+        # 重置 toggle 狀態：清空後無最新段可切
+        self._last_raw = ""
+        self._last_polished = None
+        self._showing_polished = True
+        self._apply_toggle_style()
         self._show_placeholder()
 
     def _toggle_auto_paste(self) -> None:
