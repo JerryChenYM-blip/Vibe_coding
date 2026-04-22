@@ -32,7 +32,7 @@ from hotkey_manager import (
     HotkeyManager, capture_hotkey, format_hotkey,
     is_pynput_available, check_accessibility,
 )
-from ollama_client import OllamaClient
+from ollama_client import OllamaClient, OllamaConfig
 from recorder import AudioRecorder
 from transcriber import Transcriber, TranscriptionResult
 from icons import get_icon, get_canvas_icon
@@ -136,6 +136,8 @@ class AppWindow(ctk.CTkFrame):
         self.recorder    = AudioRecorder()
         self.transcriber = Transcriber()
         self.ollama      = OllamaClient()
+        # 用設定檔同步 Ollama 參數（base_url / model / enabled / timeout）
+        self.ollama.apply_app_config(cfg)
         self.hotkey_mgr  = HotkeyManager(
             on_press_cb=self._hotkey_press,
             on_release_cb=self._hotkey_release,
@@ -154,9 +156,20 @@ class AppWindow(ctk.CTkFrame):
         self._stream_chunks:  list[str] = []
         self._stream_tick_id            = None
 
+        # Polish（AI 潤飾）狀態追蹤
+        # _polish_generation：每次新轉錄 +1，讓遲到的潤飾結果可以被識別丟棄
+        # _last_raw / _last_polished：保留最新一段的兩版本，供未來「切換顯示」
+        # _polish_busy：避免「潤飾中」時手動按 潤飾 鈕重複觸發
+        self._polish_generation: int              = 0
+        self._last_raw:          str              = ""
+        self._last_polished:     Optional[str]    = None
+        self._polish_busy:       bool             = False
+
         self._build_ui()
         self._start_hotkey_listener()
         self.after(1500, self._warmup_model)
+        # 開啟著的話再去探 Ollama；即使 Ollama 離線也不會卡 UI 建構。
+        self.after(2000, self._refresh_ollama_health)
 
     # ═══════════════════════════════════════════════════════════════════════
     #  BUILD UI
@@ -424,24 +437,25 @@ class AppWindow(ctk.CTkFrame):
         )
         self._ap_btn.pack(side="left", padx=4)
 
-        # Ollama polish
-        ollama_ok = self.ollama.is_available()
+        # Ollama polish —— 初始以 cfg 為準，不在此做網路探測（會阻塞 UI）。
+        # 實際連線狀態由 _refresh_ollama_health() 於啟動 2s 後非同步更新。
         self._ollama_btn = ctk.CTkButton(
             row, text="潤飾", width=96,
-            image=get_icon("sparkles", icon_size,
-                           TEXT_1 if ollama_ok else TEXT_3),
+            image=get_icon("sparkles", icon_size, TEXT_3),
             compound="left",
-            state="normal" if ollama_ok else "disabled",
-            fg_color=ACCENT if ollama_ok else SURF_1,
-            hover_color=ACCENT_HV if ollama_ok else SURF_2,
+            state="disabled",
+            fg_color=SURF_1,
+            hover_color=SURF_2,
             border_width=1,
-            border_color=ACCENT if ollama_ok else SURF_3,
-            text_color=TEXT_1 if ollama_ok else TEXT_3,
+            border_color=SURF_3,
+            text_color=TEXT_3,
             height=32, corner_radius=8,
             font=ctk.CTkFont("SF Pro Text", 13),
             command=self._on_ollama,
         )
         self._ollama_btn.pack(side="left", padx=4)
+        # 依目前 cfg 立即套一次外觀（啟動時僅是視覺狀態）
+        self._apply_polish_button_style(enabled=self.cfg.ollama_enabled, healthy=False)
 
         ctk.CTkButton(
             row, text="設定", width=96,
@@ -641,11 +655,41 @@ class AppWindow(ctk.CTkFrame):
         self._show_toast(f"轉錄完成 · {result.elapsed_seconds:.1f}s")
 
         text  = result.text
-        valid = text and text not in (
+        valid = bool(text) and text not in (
             "（未偵測到語音內容）",
             "（沒有偵測到音訊，請確認麥克風是否正常運作）",
         )
 
+        # 每次新轉錄都 +1，遲到的潤飾結果可據此丟棄。
+        self._polish_generation += 1
+        gen = self._polish_generation
+        self._last_raw       = text if valid else ""
+        self._last_polished  = None
+
+        # 決定路徑：能潤飾就走潤飾流程，失敗自動降級回原文。
+        # 規劃書 6.4「策略 B」：等潤飾完再貼，因此 auto-paste 也延到潤飾後。
+        take_polish_path = (
+            valid
+            and self.cfg.ollama_enabled
+            and self.ollama.health_ok is True
+        )
+
+        if take_polish_path:
+            # 複製原文到剪貼簿的行為保留（使用者可能立即想 ⌘V 原文）；
+            # 潤飾完成後會再覆蓋一次成為潤飾版。
+            if self.cfg.auto_copy:
+                try:
+                    import pyperclip
+                    pyperclip.copy(text)
+                except Exception:
+                    pass
+
+            target = self._paste_target if self.cfg.auto_paste else None
+            self._paste_target = None
+            self._start_polish(gen, text, target)
+            return
+
+        # 不走潤飾：沿用原有「auto-copy + auto-paste 原文」流程。
         if self.cfg.auto_copy and valid:
             try:
                 import pyperclip
@@ -661,6 +705,105 @@ class AppWindow(ctk.CTkFrame):
                 args=(text, target),
                 daemon=True,
             ).start()
+
+    # ── 潤飾管線 ────────────────────────────────────────────────────────────
+
+    def _start_polish(self, gen: int, raw_text: str, target: Optional[str]) -> None:
+        """啟動背景潤飾；完成時將於主執行緒回呼 _finish_polish。"""
+        self._polish_busy = True
+        self._append_result_title_suffix("  · 潤飾中…")
+
+        def _run():
+            resp = self.ollama.process(raw_text)
+            self.after(0, self._finish_polish, gen, raw_text, target, resp)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _finish_polish(
+        self,
+        gen: int,
+        raw_text: str,
+        target: Optional[str],
+        resp,
+    ) -> None:
+        """主執行緒：套用潤飾結果（或降級回原文）+ 觸發自動貼上。"""
+        # 若期間又開始新轉錄，這次結果直接丟棄，避免蓋到新內容
+        if gen != self._polish_generation:
+            self._polish_busy = False
+            return
+
+        self._polish_busy = False
+
+        if resp.error:
+            # 降級：提示錯誤，title 標示「原文」，auto-paste 貼原文
+            self._replace_result_title_suffix(f"  · 原文（潤飾失敗）")
+            self._show_toast(f"AI 潤飾失敗：{resp.error}")
+            paste_text = raw_text
+        else:
+            # 成功：textbox 的最新一段用潤飾版替換
+            polished = resp.text
+            self._last_polished = polished
+            self._replace_latest_with(polished, expect_current=raw_text)
+            self._replace_result_title_suffix(
+                f"  · 已潤飾 · {resp.elapsed_seconds:.1f}s"
+            )
+            self._show_toast(f"AI 潤飾完成 · {resp.elapsed_seconds:.1f}s")
+
+            # 剪貼簿覆蓋成潤飾版（如果開啟 auto_copy）
+            if self.cfg.auto_copy:
+                try:
+                    import pyperclip
+                    pyperclip.copy(polished)
+                except Exception:
+                    pass
+            paste_text = polished
+
+        # 自動貼上（策略 B：等潤飾完才貼）
+        if target:
+            threading.Thread(
+                target=self._do_auto_paste,
+                args=(paste_text, target),
+                daemon=True,
+            ).start()
+
+    def _replace_latest_with(self, new_text: str, expect_current: str) -> None:
+        """以 new_text 替換 textbox 最新一段的內容。
+
+        若 `expect_current` 與目前 mark 範圍內容不符，視為使用者已手動編輯或
+        又有新轉錄插入，放棄替換避免踩壞使用者操作。
+        """
+        try:
+            start = self._textbox.index("latest_start")
+            end   = self._textbox.index("latest_end")
+        except tk.TclError:
+            return
+        self._textbox.configure(state="normal")
+        current = self._textbox.get(start, end)
+        if current.strip() != expect_current.strip():
+            self._textbox.configure(state="disabled")
+            return
+        self._textbox.delete(start, end)
+        # 插入後 marks 會因 gravity 自動更新
+        self._textbox.insert(start, new_text)
+        self._textbox.see("latest_end")
+        self._textbox.configure(state="disabled")
+
+    def _append_result_title_suffix(self, suffix: str) -> None:
+        """在結果標題尾端加上狀態說明（不重複累加）。"""
+        cur = self._result_title.cget("text")
+        # 若已存在「·」開頭的尾綴，先移除再接
+        base = cur.split("  ·", 1)[0] if "  ·" in cur else cur
+        # 保留原本的括號資訊，只在最後加 suffix
+        self._result_title.configure(text=base + suffix if "  ·" in cur else cur + suffix)
+
+    def _replace_result_title_suffix(self, suffix: str) -> None:
+        """用新的尾綴覆蓋『潤飾中…』之類的臨時提示。"""
+        cur = self._result_title.cget("text")
+        # 砍掉所有「  ·」之後的部分（即第一段之後）
+        base = cur.split("  ·", 1)[0]
+        # 但原本 _display_result 寫的 "轉錄結果 (Xs · lang · model)" 本身就有 "·"
+        # 那個分隔寫在括號內，不會被這個 split 吃到（split 的是 "  ·"，有兩空格）
+        self._result_title.configure(text=base + suffix)
 
     def _do_auto_paste(self, text: str, target: str) -> None:
         success = _ap.paste_to_app(text, target)
@@ -682,7 +825,15 @@ class AppWindow(ctk.CTkFrame):
             self._textbox.insert("end", "\n\n─────────────\n\n")
         if existing == "（等待第一次錄音...）":
             self._textbox.delete("1.0", "end")
+
+        # 以 tk mark 圈住「最新一段」的起訖，之後潤飾完成時精準替換；
+        # left/right gravity 讓 mark 在插入／刪除時自動漂移到合理位置。
+        self._textbox.mark_set("latest_start", "end-1c")
+        self._textbox.mark_gravity("latest_start", "left")
         self._textbox.insert("end", result.text)
+        self._textbox.mark_set("latest_end", "end-1c")
+        self._textbox.mark_gravity("latest_end", "right")
+
         self._textbox.see("end")
         self._textbox.configure(state="disabled")
 
@@ -964,27 +1115,108 @@ class AppWindow(ctk.CTkFrame):
         self._show_toast("自動貼上已開啟" if on else "自動貼上已關閉")
 
     def _on_ollama(self) -> None:
+        """手動按「潤飾」鈕：對目前 textbox 內容執行一次潤飾。"""
+        if not self.cfg.ollama_enabled:
+            self._show_toast("AI 潤飾未啟用，請到「設定」開啟")
+            return
+        if self.ollama.health_ok is False:
+            self._show_toast("無法連線 Ollama 服務，請確認 ollama serve 已啟動")
+            # 重新探一次，下次點擊就能反映最新狀態
+            self._refresh_ollama_health()
+            return
+        if self._polish_busy:
+            self._show_toast("目前已在潤飾中，請稍候…")
+            return
+
         text = self._get_result_text()
         if not text:
             return
+
         self._ollama_btn.configure(state="disabled", text="處理中…")
+        self._polish_busy = True
 
         def _run():
             result = self.ollama.process(text)
             self.after(0, _done, result)
 
         def _done(result):
-            self._ollama_btn.configure(state="normal", text="潤飾")
+            self._polish_busy = False
+            # 用當前 cfg 重繪按鈕，避免 state 卡在 disabled
+            self._apply_polish_button_style(
+                enabled=self.cfg.ollama_enabled,
+                healthy=(self.ollama.health_ok is True),
+            )
             if result.error:
-                self._show_toast(f"Ollama 錯誤: {result.error}")
+                self._show_toast(f"AI 潤飾失敗：{result.error}")
                 return
+            # 整段覆蓋（手動潤飾情境下，使用者就是要整坨結果被替換）
             self._textbox.configure(state="normal")
             self._textbox.delete("1.0", "end")
             self._textbox.insert("end", result.text)
             self._textbox.configure(state="disabled")
-            self._show_toast("潤飾完成")
+            self._show_toast(f"AI 潤飾完成 · {result.elapsed_seconds:.1f}s")
 
         threading.Thread(target=_run, daemon=True).start()
+
+    # ── Ollama 健康狀態管理 ─────────────────────────────────────────────────
+
+    def _refresh_ollama_health(self) -> None:
+        """非同步探測 Ollama 服務，探測結果更新按鈕外觀。
+
+        設計原則：永遠不在主執行緒做 HTTP I/O；callback 用 self.after(0) 切回。
+        """
+        if not self.cfg.ollama_enabled:
+            # 沒啟用就不需要探測，直接把外觀設為「關閉」
+            self._apply_polish_button_style(enabled=False, healthy=False)
+            return
+
+        def _on_result(ok: bool):
+            # _on_result 在 requests 執行緒，UI 更新必須 marshal 回主執行緒
+            self.after(0, lambda: self._apply_polish_button_style(
+                enabled=self.cfg.ollama_enabled,
+                healthy=ok,
+            ))
+
+        self.ollama.health_check_async(on_result=_on_result)
+
+    def _apply_polish_button_style(self, enabled: bool, healthy: bool) -> None:
+        """把潤飾按鈕依「啟用 × 連線」四種組合畫出正確樣式。"""
+        if not enabled:
+            # 未啟用：完全灰態、不可按；點擊會顯示提示 toast（保留 state=normal 才能觸發）
+            self._ollama_btn.configure(
+                state="normal",
+                text="潤飾",
+                image=get_icon("sparkles", 15, TEXT_3),
+                fg_color=SURF_1,
+                hover_color=SURF_2,
+                border_color=SURF_3,
+                text_color=TEXT_3,
+            )
+            return
+
+        if not healthy:
+            # 啟用但服務不可達：用警示色，點擊會提示使用者
+            self._ollama_btn.configure(
+                state="normal",
+                text="潤飾（離線）",
+                image=get_icon("sparkles", 15, WARN),
+                fg_color=SURF_1,
+                hover_color=SURF_2,
+                border_color=WARN,
+                text_color=WARN,
+            )
+            return
+
+        # 啟用且健康：正常可用
+        self._ollama_btn.configure(
+            state="normal",
+            text="潤飾",
+            image=get_icon("sparkles", 15, TEXT_1),
+            fg_color=ACCENT,
+            hover_color=ACCENT_HV,
+            border_color=ACCENT,
+            text_color=TEXT_1,
+        )
 
     def _on_model_change(self, value: str) -> None:
         self.cfg.model = value
@@ -1021,6 +1253,9 @@ class AppWindow(ctk.CTkFrame):
             hover_color=INDIGO_HV if on else SURF_2,
             image=get_icon("keyboard", 15, TEXT_1 if on else TEXT_3),
         )
+        # Ollama 設定同步：把新 cfg 推給 client，然後重新非同步探測一次
+        self.ollama.apply_app_config(cfg)
+        self._refresh_ollama_health()
 
     # ═══════════════════════════════════════════════════════════════════════
     #  HELPERS
@@ -1231,6 +1466,68 @@ class SettingsWindow(ctk.CTkToplevel):
         sep_line(out)
         row(out, "語音轉文字後自動貼上 ⌨", make_sw(self._autopaste_var, INDIGO))
 
+        # ── AI 潤飾 (Ollama) ──────────────────────────────────────────────
+        ai = section("AI 潤飾 (Ollama)")
+
+        self._ollama_enabled_var = ctk.BooleanVar(value=self.cfg.ollama_enabled)
+        row(ai, "啟用 AI 潤飾", make_sw(self._ollama_enabled_var, ACCENT))
+        sep_line(ai)
+
+        # 模型名稱（文字輸入；未來可改為動態 dropdown）
+        model_row = ctk.CTkFrame(ai, fg_color="transparent", height=52)
+        model_row.pack(fill="x", padx=16, pady=4)
+        model_row.pack_propagate(False)
+        ctk.CTkLabel(
+            model_row, text="模型名稱", anchor="w",
+            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT1,
+        ).pack(side="left")
+        self._ollama_model_var = ctk.StringVar(value=self.cfg.ollama_model)
+        ctk.CTkEntry(
+            model_row, textvariable=self._ollama_model_var,
+            width=200, height=30, corner_radius=8,
+            fg_color=SURF2, border_color=SURF3,
+            text_color=TEXT1,
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 12),
+        ).pack(side="right")
+        sep_line(ai)
+
+        # Base URL（進階；一般使用者不需要改）
+        url_row = ctk.CTkFrame(ai, fg_color="transparent", height=52)
+        url_row.pack(fill="x", padx=16, pady=4)
+        url_row.pack_propagate(False)
+        ctk.CTkLabel(
+            url_row, text="服務位址", anchor="w",
+            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT1,
+        ).pack(side="left")
+        self._ollama_url_var = ctk.StringVar(value=self.cfg.ollama_base_url)
+        ctk.CTkEntry(
+            url_row, textvariable=self._ollama_url_var,
+            width=200, height=30, corner_radius=8,
+            fg_color=SURF2, border_color=SURF3,
+            text_color=TEXT3,
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 11),
+        ).pack(side="right")
+        sep_line(ai)
+
+        # 測試連線 + 狀態標籤
+        test_row = ctk.CTkFrame(ai, fg_color="transparent", height=52)
+        test_row.pack(fill="x", padx=16, pady=(4, 8))
+        test_row.pack_propagate(False)
+        self._ollama_test_status = ctk.CTkLabel(
+            test_row, text="（尚未測試）",
+            anchor="w",
+            font=ctk.CTkFont("SF Pro Text", 12), text_color=TEXT3,
+        )
+        self._ollama_test_status.pack(side="left")
+        ctk.CTkButton(
+            test_row, text="測試連線", width=100, height=30, corner_radius=8,
+            fg_color=SURF2, text_color=TEXT1,
+            hover_color=SURF3,
+            border_width=1, border_color=SURF3,
+            font=ctk.CTkFont("SF Pro Text", 12),
+            command=self._test_ollama,
+        ).pack(side="right")
+
         # ── 關於 ──────────────────────────────────────────────────────────
         about = section("關於")
         for label, path in [
@@ -1304,9 +1601,60 @@ class SettingsWindow(ctk.CTkToplevel):
         self.cfg.append_results = self._append_var.get()
         self.cfg.auto_copy      = self._autocopy_var.get()
         self.cfg.auto_paste     = self._autopaste_var.get()
+        # ── Ollama ────────────────────────────────────────────────────────
+        self.cfg.ollama_enabled  = self._ollama_enabled_var.get()
+        model = self._ollama_model_var.get().strip()
+        if model:
+            self.cfg.ollama_model = model
+        url = self._ollama_url_var.get().strip()
+        if url:
+            self.cfg.ollama_base_url = url
         self.cfg.save()
         self._on_save_cb(self.cfg)
         self.destroy()
+
+    def _test_ollama(self) -> None:
+        """於設定視窗中測試當前輸入的 base_url + model 是否可用。
+
+        不寫回 cfg（使用者按「取消」就應丟棄），只用暫時的 OllamaClient probe。
+        """
+        from ollama_client import OllamaClient, OllamaConfig
+
+        url   = self._ollama_url_var.get().strip() or "http://localhost:11434"
+        model = self._ollama_model_var.get().strip() or "qwen2.5:3b-instruct"
+
+        self._ollama_test_status.configure(text="測試中…", text_color=TEXT3)
+
+        def _run():
+            probe = OllamaClient(OllamaConfig(
+                base_url=url, model=model, enabled=True, timeout_seconds=5,
+            ))
+            ok = probe.health_check_sync()
+            models = probe.get_models() if ok else []
+            self.after(0, _done, ok, models)
+
+        def _done(ok: bool, models: list[str]):
+            if not ok:
+                self._ollama_test_status.configure(
+                    text="× 無法連線（請確認 ollama serve 已啟動）",
+                    text_color=DANGER,
+                )
+                return
+            has_model = any(m.split(":")[0] == model.split(":")[0] or m == model
+                            for m in models)
+            if has_model:
+                self._ollama_test_status.configure(
+                    text=f"✓ 連線成功，已找到 {model}",
+                    text_color=SUCCESS,
+                )
+            else:
+                preview = ", ".join(models[:3]) if models else "（無）"
+                self._ollama_test_status.configure(
+                    text=f"△ 連線成功但找不到 {model}。本機模型：{preview}",
+                    text_color=WARN,
+                )
+
+        threading.Thread(target=_run, daemon=True).start()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

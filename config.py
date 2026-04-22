@@ -42,7 +42,19 @@ class Config:
     append_results: bool = True
     auto_copy: bool = False
     auto_paste: bool = True
+
+    # ── Ollama 潤飾 ───────────────────────────────────────────────────────────
+    # 預設關閉；使用者需在設定中打開並確認 Ollama 服務可用後才會生效。
     ollama_enabled: bool = False
+    # 規劃書 6.2：3B 模型為 16GB Mac 首選，延遲 < 1s，中文品質可接受。
+    ollama_model: str = "qwen2.5:3b-instruct"
+    ollama_base_url: str = "http://localhost:11434"
+    # 潤飾上限 30 秒；超時即降級回原文（不阻塞使用者）。
+    ollama_timeout: int = 30
+    # 貼上策略：
+    #   "wait"   — 等潤飾完成再貼（規劃書 6.4 建議預設）
+    #   "raw"    — 先貼原文、不做潤飾替換（潤飾失敗時的降級模式）
+    ollama_paste_strategy: str = "wait"
 
     # ── persistence ──────────────────────────────────────────────────────────
 
