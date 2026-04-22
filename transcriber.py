@@ -109,6 +109,9 @@ class Transcriber:
 
     Uses mlx-whisper (Metal GPU) on Apple Silicon when available,
     falls back to faster-whisper (CPU int8) otherwise.
+
+    dictionary_terms: 個人字典詞彙清單，會注入 Whisper 的 initial_prompt
+    幫助 Whisper 正確辨識專有名詞。可透過 set_dictionary_terms() 動態更新。
     """
 
     def __init__(self) -> None:
@@ -116,6 +119,19 @@ class Transcriber:
         self._loaded_model_size: Optional[str] = None
         self._lock = threading.Lock()             # guards model loading
         self._transcription_lock = threading.Lock()  # prevents concurrent transcriptions
+        self._dictionary_terms: list[str] = []
+
+    def set_dictionary_terms(self, terms: list[str]) -> None:
+        """更新個人字典；下次轉錄會注入到 initial_prompt。"""
+        self._dictionary_terms = list(terms) if terms else []
+
+    def _build_initial_prompt(self) -> str:
+        """每次轉錄呼叫，動態組合 initial_prompt（支援 prompts.py 熱重載）。"""
+        try:
+            return prompts.format_whisper_prompt(self._dictionary_terms)
+        except Exception as e:
+            print(f"WHISPER: format_whisper_prompt failed (fallback): {e}")
+            return prompts.WHISPER_INITIAL_PROMPT
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -210,7 +226,7 @@ class Transcriber:
                 audio,
                 language=language,
                 beam_size=1,               # greedy decoding — fastest
-                initial_prompt=prompts.WHISPER_INITIAL_PROMPT,
+                initial_prompt=self._build_initial_prompt(),
                 condition_on_previous_text=False,
                 vad_filter=True,
                 vad_parameters={
@@ -312,7 +328,7 @@ class Transcriber:
                     audio,
                     path_or_hf_repo=hf_repo,
                     language=language,
-                    initial_prompt=prompts.WHISPER_INITIAL_PROMPT,
+                    initial_prompt=self._build_initial_prompt(),
                     verbose=False,
                 )
             except Exception as e:
@@ -352,7 +368,7 @@ class Transcriber:
                 language=language,
                 beam_size=5,
                 repetition_penalty=1.1,
-                initial_prompt=prompts.WHISPER_INITIAL_PROMPT,
+                initial_prompt=self._build_initial_prompt(),
                 condition_on_previous_text=False,
                 vad_filter=True,
                 vad_parameters={

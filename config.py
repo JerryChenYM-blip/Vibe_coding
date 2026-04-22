@@ -56,6 +56,27 @@ class Config:
     #   "raw"    — 先貼原文、不做潤飾替換（潤飾失敗時的降級模式）
     ollama_paste_strategy: str = "wait"
 
+    # ── Phase 2 preset 路由 ───────────────────────────────────────────────────
+    # 關閉時所有轉錄走 default preset（相當於 Phase 1 行為）
+    preset_routing_enabled: bool = True
+    # 個別 preset 停用名單：例如 {"code_comment": False} 表示不路由到 code_comment
+    # 未列出的 preset 視為啟用
+    preset_overrides: dict = field(default_factory=dict)
+
+    # ── #4 個人字典 ──────────────────────────────────────────────────────────
+    # 啟用後字典內容會注入 Whisper initial_prompt 與 Ollama polish prompt
+    dictionary_enabled: bool = True
+    # 字典檔路徑；空字串代表用 ~/.whisper_app/dictionary.json 預設值
+    dictionary_path: str = ""
+
+    # ── #2 Prompt 熱重載 ─────────────────────────────────────────────────────
+    # 啟用時 prompts.py / presets.py mtime 變化會自動 importlib.reload
+    prompt_hot_reload: bool = True
+
+    # ── #3 Polish log ────────────────────────────────────────────────────────
+    # 啟用時每次潤飾完成會附加一行 JSONL 到 ~/.whisper_app/polish_log.jsonl
+    polish_log_enabled: bool = True
+
     # ── persistence ──────────────────────────────────────────────────────────
 
     @classmethod

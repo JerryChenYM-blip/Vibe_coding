@@ -33,6 +33,9 @@ from hotkey_manager import (
     is_pynput_available, check_accessibility,
 )
 from ollama_client import OllamaClient, OllamaConfig
+import presets as _presets
+import dictionary as _dictionary
+from prompt_reloader import PromptReloader
 from recorder import AudioRecorder
 from transcriber import Transcriber, TranscriptionResult
 from icons import get_icon, get_canvas_icon
@@ -173,6 +176,18 @@ class AppWindow(ctk.CTkFrame):
         self.after(1500, self._warmup_model)
         # 開啟著的話再去探 Ollama；即使 Ollama 離線也不會卡 UI 建構。
         self.after(2000, self._refresh_ollama_health)
+
+        # #4 字典：初次載入並餵給 Transcriber
+        self._reload_dictionary()
+
+        # #2 Prompt 熱重載：啟動 mtime 背景輪詢
+        def _on_reload(name):
+            # 熱重載只是替換 module-level 字串，OllamaClient 與 Transcriber
+            # 都已走動態查詢路徑，不必重啟 pipeline
+            self.after(0, lambda: self._show_toast(f"已重新載入 {name}.py"))
+        self._prompt_reloader = PromptReloader(on_reload=_on_reload)
+        if self.cfg.prompt_hot_reload:
+            self._prompt_reloader.start()
 
     # ═══════════════════════════════════════════════════════════════════════
     #  BUILD UI
@@ -742,11 +757,45 @@ class AppWindow(ctk.CTkFrame):
     def _start_polish(self, gen: int, raw_text: str, target: Optional[str]) -> None:
         """啟動背景潤飾；完成時將於主執行緒回呼 _finish_polish。"""
         self._polish_busy = True
-        self._append_result_title_suffix("  · 潤飾中…")
+
+        # Phase 2：路由 preset（可能剝除關鍵字前綴）
+        if self.cfg.preset_routing_enabled:
+            selection = _presets.select_preset(
+                raw_text, target, enabled=self.cfg.preset_overrides,
+            )
+        else:
+            selection = _presets.PresetSelection(
+                preset=_presets.PRESETS["default"],
+                text=raw_text,
+                matched_reason="routing_disabled",
+            )
+
+        preset      = selection.preset
+        llm_input   = selection.text
+        preset_name = preset.name
+
+        # 標題顯示 preset（非 default 才顯示）+ 潤飾中
+        if preset_name != "default":
+            self._append_result_title_suffix(f"  · {preset.display_name} · 潤飾中…")
+        else:
+            self._append_result_title_suffix("  · 潤飾中…")
+
+        # 若路由剝除了關鍵字，要把 _last_raw 同步成「實際送 LLM 的文字」，
+        # 否則 _replace_latest_with 的 expect_current 比對會失敗導致潤飾版無法套用。
+        if llm_input != raw_text:
+            self._replace_latest_with(llm_input, expect_current=raw_text)
+            self._last_raw = llm_input
+
+        dict_terms = self._dictionary_terms if self.cfg.dictionary_enabled else None
 
         def _run():
-            resp = self.ollama.process(raw_text)
-            self.after(0, self._finish_polish, gen, raw_text, target, resp)
+            resp = self.ollama.process(
+                llm_input,
+                prompt_template=preset.resolve_prompt(),
+                dictionary_terms=dict_terms,
+                preset_name=preset_name,
+            )
+            self.after(0, self._finish_polish, gen, llm_input, target, resp)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -1260,6 +1309,29 @@ class AppWindow(ctk.CTkFrame):
 
     # ── Ollama 健康狀態管理 ─────────────────────────────────────────────────
 
+    # ── #4 字典 ─────────────────────────────────────────────────────────────
+
+    def _reload_dictionary(self) -> None:
+        """從檔案重新載字典，同步更新 transcriber。"""
+        if not self.cfg.dictionary_enabled:
+            self.transcriber.set_dictionary_terms([])
+            self._dictionary_terms: list[str] = []
+            return
+        path = self._dictionary_path()
+        _dictionary.ensure_file(path)
+        terms = _dictionary.load_terms(path)
+        self._dictionary_terms = terms
+        self.transcriber.set_dictionary_terms(terms)
+        print(f"DICTIONARY: loaded {len(terms)} terms from {path}")
+
+    def _dictionary_path(self):
+        """回傳字典檔路徑（cfg 自訂或預設）。"""
+        from pathlib import Path
+        custom = (self.cfg.dictionary_path or "").strip()
+        if custom:
+            return Path(custom).expanduser()
+        return _dictionary.DEFAULT_PATH
+
     def _refresh_ollama_health(self) -> None:
         """非同步探測 Ollama 服務，探測結果更新按鈕外觀。
 
@@ -1357,6 +1429,24 @@ class AppWindow(ctk.CTkFrame):
         self.ollama.apply_app_config(cfg)
         self._refresh_ollama_health()
 
+        # 字典：重新載入（可能 enabled 變了，或路徑變了）
+        self._reload_dictionary()
+
+        # Prompt 熱重載：啟動／停止 watcher
+        reloader = getattr(self, "_prompt_reloader", None)
+        if reloader is not None:
+            if cfg.prompt_hot_reload:
+                # start() 是 idempotent 嗎？不是，若已在跑會建第二個 thread。
+                # 簡單策略：先 stop 舊的（若有）再 start
+                reloader.stop()
+                # 新建一個實例以確保 _stop Event 乾淨
+                def _on_reload(name):
+                    self.after(0, lambda: self._show_toast(f"已重新載入 {name}.py"))
+                self._prompt_reloader = PromptReloader(on_reload=_on_reload)
+                self._prompt_reloader.start()
+            else:
+                reloader.stop()
+
     # ═══════════════════════════════════════════════════════════════════════
     #  HELPERS
     # ═══════════════════════════════════════════════════════════════════════
@@ -1421,6 +1511,7 @@ class AppWindow(ctk.CTkFrame):
 class SettingsWindow(ctk.CTkToplevel):
     def __init__(self, parent, cfg: Config, on_save_cb) -> None:
         super().__init__(parent)
+        self._parent     = parent                 # AppWindow（訪問 _prompt_reloader 用）
         self.cfg         = Config(**cfg.__dict__)
         self._on_save_cb = on_save_cb
         self.title("設定")
@@ -1628,6 +1719,86 @@ class SettingsWindow(ctk.CTkToplevel):
             command=self._test_ollama,
         ).pack(side="right")
 
+        # ── 情境路由 (Phase 2) ────────────────────────────────────────────
+        rout = section("情境路由 (Phase 2)")
+
+        self._routing_var = ctk.BooleanVar(value=self.cfg.preset_routing_enabled)
+        row(rout, "啟用情境自動切換", make_sw(self._routing_var, ACCENT))
+        sep_line(rout)
+
+        # 每個非 default preset 一個 switch；預設全部啟用
+        self._preset_switch_vars: dict[str, ctk.BooleanVar] = {}
+        import presets as _pr
+        for pname, preset in _pr.PRESETS.items():
+            if pname == "default":
+                continue
+            default_on = self.cfg.preset_overrides.get(pname, True)
+            var = ctk.BooleanVar(value=default_on)
+            self._preset_switch_vars[pname] = var
+            row(rout, f"  ↳ {preset.display_name}", make_sw(var, ACCENT))
+            sep_line(rout)
+
+        # 手動 reload prompt 按鈕 + 熱重載 switch
+        hot_row = ctk.CTkFrame(rout, fg_color="transparent", height=52)
+        hot_row.pack(fill="x", padx=16, pady=4)
+        hot_row.pack_propagate(False)
+        ctk.CTkLabel(
+            hot_row, text="Prompt 熱重載", anchor="w",
+            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT1,
+        ).pack(side="left")
+        self._hot_reload_var = ctk.BooleanVar(value=self.cfg.prompt_hot_reload)
+        ctk.CTkSwitch(
+            hot_row, text="", variable=self._hot_reload_var,
+            onvalue=True, offvalue=False, **sw_style,
+        ).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(
+            hot_row, text="立即重新載入", width=110, height=28, corner_radius=8,
+            fg_color=SURF2, text_color=TEXT1,
+            hover_color=SURF3, border_width=1, border_color=SURF3,
+            font=ctk.CTkFont("SF Pro Text", 12),
+            command=self._reload_prompts_now,
+        ).pack(side="right", padx=(8, 0))
+
+        # ── 個人字典 (#4) ─────────────────────────────────────────────────
+        dsec = section("個人字典")
+        self._dict_enabled_var = ctk.BooleanVar(value=self.cfg.dictionary_enabled)
+        row(dsec, "注入到轉錄與潤飾", make_sw(self._dict_enabled_var, ACCENT))
+        sep_line(dsec)
+
+        dict_path_row = ctk.CTkFrame(dsec, fg_color="transparent", height=52)
+        dict_path_row.pack(fill="x", padx=16, pady=4)
+        dict_path_row.pack_propagate(False)
+        ctk.CTkLabel(
+            dict_path_row, text="字典檔路徑", anchor="w",
+            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT1,
+        ).pack(side="left")
+        self._dict_path_var = ctk.StringVar(value=self.cfg.dictionary_path)
+        ctk.CTkEntry(
+            dict_path_row, textvariable=self._dict_path_var,
+            placeholder_text="(預設 ~/.whisper_app/dictionary.json)",
+            width=220, height=30, corner_radius=8,
+            fg_color=SURF2, border_color=SURF3,
+            text_color=TEXT3,
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 11),
+        ).pack(side="right")
+        sep_line(dsec)
+
+        dict_btn_row = ctk.CTkFrame(dsec, fg_color="transparent", height=52)
+        dict_btn_row.pack(fill="x", padx=16, pady=(4, 8))
+        dict_btn_row.pack_propagate(False)
+        self._dict_status_label = ctk.CTkLabel(
+            dict_btn_row, text="", anchor="w",
+            font=ctk.CTkFont("SF Pro Text", 12), text_color=TEXT3,
+        )
+        self._dict_status_label.pack(side="left")
+        ctk.CTkButton(
+            dict_btn_row, text="用預設編輯器開啟", width=150, height=30, corner_radius=8,
+            fg_color=SURF2, text_color=TEXT1,
+            hover_color=SURF3, border_width=1, border_color=SURF3,
+            font=ctk.CTkFont("SF Pro Text", 12),
+            command=self._open_dictionary_file,
+        ).pack(side="right")
+
         # ── 關於 ──────────────────────────────────────────────────────────
         about = section("關於")
         for label, path in [
@@ -1709,9 +1880,52 @@ class SettingsWindow(ctk.CTkToplevel):
         url = self._ollama_url_var.get().strip()
         if url:
             self.cfg.ollama_base_url = url
+        # ── Phase 2 preset 路由 ──────────────────────────────────────────
+        self.cfg.preset_routing_enabled = self._routing_var.get()
+        self.cfg.preset_overrides = {
+            name: var.get() for name, var in self._preset_switch_vars.items()
+        }
+        # ── #2 熱重載 ─────────────────────────────────────────────────────
+        self.cfg.prompt_hot_reload = self._hot_reload_var.get()
+        # ── #4 字典 ──────────────────────────────────────────────────────
+        self.cfg.dictionary_enabled = self._dict_enabled_var.get()
+        self.cfg.dictionary_path    = self._dict_path_var.get().strip()
         self.cfg.save()
         self._on_save_cb(self.cfg)
         self.destroy()
+
+    def _reload_prompts_now(self) -> None:
+        reloader = getattr(self._parent, "_prompt_reloader", None)
+        if reloader is None:
+            return
+        reloaded = reloader.reload_now()
+        if reloaded:
+            names = ", ".join(f"{n}.py" for n in reloaded)
+            self._dict_status_label.configure(
+                text=f"已重新載入 {names}", text_color=SUCCESS,
+            )
+        else:
+            self._dict_status_label.configure(
+                text="Reload 失敗（檢查 console log）",
+                text_color=DANGER,
+            )
+
+    def _open_dictionary_file(self) -> None:
+        """在預設編輯器開啟字典 JSON。"""
+        path_str = (self._dict_path_var.get().strip()
+                    or str(_dictionary.DEFAULT_PATH))
+        from pathlib import Path as _P
+        path = _P(path_str).expanduser()
+        _dictionary.ensure_file(path)
+        try:
+            subprocess.run(["open", str(path)])
+            self._dict_status_label.configure(
+                text=f"已開啟 {path.name}", text_color=TEXT3,
+            )
+        except Exception as e:
+            self._dict_status_label.configure(
+                text=f"開啟失敗：{e}", text_color=DANGER,
+            )
 
     def _test_ollama(self) -> None:
         """於設定視窗中測試當前輸入的 base_url + model 是否可用。
