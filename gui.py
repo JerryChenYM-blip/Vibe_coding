@@ -151,8 +151,12 @@ class AppWindow(ctk.CTkFrame):
         self._hotkey_held: bool  = False
         self._rec_start:   float = 0.0
 
-        # Auto-paste
-        self._paste_target: Optional[str] = None
+        # 錄音當下的前景 app：
+        #   _frontmost_app —— 永遠抓（preset 路由用）；與 auto_paste 無關
+        #   _paste_target  —— 只在 auto_paste=True 時才同步填值（⌘V 目標）
+        # A1 修法：拆開兩個概念，讓關掉 auto-paste 也能用情境路由
+        self._frontmost_app: Optional[str] = None
+        self._paste_target:  Optional[str] = None
 
         # Streaming
         self._stream_samples: int       = 0
@@ -161,15 +165,26 @@ class AppWindow(ctk.CTkFrame):
 
         # Polish（AI 潤飾）狀態追蹤
         # _polish_generation：每次新轉錄 +1，讓遲到的潤飾結果可以被識別丟棄
-        # _last_raw / _last_polished：保留最新一段的兩版本，供未來「切換顯示」
-        # _polish_busy：避免「潤飾中」時手動按 潤飾 鈕重複觸發
-        self._polish_generation: int              = 0
-        self._last_raw:          str              = ""
-        self._last_polished:     Optional[str]    = None
-        self._polish_busy:       bool             = False
-        # toggle chip 狀態：True=顯示潤飾版、False=顯示原文
+        # _last_raw         ：Whisper 產出的原文（C1：永不被 preset 剝除汙染）
+        # _last_llm_input   ：實際送給 LLM 的輸入（可能已剝除關鍵字）
+        # _last_polished    ：LLM 回的潤飾版（未完成時為 None）
+        # _polish_busy      ：避免「潤飾中」時手動按 潤飾 鈕重複觸發
+        self._polish_generation: int           = 0
+        self._last_raw:          str           = ""
+        self._last_llm_input:    Optional[str] = None
+        self._last_polished:     Optional[str] = None
+        self._polish_busy:       bool          = False
+        # toggle chip 狀態：True=顯示潤飾版、False=顯示原文（Whisper 原文）
         # 新一段轉錄進來會重置為 True；沒有潤飾版時兩顆都灰態
-        self._showing_polished:  bool             = True
+        self._showing_polished:  bool          = True
+
+        # 結果標題三段式狀態（C2：取代字串切割手術）
+        #   _title_base    —— "轉錄結果  (Xs · lang · model)"
+        #   _title_preset  —— 非 default preset 的 display_name，其他為 None
+        #   _title_status  —— "潤飾中…" / "已潤飾 · 1.2s" / "原文（潤飾失敗）"/ None
+        self._title_base:    str           = "轉錄結果"
+        self._title_preset:  Optional[str] = None
+        self._title_status:  Optional[str] = None
 
         self._build_ui()
         self._start_hotkey_listener()
@@ -558,21 +573,27 @@ class AppWindow(ctk.CTkFrame):
         self._ripples.clear()
         self._prev_rms         = 0.0
 
-        # Capture frontmost app for auto-paste —— 背景執行緒執行，避免 2 秒
-        # osascript timeout 卡住 recorder.start()。短錄音也夠時間在轉錄前完成。
-        self._paste_target = None
+        # Capture frontmost app —— 背景執行緒執行，避免 2 秒 osascript timeout
+        # 卡住 recorder.start()。此資訊同時被 preset 路由（A1）與 auto-paste 用；
+        # 所以**永遠抓**，不再綁 auto_paste 設定。
+        self._paste_target  = None
+        self._frontmost_app = None
         self._target_label.configure(text="")
-        if self.cfg.auto_paste:
-            def _capture_frontmost():
-                app = _ap.get_frontmost_app()
-                if not app or app in ("Python", "python3"):
+
+        def _capture_frontmost():
+            app = _ap.get_frontmost_app()
+            if not app or app in ("Python", "python3"):
+                return
+            def _apply():
+                if self._state != "recording":
                     return
-                def _apply():
-                    if self._state == "recording":   # 仍在錄，才更新
-                        self._paste_target = app
-                        self._target_label.configure(text=f"→ {app}")
-                self.after(0, _apply)
-            threading.Thread(target=_capture_frontmost, daemon=True).start()
+                self._frontmost_app = app
+                # 只有 auto_paste 開啟時才作為 ⌘V 目標 + 顯示提示
+                if self.cfg.auto_paste:
+                    self._paste_target = app
+                    self._target_label.configure(text=f"→ {app}")
+            self.after(0, _apply)
+        threading.Thread(target=_capture_frontmost, daemon=True).start()
 
         self.recorder.start()
 
@@ -707,8 +728,10 @@ class AppWindow(ctk.CTkFrame):
         # 每次新轉錄都 +1，遲到的潤飾結果可據此丟棄。
         self._polish_generation += 1
         gen = self._polish_generation
-        self._last_raw       = text if valid else ""
-        self._last_polished  = None
+        # C1：_last_raw 永遠是 Whisper 原文、絕不被路由剝除覆寫
+        self._last_raw         = text if valid else ""
+        self._last_llm_input   = None
+        self._last_polished    = None
         self._showing_polished = True          # 預設顯示潤飾版（有的話）
         self._apply_toggle_style()             # 新結果暫無潤飾版 → 兩顆灰
 
@@ -758,10 +781,12 @@ class AppWindow(ctk.CTkFrame):
         """啟動背景潤飾；完成時將於主執行緒回呼 _finish_polish。"""
         self._polish_busy = True
 
-        # Phase 2：路由 preset（可能剝除關鍵字前綴）
+        # A1：preset 路由一律用 _frontmost_app（不受 auto_paste 影響）
         if self.cfg.preset_routing_enabled:
             selection = _presets.select_preset(
-                raw_text, target, enabled=self.cfg.preset_overrides,
+                raw_text,
+                self._frontmost_app,
+                enabled=self.cfg.preset_overrides,
             )
         else:
             selection = _presets.PresetSelection(
@@ -773,18 +798,13 @@ class AppWindow(ctk.CTkFrame):
         preset      = selection.preset
         llm_input   = selection.text
         preset_name = preset.name
+        # C1：記錄實際送 LLM 的輸入但不汙染 _last_raw
+        self._last_llm_input = llm_input
 
-        # 標題顯示 preset（非 default 才顯示）+ 潤飾中
-        if preset_name != "default":
-            self._append_result_title_suffix(f"  · {preset.display_name} · 潤飾中…")
-        else:
-            self._append_result_title_suffix("  · 潤飾中…")
-
-        # 若路由剝除了關鍵字，要把 _last_raw 同步成「實際送 LLM 的文字」，
-        # 否則 _replace_latest_with 的 expect_current 比對會失敗導致潤飾版無法套用。
-        if llm_input != raw_text:
-            self._replace_latest_with(llm_input, expect_current=raw_text)
-            self._last_raw = llm_input
+        # C2：三段式標題狀態（preset 名稱不會被後續 status 吃掉）
+        self._title_preset = preset.display_name if preset_name != "default" else None
+        self._title_status = "潤飾中…"
+        self._rebuild_result_title()
 
         dict_terms = self._dictionary_terms if self.cfg.dictionary_enabled else None
 
@@ -795,7 +815,9 @@ class AppWindow(ctk.CTkFrame):
                 dictionary_terms=dict_terms,
                 preset_name=preset_name,
             )
-            self.after(0, self._finish_polish, gen, llm_input, target, resp)
+            # 把 raw_text（= Whisper 原文）交給 _finish_polish 做 expect_current
+            # 比對，textbox 從頭到尾維持 Whisper 原文直到替換為潤飾版
+            self.after(0, self._finish_polish, gen, raw_text, target, resp)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -815,20 +837,21 @@ class AppWindow(ctk.CTkFrame):
         self._polish_busy = False
 
         if resp.error:
-            # 降級：提示錯誤，title 標示「原文」，auto-paste 貼原文
-            self._replace_result_title_suffix(f"  · 原文（潤飾失敗）")
+            # 降級：提示錯誤，title 狀態轉為「原文（潤飾失敗）」，auto-paste 貼原文
+            # 注意：preset 名稱（若有）刻意保留，讓使用者知道是哪條 preset 炸
+            self._title_status = "原文（潤飾失敗）"
+            self._rebuild_result_title()
             self._show_toast(f"AI 潤飾失敗：{resp.error}")
             paste_text = raw_text
         else:
-            # 成功：textbox 的最新一段用潤飾版替換
+            # 成功：textbox 的最新一段用潤飾版替換（textbox 此時是 Whisper 原文）
             polished = resp.text
             self._last_polished = polished
             self._replace_latest_with(polished, expect_current=raw_text)
             self._showing_polished = True
             self._apply_toggle_style()          # 現在有潤飾版了 → 兩顆點亮
-            self._replace_result_title_suffix(
-                f"  · 已潤飾 · {resp.elapsed_seconds:.1f}s"
-            )
+            self._title_status = f"已潤飾 · {resp.elapsed_seconds:.1f}s"
+            self._rebuild_result_title()
             self._show_toast(f"AI 潤飾完成 · {resp.elapsed_seconds:.1f}s")
 
             # 剪貼簿覆蓋成潤飾版（如果開啟 auto_copy）
@@ -932,22 +955,21 @@ class AppWindow(ctk.CTkFrame):
         self._textbox.see("latest_end")
         self._textbox.configure(state="disabled")
 
-    def _append_result_title_suffix(self, suffix: str) -> None:
-        """在結果標題尾端加上狀態說明（不重複累加）。"""
-        cur = self._result_title.cget("text")
-        # 若已存在「·」開頭的尾綴，先移除再接
-        base = cur.split("  ·", 1)[0] if "  ·" in cur else cur
-        # 保留原本的括號資訊，只在最後加 suffix
-        self._result_title.configure(text=base + suffix if "  ·" in cur else cur + suffix)
+    def _rebuild_result_title(self) -> None:
+        """由 _title_base / _title_preset / _title_status 三段拼出標題。
 
-    def _replace_result_title_suffix(self, suffix: str) -> None:
-        """用新的尾綴覆蓋『潤飾中…』之類的臨時提示。"""
-        cur = self._result_title.cget("text")
-        # 砍掉所有「  ·」之後的部分（即第一段之後）
-        base = cur.split("  ·", 1)[0]
-        # 但原本 _display_result 寫的 "轉錄結果 (Xs · lang · model)" 本身就有 "·"
-        # 那個分隔寫在括號內，不會被這個 split 吃到（split 的是 "  ·"，有兩空格）
-        self._result_title.configure(text=base + suffix)
+        C2 修法：取代 _append/_replace_result_title_suffix 的字串切割手術。
+        單一入口、單一真相來源，preset 與 status 能共存不互相吃。
+        """
+        parts: list[str] = [self._title_base]
+        segments: list[str] = []
+        if self._title_preset:
+            segments.append(self._title_preset)
+        if self._title_status:
+            segments.append(self._title_status)
+        if segments:
+            parts.append("  · " + "  · ".join(segments))
+        self._result_title.configure(text="".join(parts))
 
     def _do_auto_paste(self, text: str, target: str) -> None:
         success = _ap.paste_to_app(text, target)
@@ -960,9 +982,11 @@ class AppWindow(ctk.CTkFrame):
         dur   = int(result.duration_seconds)
         lang  = result.language.upper() if result.language else "?"
         model = self._model_var.get()
-        self._result_title.configure(
-            text=f"轉錄結果  ({dur}s · {lang} · {model})"
-        )
+        # C2：重設三段式標題狀態
+        self._title_base   = f"轉錄結果  ({dur}s · {lang} · {model})"
+        self._title_preset = None
+        self._title_status = None
+        self._rebuild_result_title()
         self._textbox.configure(state="normal")
         existing = self._textbox.get("1.0", "end").strip()
         if existing and existing != "（等待第一次錄音...）":
@@ -1242,10 +1266,15 @@ class AppWindow(ctk.CTkFrame):
         self._textbox.configure(state="normal")
         self._textbox.delete("1.0", "end")
         self._textbox.configure(state="disabled")
-        self._result_title.configure(text="轉錄結果")
+        # 重置三段式標題
+        self._title_base   = "轉錄結果"
+        self._title_preset = None
+        self._title_status = None
+        self._rebuild_result_title()
         # 重置 toggle 狀態：清空後無最新段可切
-        self._last_raw = ""
-        self._last_polished = None
+        self._last_raw         = ""
+        self._last_llm_input   = None
+        self._last_polished    = None
         self._showing_polished = True
         self._apply_toggle_style()
         self._show_placeholder()
