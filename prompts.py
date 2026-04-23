@@ -1,26 +1,161 @@
 """
-Centralized storage for all System Prompts and AI instructions.
-Easy to maintain and version control.
+所有 System Prompt 與 AI 指令的集中管理處。
+
+此檔所有 prompt **皆為模組層 string 常數**，以利 prompt_reloader 偵測
+mtime 變化後用 importlib.reload() 即時生效。呼叫端必須用「module.ATTR」
+動態查詢形式，不可再用 `from prompts import OLLAMA_POLISH_PROMPT`，否則
+reload 後仍會拿到舊值。
+
+匯出：
+  WHISPER_INITIAL_PROMPT     Whisper 轉錄時注入的語系／風格提示
+  OLLAMA_POLISH_PROMPT       Phase 1 通用潤飾 prompt（default preset 用）
+  OLLAMA_PRESET_PROMPTS      Phase 2 preset name → prompt 對照表
+  format_whisper_prompt()    拼接 WHISPER_INITIAL_PROMPT + dictionary 術語
+  format_polish_prompt()     拼接 preset prompt + dictionary 約束
 """
+
+from __future__ import annotations
+
+from typing import Iterable, Optional
 
 # ── Whisper Transcription Prompts ─────────────────────────────────────────────
 
-# This helps Whisper maintain Traditional Chinese and handle technical terms.
+# 幫助 Whisper 維持繁體中文並保留英文專有名詞。
 WHISPER_INITIAL_PROMPT = (
     "這是一段繁體中文與英文夾雜的對話。請使用正體中文（繁體中文），"
     "原文保留英文單字與專有名詞，不要翻譯，保持口語自然。"
 )
 
+
 # ── Ollama AI Refinement Prompts ──────────────────────────────────────────────
 
-# Standard refinement prompt for cleaning up transcriptions.
-OLLAMA_SYSTEM_PROMPT = (
-    "你是一位專業的文字編輯助理。以下是一段語音辨識轉錄文字，"
-    "請修正錯字、斷句、語氣，使其更通順自然，只回傳修正後的文字，不要加任何說明或旁白：\n\n{text}"
+# Phase 1 通用潤飾 prompt（default preset 也用這個）。
+# 嚴格版：正面清單 + 負面清單 + 固定結尾「只輸出修正後的文字」收斂 LLM 行為。
+OLLAMA_POLISH_PROMPT = (
+    "你是語音轉文字後處理助理。輸入是一段 Whisper 中英混講轉錄，你要做下列事情：\n"
+    "1. 刪除語氣詞與無意義重複（嗯、啊、那個、然後那個、所以那個、um、uh、like、you know）\n"
+    "2. 修正明顯的同音錯字（例：在／再、做／坐、的／得／地）\n"
+    "3. 補上合適的標點與斷句\n"
+    "4. 保留所有英文原文（專有名詞、技術術語、品牌名不要翻譯）\n"
+    "5. 保留語意與說話者原意，**不要增加、刪減或改寫內容**\n"
+    "6. 若原文極短（≤5 字），僅做最小幅度修正\n\n"
+    "只輸出修正後的文字，不要加任何說明、標題、前綴、引號或括號。\n\n"
+    "原文：\n{text}"
 )
 
-# Optional: Add different personalities here
+# 舊別名（向後相容）
+OLLAMA_SYSTEM_PROMPT = OLLAMA_POLISH_PROMPT
+
+
+# ── Phase 2 情境 preset prompts ───────────────────────────────────────────────
+
+# 每個 preset 的 prompt 都繼承 Phase 1 的「去 filler / 修錯字 / 保留英文」底盤，
+# 再套上情境特有的語氣與格式要求。
+
+OLLAMA_EMAIL_PROMPT = (
+    "你是語音轉文字後處理助理。輸入是一段 Whisper 中英混講轉錄，目標是輸出一封"
+    "**正式但自然**的 email 內容。做下列事情：\n"
+    "1. 刪除語氣詞與無意義重複\n"
+    "2. 修正同音錯字\n"
+    "3. 使用完整句、適當分段；若有明確收件人語氣就加招呼語（例如 Hi X,）\n"
+    "4. 保留所有英文原文，不要翻譯技術術語、品牌名、人名\n"
+    "5. **不要憑空加上簽名檔、祝福語或寄件人資訊**（除非原文有提到）\n"
+    "6. 維持原意，不要改寫或擴充內容\n\n"
+    "只輸出 email 本文，不要加任何說明、標題、前綴、引號或括號。\n\n"
+    "原文：\n{text}"
+)
+
+OLLAMA_CHAT_PROMPT = (
+    "你是語音轉文字後處理助理。輸入是一段 Whisper 中英混講轉錄，目標是輸出一則"
+    "**輕鬆口語、符合即時通訊（Slack / Line / Messages）風格**的訊息。做：\n"
+    "1. 刪除語氣詞與無意義重複\n"
+    "2. 修正同音錯字\n"
+    "3. 保持口語化，短句優先、標點少量；英文句子可維持小寫（除非專有名詞）\n"
+    "4. 保留所有英文原文\n"
+    "5. 不要加招呼語或簽名\n"
+    "6. 維持原意\n\n"
+    "只輸出訊息本文，不要加任何說明、標題、前綴、引號或括號。\n\n"
+    "原文：\n{text}"
+)
+
+OLLAMA_NOTE_PROMPT = (
+    "你是語音轉文字後處理助理。輸入是一段 Whisper 中英混講轉錄，目標是輸出一段"
+    "**結構清晰的筆記內容**（Notion / Obsidian / Bear 使用情境）。做：\n"
+    "1. 刪除語氣詞與無意義重複\n"
+    "2. 修正同音錯字\n"
+    "3. 若內容自然呈現多個要點，可用「-」條列；若為連貫敘述，維持段落\n"
+    "4. 標點完整、斷句清楚\n"
+    "5. 保留所有英文原文\n"
+    "6. 維持原意\n\n"
+    "只輸出筆記內容，不要加任何說明、標題、前綴、引號或括號。\n\n"
+    "原文：\n{text}"
+)
+
+OLLAMA_CODE_COMMENT_PROMPT = (
+    "你是語音轉文字後處理助理。輸入是一段 Whisper 中英混講轉錄，目標是輸出一段"
+    "**技術註解**（給 Xcode / VS Code / Cursor 使用）。做：\n"
+    "1. 刪除語氣詞與無意義重複\n"
+    "2. 修正技術術語錯字\n"
+    "3. 技術名詞與 API 名稱一律用英文原文\n"
+    "4. 簡潔、一到兩句話為主，不要冗長解釋\n"
+    "5. 維持原意，不要憑空加入使用範例或 TODO\n\n"
+    "只輸出註解內容本身，不要加 // 或 # 前綴、不要加引號或括號。\n\n"
+    "原文：\n{text}"
+)
+
+# Phase 2 核心資料：preset 名 → prompt 字串
+OLLAMA_PRESET_PROMPTS: dict[str, str] = {
+    "default":      OLLAMA_POLISH_PROMPT,
+    "email":        OLLAMA_EMAIL_PROMPT,
+    "chat":         OLLAMA_CHAT_PROMPT,
+    "note":         OLLAMA_NOTE_PROMPT,
+    "code_comment": OLLAMA_CODE_COMMENT_PROMPT,
+}
+
+# 會議記錄 preset 先留著（Phase 3 若要做 voice shortcut 觸發時可用）
 OLLAMA_MEETING_MINUTES_PROMPT = (
     "你是一位會議記錄專家。請將以下轉錄文字整理成條列式的會議要點，"
     "保留關鍵決策與行動項，使用繁體中文：\n\n{text}"
 )
+
+
+# ── Dictionary 注入 helpers ───────────────────────────────────────────────────
+
+def format_whisper_prompt(dictionary_terms: Optional[Iterable[str]] = None) -> str:
+    """拼出傳給 Whisper 的 initial_prompt：基礎提示 + 術語清單。
+
+    dictionary_terms 是使用者個人字典的詞彙；最多取 30 個（Whisper prompt
+    長度有限），用逗號拼接附在後面。空或 None 時回基礎提示。
+    """
+    base = WHISPER_INITIAL_PROMPT
+    if not dictionary_terms:
+        return base
+    terms = [t.strip() for t in dictionary_terms if t and t.strip()]
+    if not terms:
+        return base
+    snippet = "、".join(terms[:30])
+    return f"{base} 常用詞彙：{snippet}。"
+
+
+def format_polish_prompt(
+    base_prompt: str,
+    dictionary_terms: Optional[Iterable[str]] = None,
+) -> str:
+    """在 preset prompt 尾端（{text} 之前）追加一行保留術語約束。
+
+    dictionary_terms 空時回原 base_prompt 不動。
+    """
+    if not dictionary_terms:
+        return base_prompt
+    terms = [t.strip() for t in dictionary_terms if t and t.strip()]
+    if not terms:
+        return base_prompt
+    snippet = "、".join(terms[:50])
+    # 將一行約束插在最後一行「只輸出…」之前（通常是原文之上）。策略：
+    # 若 base 含 "原文：\n{text}"，就把約束插在它前面。
+    addon = f"★ 務必逐字保留下列術語原文，不要替換為同音字或翻譯：{snippet}\n\n"
+    marker = "原文：\n{text}"
+    if marker in base_prompt:
+        return base_prompt.replace(marker, addon + marker)
+    # 退而求其次：直接拼在尾端
+    return base_prompt + "\n" + addon

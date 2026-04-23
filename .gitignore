@@ -40,10 +40,11 @@ Icon
 .VolumeIcon.icns
 .com.apple.timemachine.donotpresent
 
-# App logs
+# App logs（新路徑：~/.whisper_app/logs/；legacy：app.log / fault.log 仍在專案根）
 app.log
 app.pid
 fault.log
+logs/
 *.log
 
 # Node (不該被版控的依賴)
