@@ -27,6 +27,10 @@ try:
 except ImportError:
     _PYNPUT_AVAILABLE = False
 
+from logger import get_logger, log_action, log_error
+
+log = get_logger("hotkey")
+
 # combo_active=True 持續超過此秒數仍未見 release，視為 pynput 漏收事件。
 # 選 2 秒：足夠涵蓋正常「按住說話」場景，不會誤觸發重置。
 _STALE_COMBO_SEC = 2.0
@@ -249,7 +253,8 @@ class HotkeyManager:
         """
         self.stop()
         self._hotkeys = parse_hotkey(combo)
-        print(f"HOTKEY: Starting listener for {self._hotkeys}")
+        self._combo_str = combo
+        log.info(f"HOTKEY: Starting listener for combo='{combo}' keys={self._hotkeys}")
         self._listener = _kb.Listener(
             on_press=self._on_p,
             on_release=self._on_r,
@@ -272,11 +277,11 @@ class HotkeyManager:
             self._combo_active = False
         # 在鎖外停止，避免 pynput 執行緒中持鎖等待造成死鎖
         if listener_to_stop is not None:
-            print("HOTKEY: Stopping listener...")
+            log.info("HOTKEY: Stopping listener...")
             try:
                 listener_to_stop.stop()
             except Exception:
-                pass
+                log_error("hotkey_stop_failed")
 
     def _normalize(self, key) -> object:
         """正規化左右修飾鍵（委派給模組層函式）。"""
@@ -309,11 +314,12 @@ class HotkeyManager:
                 fire = True
 
         if healed:
-            print(f"HOTKEY: self-heal — stale combo_active cleared")
+            log.warning("HOTKEY: self-heal — stale combo_active cleared")
         if nk in self._hotkeys:
-            print(f"HOTKEY: press   {nk!r:>10}  pressed={sorted(self._pressed, key=str)}")
+            log.debug(f"HOTKEY: press   {nk!r:>10}  pressed={sorted(self._pressed, key=str)}")
         if fire:
-            print("HOTKEY: Triggered!")
+            combo = getattr(self, "_combo_str", "?")
+            log_action("hotkey_pressed", combo=combo)
             self._on_press_cb()   # 在鎖外呼叫，避免 callback 內持鎖死鎖
 
     def _on_r(self, key) -> None:
@@ -331,7 +337,8 @@ class HotkeyManager:
             self._last_event_at = now
 
         if nk in self._hotkeys:
-            print(f"HOTKEY: release {nk!r:>10}  pressed={sorted(self._pressed, key=str)}")
+            log.debug(f"HOTKEY: release {nk!r:>10}  pressed={sorted(self._pressed, key=str)}")
         if fire:
-            print("HOTKEY: Released!")
+            combo = getattr(self, "_combo_str", "?")
+            log_action("hotkey_released", combo=combo)
             self._on_release_cb()   # 在鎖外呼叫

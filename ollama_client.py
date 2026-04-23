@@ -29,6 +29,10 @@ import requests
 
 import prompts
 
+from logger import get_logger, log_error
+
+log = get_logger("ollama")
+
 # ── 常數 ──────────────────────────────────────────────────────────────────────
 
 DEFAULT_BASE_URL = "http://localhost:11434"
@@ -125,8 +129,8 @@ class OllamaClient:
             ok = resp.status_code == 200
         except requests.exceptions.RequestException:
             ok = False
-        except Exception as e:
-            print(f"OLLAMA: health_check unexpected error: {e}")
+        except Exception:
+            log_error("ollama_health_check_unexpected")
             ok = False
         with self._health_lock:
             self._health_ok = ok
@@ -141,8 +145,8 @@ class OllamaClient:
             if on_result is not None:
                 try:
                     on_result(ok)
-                except Exception as e:
-                    print(f"OLLAMA: health_check callback error: {e}")
+                except Exception:
+                    log_error("ollama_health_callback_failed")
         threading.Thread(target=_run, daemon=True).start()
 
     def is_available(self) -> bool:
@@ -160,8 +164,8 @@ class OllamaClient:
             resp.raise_for_status()
             data = resp.json()
             return [m["name"] for m in data.get("models", [])]
-        except Exception as e:
-            print(f"OLLAMA: get_models failed: {e}")
+        except Exception:
+            log_error("ollama_get_models_failed", base_url=self.config.base_url)
             return []
 
     # ── 核心：潤飾 ───────────────────────────────────────────────────────────
@@ -202,8 +206,8 @@ class OllamaClient:
             prompt_template = prompts.format_polish_prompt(
                 prompt_template, dictionary_terms,
             )
-        except Exception as e:
-            print(f"OLLAMA: format_polish_prompt failed (falling back): {e}")
+        except Exception:
+            log_error("format_polish_prompt_failed")
 
         prompt = prompt_template.format(text=text)
         payload = {
@@ -269,7 +273,7 @@ class OllamaClient:
             self._log_polish(text, "", elapsed, preset_name, error=resp.error)
             return resp
         except Exception as e:
-            print(f"OLLAMA: process error: {e}")
+            log_error("ollama_process_failed", model=self.config.model)
             elapsed = time.perf_counter() - t0
             resp = OllamaResponse(
                 text=text, model=self.config.model, done=True,
@@ -327,8 +331,8 @@ class OllamaClient:
             }
             with _POLISH_LOG_PATH.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        except Exception as e:
-            print(f"OLLAMA: polish_log write failed: {e}")
+        except Exception:
+            log_error("polish_log_write_failed", path=str(_POLISH_LOG_PATH))
 
 
 # ── 工具 ──────────────────────────────────────────────────────────────────────

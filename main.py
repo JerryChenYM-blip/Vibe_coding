@@ -3,7 +3,7 @@ Whisper Pro 應用程式進入點。
 
 啟動順序：
   1. 開啟 fault.log 捕捉 C-level 崩潰（SIGSEGV / SIGABRT / SIGBUS）
-  2. 重導 stdout / stderr 到帶時間戳的 Logger（同時寫入 terminal 與 app.log）
+  2. 匯入 logger（自動 setup_logging：~/.whisper_app/logs/whisper_app.log）
   3. 檢查 Python 套件依賴，缺少則提示安裝指令並退出
   4. 讀取 ~/.whisper_app/config.json 使用者設定
   5. 建立 tkinter 根視窗並啟動 AppWindow
@@ -13,74 +13,42 @@ Whisper Pro 應用程式進入點。
 
 from __future__ import annotations
 
-import sys
-import threading
-import os
 import datetime
 import faulthandler
+import os
+import sys
+import threading
 import traceback
 
 # ── C-level 崩潰記錄器 ───────────────────────────────────────────────────────
 # 捕捉 SIGSEGV / SIGABRT / SIGBUS 等 C 層面崩潰（例如 MLX/Metal mutex 失敗）。
 # 這類崩潰 Python 例外機制抓不到，faulthandler 會在 kill 前把 traceback 寫入
-# fault.log，方便事後分析。用獨立檔案（而非 app.log）避免時間戳被 Logger 切碎。
+# fault.log，方便事後分析。用獨立檔案（而非 whisper_app.log）避免被 rotation
+# 截斷。路徑仍固定在專案根目錄，方便 debug 時立即可見。
 _fault_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fault.log")
 _fault_log_fh = open(_fault_log_path, "a", encoding="utf-8")
 faulthandler.enable(file=_fault_log_fh, all_threads=True)  # 所有執行緒的 traceback 都記下來
 
 
-# ── 帶時間戳的 stdout/stderr 替代器 ─────────────────────────────────────────
+# ── 匯入統一日誌系統 ─────────────────────────────────────────────────────────
+# import logger 時會自動 setup_logging()，log 會寫到
+# ~/.whisper_app/logs/whisper_app.log 並同時輸出到終端。
+from logger import get_logger, log_error
 
-class Logger:
-    """同時寫入 terminal 與 app.log 的 stdout/stderr 替代器。
+log = get_logger("main")
 
-    每一行訊息加上時間戳前綴；純換行符號不加時間戳，避免 log 裡
-    產生大量空行。啟動後取代 sys.stdout / sys.stderr，讓所有
-    print() 與 traceback 輸出都落地。
-    """
-
-    def __init__(self, filename: str = "app.log") -> None:
-        """開啟 log 檔（追加模式）並保留對原始 terminal 的參照。"""
-        self.terminal = sys.stdout                             # 保留原始 terminal 輸出
-        self.log = open(filename, "a", encoding="utf-8")      # 追加模式，不覆蓋舊 log
-
-    def write(self, message: str) -> None:
-        """寫入一段訊息；非空行加上 [YYYY-MM-DD HH:MM:SS] 前綴。"""
-        if message.strip():
-            # 有實際內容才加時間戳，避免換行符號也被標記
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            formatted_message = f"[{timestamp}] {message}"
-            self.terminal.write(formatted_message)
-            self.log.write(formatted_message)
-        else:
-            # 純換行或空白：直接寫入，不加時間戳
-            self.terminal.write(message)
-            self.log.write(message)
-        self.log.flush()   # 立即刷新，確保崩潰前已落地
-
-    def flush(self) -> None:
-        """確保 terminal 與 log 檔的緩衝區都被清空。"""
-        self.terminal.flush()
-        self.log.flush()
-
-
-# 啟動 log 重導；之後所有 print() 都會經過 Logger
-sys.stdout = Logger("app.log")
-sys.stderr = sys.stdout   # stderr 也導到同一個 Logger，統一格式
-
-# 每次啟動印一條分隔線，方便在 app.log 裡辨識 session 邊界
-print("\n" + "=" * 60)
-print(f"NEW SESSION: Whisper Pro started at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-print("=" * 60)
+# 每次啟動印一條分隔線，方便在 log 裡辨識 session 邊界
+log.info("=" * 60)
+log.info(f"NEW SESSION: Whisper Pro started at {datetime.datetime.now():%Y-%m-%d %H:%M:%S}")
+log.info("=" * 60)
 
 import customtkinter as ctk
 import gui
-import os
 
 # 診斷資訊：確認執行環境是否符合預期
-print(f"DIAG: Current Working Directory: {os.getcwd()}")
-print(f"DIAG: gui.py location: {gui.__file__}")
-print(f"DIAG: Python executable: {sys.executable}")
+log.debug(f"DIAG: Current Working Directory: {os.getcwd()}")
+log.debug(f"DIAG: gui.py location: {gui.__file__}")
+log.debug(f"DIAG: Python executable: {sys.executable}")
 
 from config import Config
 from gui import WIN_W, WIN_H, AppWindow, AccessibilityDialog
@@ -105,12 +73,16 @@ def main() -> None:
     missing = check_dependencies()
     if missing:
         # 缺套件就提示並退出，不進入 GUI 以免出現難以理解的 ImportError
-        print("❌ 缺少以下套件，請先執行安裝：")
-        print("   pip install " + " ".join(missing))
+        log.error("MISSING_DEPENDENCIES: " + " ".join(missing))
+        log.error("Install via: pip install " + " ".join(missing))
         sys.exit(1)
 
     # ── 2. 載入使用者設定 ─────────────────────────────────────────────────────
     cfg = Config.load()
+    log.info(
+        f"CONFIG: loaded model={cfg.model} language={cfg.language} "
+        f"hotkey={cfg.hotkey} auto_paste={cfg.auto_paste} auto_copy={cfg.auto_copy}"
+    )
 
     # ── 3. 建立 tkinter 根視窗 ────────────────────────────────────────────────
     root = ctk.CTk()
@@ -123,31 +95,45 @@ def main() -> None:
     try:
         root.tk.call("wm", "iconphoto", root._w)
     except Exception:
-        pass   # 非致命，靜默忽略
+        log_error("set_dock_icon_failed")   # 非致命，只記不拋
 
     # ── 4. 建立主應用程式視窗 ─────────────────────────────────────────────────
     app = AppWindow(root, cfg)
+    log.info("GUI: AppWindow initialized")
 
     # ── 5. 輔助使用權限確認（非阻塞）────────────────────────────────────────
     def _check_access():
         """背景執行緒：檢查 pynput 是否有輔助使用權限，沒有就彈引導對話框。"""
         if is_pynput_available() and not check_accessibility():
+            log.warning("ACCESSIBILITY: permission NOT granted — global hotkey disabled")
             if root.winfo_exists():
                 # 延遲 0.8s 讓主視窗先渲染完，再彈對話框
                 root.after(800, lambda: AccessibilityDialog(root) if root.winfo_exists() else None)
+        else:
+            log.info("ACCESSIBILITY: permission granted or pynput unavailable")
 
     threading.Thread(target=_check_access, daemon=True).start()
 
     # ── 6. 視窗關閉處理 ──────────────────────────────────────────────────────
     def _on_close():
         """使用者按視窗關閉按鈕時：先通知 AppWindow 清理資源，再銷毀 tkinter。"""
-        app.on_close()
+        log.info("SESSION: user requested close")
+        try:
+            app.on_close()
+        except Exception:
+            log_error("app_on_close_failed")
         root.destroy()
+        log.info("SESSION: ended")
 
     root.protocol("WM_DELETE_WINDOW", _on_close)
 
     # ── 7. 進入主迴圈 ─────────────────────────────────────────────────────────
-    root.mainloop()
+    log.info("GUI: entering mainloop")
+    try:
+        root.mainloop()
+    except Exception:
+        log_error("mainloop_crashed")
+        raise
 
 
 if __name__ == "__main__":
@@ -156,7 +142,7 @@ if __name__ == "__main__":
     except SystemExit:
         raise   # 讓 sys.exit() 正常傳遞，不被下面的 except 攔截
     except BaseException:
-        # 任何未捕獲的 Python 例外都落地到 app.log，方便下次 debug
-        print("FATAL: Uncaught exception in main()")
+        # 任何未捕獲的 Python 例外都落地到 log，方便下次 debug
+        log.critical("FATAL: Uncaught exception in main()")
         traceback.print_exc()
         raise

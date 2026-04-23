@@ -24,6 +24,10 @@ from typing import Optional
 
 import prompts
 
+from logger import get_logger, log_error
+
+log = get_logger("transcriber")
+
 
 # ── 後端偵測 ──────────────────────────────────────────────────────────────────
 
@@ -46,9 +50,12 @@ def _detect_backend() -> str:
 BACKEND = _detect_backend()
 
 # faster-whisper 模型名稱 → mlx-community HuggingFace 倉庫 ID 的映射
+# 注意：tiny/base 的 `mlx-community/whisper-tiny`、`whisper-base` repo 已於
+# 2026 年改名/下架，會回 401。全部統一使用 `-mlx-4bit` 量化版本；若 MLX 載入
+# 失敗，transcribe() 會自動 fallback 到 CTranslate2 CPU。
 _MLX_MODEL_MAP: dict[str, str] = {
-    "tiny":           "mlx-community/whisper-tiny",
-    "base":           "mlx-community/whisper-base",
+    "tiny":           "mlx-community/whisper-tiny-mlx-4bit",
+    "base":           "mlx-community/whisper-base-mlx-4bit",
     "small":          "mlx-community/whisper-small-mlx-4bit",
     "medium":         "mlx-community/whisper-medium-mlx-4bit",
     "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
@@ -85,12 +92,36 @@ def _is_silence(audio) -> bool:
 
 
 def _is_hallucination(text: str) -> bool:
-    """判斷文字是否包含已知 Whisper 幻覺片段。"""
+    """判斷文字是否包含已知 Whisper 幻覺片段。
+
+    寬容策略：只對「短句（< 20 字）」才用子字串檢查。長句子即使包含
+    「訂閱」「感謝」等常見幻覺關鍵字，也視為正當句子保留 — 避免誤殺。
+    """
     if not text:
         return True   # 空字串也算幻覺
     # 去除空白與換行後進行子字串比對
     lower = text.lower().replace(" ", "").replace("\n", "")
+    # 長句（≥ 20 字）免檢查 — 幾乎不會有 20 字以上的純幻覺
+    if len(lower) >= 20:
+        return False
     return any(h.lower().replace(" ", "") in lower for h in _HALLUCINATIONS)
+
+
+def _normalize_volume(audio, target_peak: float = 0.9, min_peak: float = 0.5):
+    """若音訊峰值過小（<min_peak）則線性放大到 target_peak。
+
+    避免：使用者小聲說話時峰值過低 → VAD 誤判為靜音 → 整段被丟。
+    防爆：放大倍率上限 12x，避免把底噪放大到爆音。
+    """
+    import numpy as np
+    if audio.size == 0:
+        return audio
+    peak = float(np.abs(audio).max())
+    # 峰值太小（純噪音）或已足夠大（正常音量）就不動
+    if peak <= 0.005 or peak >= min_peak:
+        return audio
+    scale = min(target_peak / peak, 12.0)
+    return (audio * scale).astype(audio.dtype)
 
 
 # ── 資料類別 ──────────────────────────────────────────────────────────────────
@@ -140,8 +171,8 @@ class Transcriber:
         """
         try:
             return prompts.format_whisper_prompt(self._dictionary_terms)
-        except Exception as e:
-            print(f"WHISPER: format_whisper_prompt failed (fallback): {e}")
+        except Exception:
+            log_error("format_whisper_prompt_failed")
             return prompts.WHISPER_INITIAL_PROMPT   # 降級回基礎 prompt
 
     # ── 公開介面 ──────────────────────────────────────────────────────────────
@@ -166,7 +197,7 @@ class Transcriber:
 
         # 空音訊：立即回傳錯誤訊息，不進行推論
         if audio is None or len(audio) == 0:
-            print("WHISPER: ERROR - Empty audio buffer received.")
+            log.error("WHISPER: Empty audio buffer received.")
             return TranscriptionResult(
                 text="（沒有偵測到音訊，請確認麥克風是否正常運作）",
                 language="", duration_seconds=0.0, elapsed_seconds=0.0,
@@ -177,13 +208,25 @@ class Transcriber:
         if audio.max() > 1.0:
             audio = audio / 32768.0   # int16 最大值，還原到 [-1, 1]
 
+        # 音量自動正規化：小聲說話時避免 VAD 把整段判為靜音
+        pre_peak = float(np.abs(audio).max()) if audio.size else 0.0
+        audio = _normalize_volume(audio)
+        post_peak = float(np.abs(audio).max()) if audio.size else 0.0
+        if post_peak > pre_peak * 1.5:
+            log.info(
+                f"WHISPER: Volume normalized (peak {pre_peak:.3f} → {post_peak:.3f})"
+            )
+
         duration = len(audio) / 16_000
         t0 = time.perf_counter()
-        print(f"WHISPER: Starting transcription. Backend={BACKEND}, Model={model_size}, Lang={language}, AudioDuration={duration:.2f}s")
+        log.info(
+            f"WHISPER: Starting transcription. Backend={BACKEND}, Model={model_size}, "
+            f"Lang={language}, AudioDuration={duration:.2f}s"
+        )
 
         # 靜音防護：能量太低就直接跳過，避免觸發幻覺
         if _is_silence(audio):
-            print("WHISPER: Guard - Audio level below threshold, skipping inference.")
+            log.info("WHISPER: Guard - Audio level below threshold, skipping inference.")
             return TranscriptionResult(
                 text="（未偵測到語音內容）",
                 language="", duration_seconds=duration,
@@ -194,9 +237,10 @@ class Transcriber:
         if BACKEND == "mlx":
             try:
                 result = self._transcribe_mlx(audio, model_size, language)
-            except Exception as e:
+            except Exception:
                 # MLX 失敗時降級到 CPU，確保功能不中斷
-                print(f"WHISPER ERROR: MLX Backend failed: {e}. Falling back to CPU.")
+                log_error("mlx_backend_failed", model=model_size)
+                log.warning("WHISPER: Falling back to CPU CTranslate2 backend.")
                 result = self._transcribe_ctranslate(audio, model_size, language)
         else:
             result = self._transcribe_ctranslate(audio, model_size, language)
@@ -204,12 +248,33 @@ class Transcriber:
         # 填入實際的音訊長度與推論耗時（兩個後端的 _transcribe_* 不填這兩欄）
         result.duration_seconds = duration
         result.elapsed_seconds  = time.perf_counter() - t0
-        print(f"WHISPER: Inference finished in {result.elapsed_seconds:.2f}s. RTF={(result.elapsed_seconds/duration) if duration>0 else 0:.3f}")
+        rtf = (result.elapsed_seconds / duration) if duration > 0 else 0
+        log.info(f"WHISPER: Inference finished in {result.elapsed_seconds:.2f}s. RTF={rtf:.3f}")
 
-        # 幻覺防護：替換已知幻覺輸出
-        if _is_hallucination(result.text):
-            print(f"WHISPER: Guard - Detected hallucination in result: '{result.text[:50]}...'")
+        # 幻覺過濾：優先逐段過濾（保留合法段），沒 segments 資訊才退回整段檢查
+        if result.segments:
+            kept = [
+                s for s in result.segments
+                if not _is_hallucination(s.get("text", "").strip())
+            ]
+            removed = len(result.segments) - len(kept)
+            if removed > 0:
+                log.warning(
+                    f"WHISPER: Guard - Removed {removed}/{len(result.segments)} "
+                    f"hallucination segment(s), kept {len(kept)}."
+                )
+                result.segments = kept
+                if kept:
+                    result.text = "".join(s["text"].strip() for s in kept).strip()
+                else:
+                    result.text = "（未偵測到語音內容）"
+        elif _is_hallucination(result.text):
+            log.warning(f"WHISPER: Guard - Detected hallucination: '{result.text[:50]}...'")
             result.text = "（未偵測到語音內容）"
+
+        # 記錄轉錄結果（前 100 字，方便未來 debug hallucination / 準確度）
+        preview = result.text[:100].replace("\n", " ")
+        log.info(f"WHISPER: Result (lang={result.language}) text='{preview}'")
 
         return result
 
@@ -239,6 +304,9 @@ class Transcriber:
         if audio.max() > 1.0:
             audio = audio / 32768.0
 
+        # 音量正規化 — 和 transcribe() 同策略
+        audio = _normalize_volume(audio)
+
         duration = len(audio) / 16_000
         t0 = time.perf_counter()
 
@@ -260,10 +328,12 @@ class Transcriber:
                 initial_prompt=self._build_initial_prompt(),
                 condition_on_previous_text=False,         # 不依賴前文，避免幻覺傳播
                 vad_filter=True,                          # 內建 VAD 過濾靜音
+                # 寬鬆 VAD：threshold 降低讓小聲也偵測到；silence 拉長避免句中停頓
+                # 被切段；min_speech 降到 50ms 保留短詞。
                 vad_parameters={
-                    "threshold": 0.6,                     # 比主轉錄更嚴格（減少誤判）
-                    "min_silence_duration_ms": 200,
-                    "min_speech_duration_ms": 100,
+                    "threshold":              0.3,
+                    "min_silence_duration_ms": 800,
+                    "min_speech_duration_ms":  50,
                 },
                 word_timestamps=False,   # 不需要詞級時間戳，省時間
                 temperature=0,           # temperature=0 = 確定性輸出
@@ -336,8 +406,9 @@ class Transcriber:
                     language="zh",    # 指定語言可加速暖機
                     verbose=False,
                 )
-            except Exception as e:
-                print(f"Warmup MLX failed: {e}")
+                log.info(f"WHISPER: Warmup MLX complete (repo={hf_repo})")
+            except Exception:
+                log_error("warmup_mlx_failed", model=model_size, repo=hf_repo)
 
     def _transcribe_mlx(
         self,
@@ -391,8 +462,9 @@ class Transcriber:
             with self._transcription_lock:
                 segs, _ = model.transcribe(silence, beam_size=1, temperature=0)
                 list(segs)   # 必須迭代才會真正執行推論
-        except Exception as e:
-            print(f"Warmup CTranslate failed: {e}")
+            log.info(f"WHISPER: Warmup CTranslate complete (model={model_size})")
+        except Exception:
+            log_error("warmup_ctranslate_failed", model=model_size)
 
     def _transcribe_ctranslate(
         self,
@@ -403,6 +475,11 @@ class Transcriber:
         """使用 faster-whisper（CTranslate2）進行 CPU int8 推論。"""
         model = self._ensure_model(model_size)
 
+        # 長音訊（≥ 30s）開啟 condition_on_previous_text，讓模型利用前文
+        # 上下文，減少長錄音的斷裂與不一致。短音訊維持關閉，避免 bad
+        # start 造成 cascading error。
+        long_audio = len(audio) >= 30 * 16_000
+
         with self._transcription_lock:
             segments_iter, info = model.transcribe(
                 audio,
@@ -410,12 +487,16 @@ class Transcriber:
                 beam_size=5,               # beam 越大越準，但越慢
                 repetition_penalty=1.1,    # 輕微懲罰重複，抑制幻覺循環
                 initial_prompt=self._build_initial_prompt(),
-                condition_on_previous_text=False,   # 不依賴前文（單次錄音場景）
+                condition_on_previous_text=long_audio,   # 長音訊才依賴前文
                 vad_filter=True,           # 內建 VAD，過濾靜音段落
+                # 寬鬆 VAD — 避免漏字/漏段：
+                #   threshold 0.5→0.3：更包容弱訊號
+                #   silence 300→800ms：句中小停頓不切段
+                #   speech 150→50ms：短詞（如「是」「對」）也保留
                 vad_parameters={
-                    "threshold": 0.5,
-                    "min_silence_duration_ms": 300,
-                    "min_speech_duration_ms": 150,
+                    "threshold":              0.3,
+                    "min_silence_duration_ms": 800,
+                    "min_speech_duration_ms":  50,
                 },
                 word_timestamps=False,
                 temperature=0,
@@ -460,17 +541,17 @@ class Transcriber:
 
                 # 釋放舊模型記憶體
                 if self._model is not None:
-                    print(f"WHISPER: Unloading old model '{self._loaded_model_size}'...")
+                    log.info(f"WHISPER: Unloading old model '{self._loaded_model_size}'...")
                     try:
                         del self._model
                     except Exception:
-                        pass
+                        log_error("whisper_model_del_failed")
                     gc.collect()
 
                 from faster_whisper import WhisperModel
                 # CPU 執行緒數：不超過 4，避免與 UI / pynput 執行緒競爭
                 cpu_threads = min(4, os.cpu_count() or 4)
-                print(f"WHISPER: Loading CPU model '{model_size}' with {cpu_threads} threads...")
+                log.info(f"WHISPER: Loading CPU model '{model_size}' with {cpu_threads} threads...")
 
                 try:
                     self._model = WhisperModel(
@@ -482,9 +563,9 @@ class Transcriber:
                     )
                     self._loaded_model_size = model_size
                     elapsed = time.perf_counter() - t_start
-                    print(f"WHISPER: Model '{model_size}' loaded successfully in {elapsed:.2f}s.")
+                    log.info(f"WHISPER: Model '{model_size}' loaded successfully in {elapsed:.2f}s.")
                 except Exception as e:
-                    print(f"WHISPER ERROR: Failed to load model '{model_size}'. Detail: {e}")
+                    log_error("whisper_model_load_failed", model=model_size)
                     raise RuntimeError(f"無法載入 Whisper 模型 {model_size}: {e}")
 
             return self._model

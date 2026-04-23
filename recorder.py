@@ -62,6 +62,10 @@ try:
 except ImportError:
     sd = None   # 沒有 sounddevice 時，所有錄音操作都回傳失敗/空陣列
 
+from logger import get_logger, log_error
+
+log = get_logger("recorder")
+
 
 # ── 錄音參數常數 ──────────────────────────────────────────────────────────────
 
@@ -115,13 +119,13 @@ class AudioRecorder:
             True 代表串流成功開啟，False 代表失敗（sounddevice 不可用或裝置錯誤）。
         """
         if sd is None:
-            print("RECORD: ERROR - sounddevice is not available.")
+            log.error("RECORD: sounddevice is not available.")
             return False
 
         with self._lock:
             if self._is_recording:
                 # 避免重複呼叫 start()（例如快捷鍵連按）
-                print("RECORD: Already recording, ignoring start request.")
+                log.warning("RECORD: Already recording, ignoring start request.")
                 return True
 
             # 重置所有狀態，確保每次錄音都是乾淨開始
@@ -131,7 +135,10 @@ class AudioRecorder:
             blocksize = int(BLOCK_MS / 1000 * SAMPLE_RATE)
 
             try:
-                print(f"RECORD: Attempting to start microphone. Device={self._device_index}, Samplerate={SAMPLE_RATE}, Blocksize={blocksize}")
+                log.info(
+                    f"RECORD: Attempting to start microphone. "
+                    f"Device={self._device_index}, Samplerate={SAMPLE_RATE}, Blocksize={blocksize}"
+                )
                 self._stream = sd.InputStream(
                     samplerate=SAMPLE_RATE,
                     channels=CHANNELS,
@@ -142,12 +149,13 @@ class AudioRecorder:
                 )
                 self._stream.start()
                 self._is_recording = True
-                print(f"RECORD: Stream active. Latency={self._stream.latency:.4f}s, CPU Load={self._stream.cpu_load:.2%}")
+                log.info(
+                    f"RECORD: Stream active. Latency={self._stream.latency:.4f}s, "
+                    f"CPU Load={self._stream.cpu_load:.2%}"
+                )
                 return True
-            except Exception as e:
-                print(f"RECORD ERROR: Initialization failed. Exception: {str(e)}")
-                import traceback
-                traceback.print_exc()
+            except Exception:
+                log_error("recorder_init_failed", device=self._device_index)
                 # 確保狀態乾淨，不讓下次 start() 誤判
                 self._stream = None
                 self._is_recording = False
@@ -162,10 +170,10 @@ class AudioRecorder:
         """
         with self._lock:
             if not self._is_recording:
-                print("RECORD: stop() called while already idle.")
+                log.debug("RECORD: stop() called while already idle.")
                 return np.zeros(0, dtype=np.float32)
 
-            print("RECORD: Stopping audio stream...")
+            log.info("RECORD: Stopping audio stream...")
             self._is_recording = False
 
             # 關閉 PortAudio 串流，釋放硬體資源
@@ -173,9 +181,9 @@ class AudioRecorder:
                 try:
                     self._stream.stop()
                     self._stream.close()
-                    print("RECORD: PortAudio stream closed cleanly.")
-                except Exception as e:
-                    print(f"RECORD ERROR: Error while closing stream: {e}")
+                    log.info("RECORD: PortAudio stream closed cleanly.")
+                except Exception:
+                    log_error("recorder_close_failed")
                 self._stream = None
 
             # 複製 frames list 後立即清空，釋放記憶體
@@ -183,12 +191,15 @@ class AudioRecorder:
             self._frames = []
 
         if not frames:
-            print("RECORD: Warning - No audio data captured.")
+            log.warning("RECORD: No audio data captured.")
             return np.zeros(0, dtype=np.float32)
 
         # 將所有音訊塊串接成單一一維陣列
         full_audio = np.concatenate(frames, axis=0).flatten()
-        print(f"RECORD: Session complete. Total samples={len(full_audio)}, Duration={len(full_audio)/SAMPLE_RATE:.2f}s")
+        log.info(
+            f"RECORD: Session complete. Total samples={len(full_audio)}, "
+            f"Duration={len(full_audio)/SAMPLE_RATE:.2f}s"
+        )
         return full_audio
 
     def get_rms_level(self) -> float:
@@ -244,8 +255,8 @@ class AudioRecorder:
                 if d.get("max_input_channels", 0) > 0:
                     devices.append({"id": i, "name": d["name"]})
             return devices
-        except Exception as e:
-            print(f"WARNING: Cannot query audio devices: {e}")
+        except Exception:
+            log_error("query_audio_devices_failed")
             return []
 
     # ── 私有方法 ──────────────────────────────────────────────────────────────
@@ -264,7 +275,7 @@ class AudioRecorder:
         """
         if status:
             # PortAudio 回報的狀態警告（如 input overflow），記錄但不中止
-            print(f"SD STATUS: {status}")
+            log.warning(f"SD STATUS: {status}")
 
         try:
             chunk = indata.copy()   # 複製一份，避免 PortAudio 回收緩衝區後資料消失
@@ -273,7 +284,7 @@ class AudioRecorder:
                     self._frames.append(chunk)   # 加入幀列表
             # 計算 RMS 振幅（不在鎖內，因為 float 賦值是原子操作）
             self._rms_level = float(np.sqrt(np.mean(chunk ** 2)))
-        except Exception as e:
+        except Exception:
             # callback 中任何例外都不能往上拋（會讓 PortAudio 崩潰），只能記錄
-            print(f"CALLBACK ERROR: {e}")
+            log_error("audio_callback_failed")
             self._is_recording = False

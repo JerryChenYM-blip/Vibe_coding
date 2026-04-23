@@ -19,6 +19,10 @@ import subprocess
 import time
 from typing import Optional
 
+from logger import get_logger, log_error
+
+log = get_logger("auto_paste")
+
 
 def get_frontmost_app() -> Optional[str]:
     """取得目前最前景的 macOS 應用程式名稱。
@@ -43,9 +47,10 @@ def get_frontmost_app() -> Optional[str]:
             timeout=2,   # 防止 osascript 卡住阻塞 UI 執行緒
         )
         name = result.stdout.strip()
+        log.debug(f"AUTO-PASTE: frontmost app = '{name}'")
         return name or None   # 空字串轉 None，讓呼叫端統一判斷
-    except Exception as e:
-        print(f"AUTO-PASTE: get_frontmost_app failed: {e}")
+    except Exception:
+        log_error("get_frontmost_app_failed")
         return None
 
 
@@ -74,8 +79,8 @@ def paste_to_app(
     try:
         import pyperclip
         pyperclip.copy(text)
-    except Exception as e:
-        print(f"AUTO-PASTE: clipboard write failed: {e}")
+    except Exception:
+        log_error("auto_paste_clipboard_failed", text_len=len(text))
         return False
 
     # ── 步驟 2：把目標 App 拉到前景 ─────────────────────────────────────────
@@ -86,8 +91,8 @@ def paste_to_app(
                 timeout=3,   # 若 App 無回應，最多等 3 秒
             )
             time.sleep(activate_delay)   # 給 App 時間完成視窗切換，再送 ⌘V
-        except Exception as e:
-            print(f"AUTO-PASTE: activate '{app_name}' failed: {e}")
+        except Exception:
+            log_error("auto_paste_activate_failed", app=app_name)
             # 繼續往下執行——貼到目前焦點視窗，雖不完美但比什麼都不做好
 
     # ── 步驟 3：模擬 ⌘V ─────────────────────────────────────────────────────
@@ -96,8 +101,8 @@ def paste_to_app(
         kb = Controller()
         with kb.pressed(Key.cmd):   # 按住 Command 鍵
             kb.tap("v")             # 按 V，等同 ⌘V
-        print(f"AUTO-PASTE: ⌘V sent → '{app_name}'")
+        log.info(f"AUTO-PASTE: ⌘V sent → '{app_name}' (text_len={len(text)})")
         return True
-    except Exception as e:
-        print(f"AUTO-PASTE: keyboard simulation failed: {e}")
+    except Exception:
+        log_error("auto_paste_keyboard_failed", app=app_name)
         return False

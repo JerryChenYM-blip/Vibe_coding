@@ -35,6 +35,7 @@ from typing import Optional
 import customtkinter as ctk
 
 from config import MODEL_INFO, LANGUAGE_OPTIONS, Config
+from logger import get_logger, log_action, log_error, log_settings, log_state
 from hotkey_manager import (
     HotkeyManager, capture_hotkey, format_hotkey,
     is_pynput_available, check_accessibility,
@@ -48,6 +49,8 @@ from transcriber import Transcriber, TranscriptionResult
 from icons import get_icon, get_canvas_icon
 from animation import blend, breathe, ease_in_out_cubic, Ripple
 import auto_paste as _ap
+
+log = get_logger("gui")
 
 # ── 強制套用 Apple 深色美學 ───────────────────────────────────────────────────
 ctk.set_appearance_mode("Dark")
@@ -583,7 +586,14 @@ class AppWindow(ctk.CTkFrame):
     def _transition_to_recording(self) -> None:
         """狀態機：idle → recording。啟動麥克風錄音並更新全部 UI。"""
         if self._state != "idle":
+            log.debug(f"_transition_to_recording ignored (state={self._state})")
             return
+        log_state(
+            "idle->recording",
+            model=self._model_var.get(),
+            language=self._lang_var.get(),
+            auto_paste=self.cfg.auto_paste,
+        )
         self._state            = "recording"
         self._state_start_time = time.perf_counter()
         self._rec_start        = self._state_start_time
@@ -636,7 +646,10 @@ class AppWindow(ctk.CTkFrame):
     def _transition_to_processing(self) -> None:
         """狀態機：recording → processing。停止麥克風並在背景執行緒跑 Whisper。"""
         if self._state != "recording":
+            log.debug(f"_transition_to_processing ignored (state={self._state})")
             return
+        duration = time.perf_counter() - self._rec_start
+        log_state("recording->processing", duration_s=f"{duration:.2f}")
         self._state            = "processing"
         self._state_start_time = time.perf_counter()
         self._hotkey_held      = False
@@ -667,6 +680,16 @@ class AppWindow(ctk.CTkFrame):
 
     def _transition_to_idle(self, result: Optional[TranscriptionResult] = None) -> None:
         """狀態機：任何狀態 → idle。恢復 UI 操作性；若 result 非 None 則顯示結果。"""
+        if result is not None:
+            log_state(
+                "processing->idle",
+                text_len=len(result.text),
+                language=result.language,
+                elapsed_s=f"{result.elapsed_seconds:.2f}",
+                audio_s=f"{result.duration_seconds:.2f}",
+            )
+        else:
+            log_state("->idle")
         self._state            = "idle"
         self._state_start_time = time.perf_counter()
         self._ripples.clear()
@@ -1257,10 +1280,18 @@ class AppWindow(ctk.CTkFrame):
     #  EVENT HANDLERS
     # ═══════════════════════════════════════════════════════════════════════
 
+    # Tail padding：停錄音前多等 N 毫秒，抓住使用者說完尾字前放開熱鍵/點按鈕
+    # 的短暫餘音，避免最後一兩個字被切掉。
+    TAIL_PADDING_MS = 300
+
     def _on_record_btn(self) -> None:
         """Chamber 點擊 → 依目前狀態切換錄音（idle↔recording）。"""
-        if   self._state == "idle":      self._transition_to_recording()
-        elif self._state == "recording": self._transition_to_processing()
+        log_action("record_button_clicked", state=self._state)
+        if   self._state == "idle":
+            self._transition_to_recording()
+        elif self._state == "recording":
+            # Tail padding — 多錄 300ms 再停，抓尾音避免漏字
+            self.after(self.TAIL_PADDING_MS, self._try_stop)
 
     def _hotkey_press(self) -> None:
         """pynput 執行緒 → 安全 marshal 到主執行緒。"""
@@ -1273,10 +1304,18 @@ class AppWindow(ctk.CTkFrame):
     def _on_hotkey_press(self) -> None:
         """主執行緒：快捷鍵按下時若為 idle 則開始錄音。"""
         if self._state == "idle" and not self._hotkey_held:
+            log_action("hotkey_triggered_recording", combo=self.cfg.hotkey)
             self._transition_to_recording()
 
     def _on_hotkey_release(self) -> None:
-        """主執行緒：快捷鍵放開時若為 recording 則停止轉錄。"""
+        """主執行緒：快捷鍵放開時若為 recording 則延遲停止（抓尾音）。"""
+        if self._state == "recording":
+            log_action("hotkey_triggered_stop", combo=self.cfg.hotkey)
+            # Tail padding — 多錄 300ms 再停，避免漏最後一兩個字
+            self.after(self.TAIL_PADDING_MS, self._try_stop)
+
+    def _try_stop(self) -> None:
+        """延遲後真的停錄音。只在仍為 recording 狀態才執行（防重入）。"""
         if self._state == "recording":
             self._transition_to_processing()
 
@@ -1284,18 +1323,22 @@ class AppWindow(ctk.CTkFrame):
         """複製按鈕：將目前 textbox 內容複製到剪貼簿。"""
         text = self._get_result_text()
         if not text:
+            log_action("copy_clicked_empty")
             return
         try:
             import pyperclip
             pyperclip.copy(text)
+            log_action("copy_succeeded", text_len=len(text))
             self._show_toast("已複製到剪貼簿")
         except Exception as e:
+            log_error("copy_failed", text_len=len(text))
             self._show_toast(f"複製失敗: {e}")
 
     def _on_save(self) -> None:
         """存檔按鈕：開啟 Save As 對話框，將結果寫成 .txt 檔。"""
         text = self._get_result_text()
         if not text:
+            log_action("save_clicked_empty")
             return
         path = fd.asksaveasfilename(
             defaultextension=".txt",
@@ -1306,12 +1349,17 @@ class AppWindow(ctk.CTkFrame):
             try:
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(text)
+                log_action("save_succeeded", path=path, text_len=len(text))
                 self._show_toast("已儲存")
             except Exception as e:
+                log_error("save_file_failed", path=path)
                 self._show_toast(f"儲存失敗: {e}")
+        else:
+            log_action("save_cancelled")
 
     def _on_clear(self) -> None:
         """清除按鈕：清空 textbox，重置三段式標題與 toggle 狀態，顯示佔位符。"""
+        log_action("clear_clicked")
         self._textbox.configure(state="normal")
         self._textbox.delete("1.0", "end")
         self._textbox.configure(state="disabled")
@@ -1330,8 +1378,10 @@ class AppWindow(ctk.CTkFrame):
 
     def _toggle_auto_paste(self) -> None:
         """自動貼上按鈕：切換 auto_paste 開關並即時更新按鈕樣式。"""
+        old = self.cfg.auto_paste
         self.cfg.auto_paste = not self.cfg.auto_paste
         self.cfg.save()
+        log_settings("changed", field="auto_paste", old=old, new=self.cfg.auto_paste)
         on = self.cfg.auto_paste
         self._ap_btn.configure(
             fg_color=INDIGO if on else SURF_1,
@@ -1345,20 +1395,25 @@ class AppWindow(ctk.CTkFrame):
     def _on_ollama(self) -> None:
         """手動按「潤飾」鈕：對目前 textbox 內容執行一次潤飾。"""
         if not self.cfg.ollama_enabled:
+            log_action("ollama_clicked_disabled")
             self._show_toast("AI 潤飾未啟用，請到「設定」開啟")
             return
         if self.ollama.health_ok is False:
+            log_action("ollama_clicked_offline")
             self._show_toast("無法連線 Ollama 服務，請確認 ollama serve 已啟動")
             # 重新探一次，下次點擊就能反映最新狀態
             self._refresh_ollama_health()
             return
         if self._polish_busy:
+            log_action("ollama_clicked_busy")
             self._show_toast("目前已在潤飾中，請稍候…")
             return
 
         text = self._get_result_text()
         if not text:
+            log_action("ollama_clicked_empty")
             return
+        log_action("ollama_clicked", text_len=len(text))
 
         self._ollama_btn.configure(state="disabled", text="處理中…")
         self._polish_busy = True
@@ -1471,14 +1526,18 @@ class AppWindow(ctk.CTkFrame):
 
     def _on_model_change(self, value: str) -> None:
         """頂部模型選單變更時：更新 cfg 並刷新狀態列文字。"""
+        old = self.cfg.model
         self.cfg.model = value
         self.cfg.save()
+        log_settings("changed", field="model", old=old, new=value, source="dropdown")
         self._status_label.configure(text=f"  就緒 ({value})")
 
     def _on_language_change(self, value: str) -> None:
         """頂部語言選單變更時：更新 cfg 儲存（下次錄音生效）。"""
+        old = self.cfg.language
         self.cfg.language = value
         self.cfg.save()
+        log_settings("changed", field="language", old=old, new=value, source="dropdown")
 
     # ═══════════════════════════════════════════════════════════════════════
     #  SETTINGS
@@ -1486,16 +1545,26 @@ class AppWindow(ctk.CTkFrame):
 
     def _open_settings(self) -> None:
         """開啟設定視窗（modal）。"""
+        log_action("settings_opened")
         SettingsWindow(self, self.cfg, self._on_settings_saved)
 
     def _on_settings_saved(self, cfg: Config) -> None:
         """設定視窗儲存後：同步 cfg、重啟 listener（若 hotkey 有變），刷新所有 UI。"""
         old_hotkey = self.cfg.hotkey
+        # 逐欄位紀錄變動
+        for field_name in ("model", "language", "hotkey", "auto_copy",
+                           "auto_paste", "append_results", "ollama_enabled"):
+            ov, nv = getattr(self.cfg, field_name), getattr(cfg, field_name)
+            if ov != nv:
+                log_settings("changed", field=field_name, old=ov, new=nv,
+                             source="settings_window")
         self.cfg = cfg
         # 只有 hotkey 真正變更才重啟 pynput listener——反覆 stop/start 在 macOS
         # 上曾與 MLX/Metal 並存時觸發 native 層不穩定，能避免就避免。
+        # PR #8 修正：延遲 100ms 再重啟，讓 SettingsWindow.destroy() 與舊 Listener
+        # 的 CFRunLoop teardown 完成，避免 macOS Cocoa native race 造成閃退。
         if cfg.hotkey != old_hotkey:
-            self._start_hotkey_listener()
+            self.after(100, self._start_hotkey_listener)
         self._hotkey_hint.configure(text=f"按住 {cfg.format_hotkey_display()} 即時錄音")
         self._hotkey_status.configure(text=cfg.format_hotkey_display())
         self._model_var.set(cfg.model)
@@ -1543,17 +1612,20 @@ class AppWindow(ctk.CTkFrame):
     def _warmup_model(self) -> None:
         """背景預熱 Whisper 模型（延遲 1.5s 後執行，避免阻礙 UI 初始化）。"""
         model = self._model_var.get()
+        log.info(f"WARMUP: starting for model={model}")
 
         def _load():
             try:
                 self.transcriber.warmup(model)
                 backend = self.transcriber.active_backend()
                 label   = "⚡ Metal" if backend == "mlx" else "CPU"
+                log.info(f"WARMUP: complete (model={model} backend={backend})")
                 self.after(0, lambda: self._status_label.configure(
                     text=f"  就緒 ({model} · {label})"
                 ))
                 self.after(0, lambda: self._status_dot.configure(text_color=GREEN))
             except Exception:
+                log_error("warmup_failed", model=model)
                 self.after(0, lambda: self._status_label.configure(text="  模型載入失敗"))
                 self.after(0, lambda: self._status_dot.configure(text_color=RED))
 
@@ -1588,9 +1660,17 @@ class AppWindow(ctk.CTkFrame):
 
     def on_close(self) -> None:
         """視窗關閉時：停止 pynput 監聽器與進行中的錄音，避免資源洩漏。"""
-        self.hotkey_mgr.stop()
+        log.info("GUI: on_close")
+        try:
+            self.hotkey_mgr.stop()
+        except Exception:
+            log_error("hotkey_mgr_stop_on_close_failed")
         if self.recorder.is_recording():
-            self.recorder.stop()
+            log.info("GUI: recorder still active on close — stopping")
+            try:
+                self.recorder.stop()
+            except Exception:
+                log_error("recorder_stop_on_close_failed")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1962,15 +2042,36 @@ class SettingsWindow(ctk.CTkToplevel):
 
     def _rebind_hotkey(self) -> None:
         """開啟 HotkeyBindDialog，讓使用者重新綁定快捷鍵。"""
+        log_action("rebind_hotkey_dialog_opened")
         HotkeyBindDialog(self, self.cfg.hotkey, self._apply_hotkey).focus()
 
     def _apply_hotkey(self, combo: str) -> None:
         """HotkeyBindDialog 完成後回呼：把新組合寫回暫存 cfg 並刷新標籤。"""
+        old = self.cfg.hotkey
         self.cfg.hotkey = combo
         self._hk_label.configure(text=format_hotkey(combo))
+        log_settings("pending", field="hotkey", old=old, new=combo,
+                     note="pending_save_button")
 
     def _save(self) -> None:
-        """收集所有 UI 欄位值，寫入暫存 cfg、呼叫 on_save_cb，然後關閉視窗。"""
+        """收集所有 UI 欄位值，寫入暫存 cfg、呼叫 on_save_cb，然後關閉視窗。
+
+        包 try/except + finally — 避免 Cocoa/MLX 並存時任何例外變成靜默
+        SIGSEGV；同時保證 destroy() 一定被呼叫，不讓使用者被卡在設定視窗。
+        """
+        log_action("settings_save_clicked")
+        try:
+            self._collect_and_save()
+        except Exception:
+            log_error("settings_save_failed")
+        finally:
+            try:
+                self.destroy()
+            except Exception:
+                log_error("settings_window_destroy_failed")
+
+    def _collect_and_save(self) -> None:
+        """從表單欄位蒐集所有值、呼叫 cfg.save() 並通知主視窗。"""
         self.cfg.model          = self._model_var.get()
         self.cfg.language       = self._lang_var.get()
         self.cfg.append_results = self._append_var.get()
@@ -1995,8 +2096,7 @@ class SettingsWindow(ctk.CTkToplevel):
         self.cfg.dictionary_enabled = self._dict_enabled_var.get()
         self.cfg.dictionary_path    = self._dict_path_var.get().strip()
         self.cfg.save()
-        self._on_save_cb(self.cfg)
-        self.destroy()
+        self._on_save_cb(self.cfg)   # 通知主視窗（destroy 由 _save 的 finally 負責）
 
     def _reload_prompts_now(self) -> None:
         """立即觸發 PromptReloader.reload_now()，並以狀態標籤顯示結果。"""
