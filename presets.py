@@ -21,6 +21,10 @@ from typing import Optional
 
 import prompts
 
+from logger import get_logger, log_error
+
+log = get_logger("presets")
+
 
 # ── Preset 契約 ───────────────────────────────────────────────────────────────
 
@@ -74,7 +78,7 @@ PRESETS: dict[str, Preset] = {
             "notion", "obsidian", "bear", "notes", "備忘錄",
             "craft", "logseq", "apple notes",
         },
-        triggers_keyword=["筆記", "meeting notes", "note mode", "條列"],
+        triggers_keyword=["筆記", "note mode"],
         prompt_attr="OLLAMA_NOTE_PROMPT",
     ),
     "code_comment": Preset(
@@ -88,6 +92,39 @@ PRESETS: dict[str, Preset] = {
         },
         triggers_keyword=["// ", "# comment", "code comment"],
         prompt_attr="OLLAMA_CODE_COMMENT_PROMPT",
+    ),
+    # ── Phase 3.1 Voice Shortcuts（action preset）────────────────────────────
+    # 只靠關鍵字觸發（triggers_app 留空），避免「在 Mail 裡說『翻譯英文…』」
+    # 這類句子被 target preset 搶走。
+    "translate_en": Preset(
+        name="translate_en",
+        display_name="翻英文",
+        triggers_app=set(),
+        triggers_keyword=[
+            "翻譯英文", "翻成英文", "翻英文",
+            "translate to english", "translate english", "in english",
+        ],
+        prompt_attr="OLLAMA_TRANSLATE_EN_PROMPT",
+    ),
+    "list": Preset(
+        name="list",
+        display_name="條列",
+        triggers_app=set(),
+        triggers_keyword=[
+            "條列", "列點", "列出",
+            "list mode", "bullet points", "bullet list",
+        ],
+        prompt_attr="OLLAMA_LIST_PROMPT",
+    ),
+    "meeting_notes": Preset(
+        name="meeting_notes",
+        display_name="會議紀錄",
+        triggers_app=set(),
+        triggers_keyword=[
+            "會議紀錄", "會議記錄", "會議摘要",
+            "meeting notes", "meeting minutes",
+        ],
+        prompt_attr="OLLAMA_MEETING_NOTES_PROMPT",
     ),
 }
 
@@ -189,8 +226,8 @@ def select_preset(
             text=text,
             matched_reason="default",
         )
-    except Exception as e:
-        print(f"PRESETS: select_preset exception → default: {e}")
+    except Exception:
+        log_error("select_preset_exception", text_len=len(text), app=app_name)
         return PresetSelection(
             preset=PRESETS["default"],
             text=text,

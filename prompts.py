@@ -103,20 +103,75 @@ OLLAMA_CODE_COMMENT_PROMPT = (
     "原文：\n{text}"
 )
 
+# ── Phase 3.1 Voice Shortcuts（action preset prompts）──────────────────────
+#
+# 這組 prompt 由 presets.py 的 action preset 觸發：使用者說話開頭含對應
+# 關鍵字（「翻譯英文」「條列」「會議紀錄」）時路由至此，關鍵字會被 presets.py
+# 剝除，只把「動作目標文字」傳進 {text}。
+
+OLLAMA_TRANSLATE_EN_PROMPT = (
+    "你是中英翻譯助理。輸入是一段中文轉錄（可能夾雜英文專有名詞），"
+    "目標是輸出一段**自然流暢的英文**。做下列事情：\n"
+    "1. 刪除語氣詞與無意義重複（嗯、啊、那個、um、uh、like）\n"
+    "2. 翻譯成符合母語者語感的英文，不要逐字直譯\n"
+    "3. 英文專有名詞、人名、品牌名、技術術語維持原拼寫\n"
+    "4. 若原文極短（≤ 3 字），仍保持完整英文句結構\n"
+    "5. 維持原意，不要擴充或省略資訊\n\n"
+    "範例：\n"
+    "輸入：嗯我明天下午三點要跟 Jerry 開會討論那個 Q2 roadmap\n"
+    "輸出：I have a meeting with Jerry tomorrow at 3 PM to discuss the Q2 roadmap.\n\n"
+    "只輸出翻譯後的英文，不要加任何說明、標題、前綴、引號或括號。\n\n"
+    "原文：\n{text}"
+)
+
+OLLAMA_LIST_PROMPT = (
+    "你是語音轉文字後處理助理。輸入是一段 Whisper 中英混講轉錄，"
+    "目標是把使用者口述的項目**整理為條列清單**。做：\n"
+    "1. 刪除語氣詞與無意義重複\n"
+    "2. 每個項目一行，開頭用「- 」（減號空格）\n"
+    "3. 順序保留使用者說的順序；若使用者明確說「第一」「第二」可去掉這些編號詞\n"
+    "4. 項目內保留英文原文、不翻譯\n"
+    "5. 不要憑空新增項目，也不要合併相近項目\n\n"
+    "範例：\n"
+    "輸入：那我要買牛奶然後買麵包還有要買雞蛋\n"
+    "輸出：\n- 牛奶\n- 麵包\n- 雞蛋\n\n"
+    "只輸出條列內容，不要加標題、說明、前綴、引號或括號。\n\n"
+    "原文：\n{text}"
+)
+
+OLLAMA_MEETING_NOTES_PROMPT = (
+    "你是會議紀錄整理助理。輸入是一段會議中的口述轉錄，"
+    "目標是輸出**結構化的會議紀錄**。做：\n"
+    "1. 刪除語氣詞與無意義重複\n"
+    "2. 按內容性質分段，每段可用「## 重點 」「## 行動項 」「## 決議 」等標題\n"
+    "3. 行動項（action items）用條列，格式「- [負責人] 要做的事」\n"
+    "4. 決議（decisions）用條列\n"
+    "5. 保留所有英文原文（人名、專案名、技術術語）\n"
+    "6. 沒有對應內容的段落（例如沒有行動項）就不要留空標題\n"
+    "7. 維持原意，不要憑空加結論\n\n"
+    "範例：\n"
+    "輸入：今天討論 Q2 roadmap 大家覺得 API 那塊要 Jerry 負責 UI 的話 Alice 來做 時程訂在六月底\n"
+    "輸出：\n## 重點\n- 討論 Q2 roadmap\n- 時程訂在 6 月底\n\n## 行動項\n- [Jerry] 負責 API\n- [Alice] 負責 UI\n\n"
+    "只輸出會議紀錄內容，不要加說明、前綴、引號或括號。\n\n"
+    "原文：\n{text}"
+)
+
 # Phase 2 核心資料：preset 名 → prompt 字串
 OLLAMA_PRESET_PROMPTS: dict[str, str] = {
-    "default":      OLLAMA_POLISH_PROMPT,
-    "email":        OLLAMA_EMAIL_PROMPT,
-    "chat":         OLLAMA_CHAT_PROMPT,
-    "note":         OLLAMA_NOTE_PROMPT,
-    "code_comment": OLLAMA_CODE_COMMENT_PROMPT,
+    "default":       OLLAMA_POLISH_PROMPT,
+    "email":         OLLAMA_EMAIL_PROMPT,
+    "chat":          OLLAMA_CHAT_PROMPT,
+    "note":          OLLAMA_NOTE_PROMPT,
+    "code_comment":  OLLAMA_CODE_COMMENT_PROMPT,
+    # Phase 3.1 action presets
+    "translate_en":  OLLAMA_TRANSLATE_EN_PROMPT,
+    "list":          OLLAMA_LIST_PROMPT,
+    "meeting_notes": OLLAMA_MEETING_NOTES_PROMPT,
 }
 
-# 會議記錄 preset 先留著（Phase 3 若要做 voice shortcut 觸發時可用）
-OLLAMA_MEETING_MINUTES_PROMPT = (
-    "你是一位會議記錄專家。請將以下轉錄文字整理成條列式的會議要點，"
-    "保留關鍵決策與行動項，使用繁體中文：\n\n{text}"
-)
+# 舊別名保留：OLLAMA_MEETING_MINUTES_PROMPT 是 v2.1.0 預留的佔位符，
+# Phase 3.1 正式用 OLLAMA_MEETING_NOTES_PROMPT 取代（內容更完整）。
+OLLAMA_MEETING_MINUTES_PROMPT = OLLAMA_MEETING_NOTES_PROMPT
 
 
 # ── Dictionary 注入 helpers ───────────────────────────────────────────────────
