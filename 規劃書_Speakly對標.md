@@ -1,8 +1,76 @@
 # Whisper Pro → Speakly 全功能對標規劃書
 
 > 文件用途：在動工之前把「要做什麼、為什麼、怎麼拆、做到什麼程度算完成」一次講清楚，避免邊做邊偏。
-> 適用版本：Whisper Pro v2.0（branch `feat/ambient-chamber`）
-> 撰寫日期：2026-04-20
+> 原撰寫日期：2026-04-20（v2.0 時期）
+> 最後狀態更新：2026-04-24（v2.1.0 發佈後）
+
+---
+
+## 📊 執行狀態追蹤（2026-04-24）
+
+> 這個區塊是事後加上去的執行進度，讓閱讀者一眼看到「當初規劃 vs 實際做到哪」。下方第 0–8 節保留原規劃紀錄，不動。
+
+### Phase 狀態總覽
+
+| Phase | 原規劃目標 | 狀態 | 落地版本 | 備註 |
+|---|---|---|---|---|
+| **Phase 1** | Ollama 潤飾管線（MVP） | ✅ 完成 | v2.1.0（`0f7b6ce`）| 中英混講去 filler、修錯、補標點 |
+| **Phase 1.5**（規劃外追加）| 原文／潤飾 toggle chip | ✅ 完成 | v2.1.0（`0824fe0`）| 緩解 §7.1 risk 3「LLM 過度改寫」 |
+| **Phase 2** | 情境格式化（preset 系統）| ✅ 完成 | v2.1.0（`6623947`）| email/chat/note/code_comment/default |
+| Phase 2 擴充 #2 | Prompt 熱重載 | ✅ 完成 | v2.1.0 | `prompt_reloader.py`，2s 輪詢 mtime |
+| Phase 2 擴充 #3 | Polish log（規劃外追加）| ✅ 完成 | v2.1.0 | JSONL 落地 `~/.whisper_app/polish_log.jsonl` |
+| Phase 2 擴充 #4 | 個人字典（原列 Phase 5 → 提前）| ✅ 完成 | v2.1.0 | `dictionary.py`，注入 Whisper + Ollama prompt |
+| Regression CLI（規劃外追加）| `eval_runner.py` | ✅ 完成 | v2.1.0 | 跑 `tests/golden_set/` → CSV |
+| **Phase 3** | Voice Shortcuts + 歷史紀錄 | ⏳ 待辦 | — | 見下方第 5.3 節 |
+| **Phase 4** | 整合打磨（menu bar / mini 窗 / 自動語言）| ⏳ 待辦 | — | 見下方第 5.4 節 |
+| **Phase 5** | 長線功能 | ⏸️ 暫不動 | — | 個人字典已提前完成 |
+
+### Phase 1 驗收狀態（§1 末，第 265 行）
+
+| 驗收項 | 狀態 |
+|---|---|
+| 中英混講 5 秒訊息從按下到貼上 < 4 秒 | 🔍 待實測 |
+| 至少刪除 80% filler | 🔍 待實測（有 `eval_runner.py` 可跑）|
+| 不誤刪 meaningful 內容 | 🔍 待實測 |
+| Ollama 服務不在時 app 不崩、自動降級貼原文 | ✅ 已驗證（`ollama_client.py` 的 `except` 分支）|
+
+### Phase 2 驗收狀態（§2 末，第 311 行）
+
+| 驗收項 | 狀態 |
+|---|---|
+| 5 個不同 app 測同一句話輸出風格明顯不同 | 🔍 待實測 |
+| 未命中任何 preset 時行為等同 Phase 1 default | ✅ 已驗證（`presets.py` 尾端降級邏輯）|
+
+### 附錄 A 狀態同步（第 467 行那張表）
+
+| Speakly 功能 | 原計畫 Phase | **最新狀態** |
+|---|---|---|
+| 全域熱鍵 | 已完成 | ✅ v1.0.0 |
+| 多語 ASR | 已完成 | ✅ v1.0.0 |
+| 去 filler / 修錯 / 標點 | Phase 1 | ✅ v2.1.0 |
+| 自動格式化 | Phase 2 | ✅ v2.1.0 |
+| 即時翻譯 | Phase 5 | ⏸️ 未做 |
+| Voice shortcuts | Phase 3 | ⏳ 待辦 |
+| 100+ 應用整合 | 繼承 auto-paste | ✅ |
+| 每月無限使用 | 天生免費 | ✅ |
+| 雲端 AI | 不做 | ❌（維持本地 Ollama）|
+| 個人字典（原 Phase 5）| 長線 | ✅ v2.1.0 提前 |
+
+### 和原規劃的偏差（誠實記錄）
+
+1. **Phase 1 實際做完 = Phase 1 + 1.5**：原規劃沒有 toggle chip；實作時覺得「LLM 過度改寫」是真實痛點，臨時加碼。結果是好的。
+2. **Phase 2 實際做完 = Phase 2 + 擴充 #2/#3/#4**：原規劃只有 preset 路由；CEO review（路徑 B）決定把「測試優先 + Phase 5 個人字典 + 熱重載 + polish log」都一起做。工程密度大但一次做完更連貫。
+3. **Phase 1 貼上策略選 B**：原規劃建議「長錄音用 A、短錄音用 B」；實作時統一用 B（`ollama_paste_strategy="wait"`），因為 MLX + 3B 模型實測夠快，使用者看不到閃爍。
+4. **推薦模型用 3B**：原規劃列 3B/7B/14B/20B；預設 `qwen2.5:3b-instruct`。
+5. **新增基礎設施（規劃外）**：統一日誌系統（`logger.py`）、錄音完整性修正（VAD 放寬、音量正規化、尾音 padding）、macOS 26.4+ 穩定性修復。這些是做 Phase 1/2 時發現必須先處理的地基。
+
+### 下一步建議
+
+**先用一週**（§7.3 原則：每個 Phase 做完拉長使用一週再進下一個）。期間完成 v2.1.0 驗收實測（見 CLAUDE.md §11 末段清單），收集真實使用回饋。
+
+之後二擇一：
+- **Phase 3**（Voice Shortcuts + 歷史紀錄，約 1-2 天）— 擴功能
+- **打磨**（間距統一、等寬數字、reduce-motion、App Icon、移除舊 token 別名）— 收尾
 
 ---
 
