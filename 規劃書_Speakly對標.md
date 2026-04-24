@@ -21,7 +21,8 @@
 | Phase 2 擴充 #3 | Polish log（規劃外追加）| ✅ 完成 | v2.1.0 | JSONL 落地 `~/.whisper_app/polish_log.jsonl` |
 | Phase 2 擴充 #4 | 個人字典（原列 Phase 5 → 提前）| ✅ 完成 | v2.1.0 | `dictionary.py`，注入 Whisper + Ollama prompt |
 | Regression CLI（規劃外追加）| `eval_runner.py` | ✅ 完成 | v2.1.0 | 跑 `tests/golden_set/` → CSV |
-| **Phase 3** | Voice Shortcuts + 歷史紀錄 | ⏳ 待辦 | — | 見下方第 5.3 節 |
+| **Phase 3.1** | Voice Shortcuts（action preset）| ✅ 完成 | v2.2.0（`abe79be`）| 翻英文 / 條列 / 會議紀錄 3 個 action preset |
+| **Phase 3.2** | SQLite 歷史紀錄 | ✅ 完成 | v2.2.0（`ddfb4d3`）| FTS5 trigram 搜尋 + CJK LIKE fallback + 重新潤飾 |
 | **Phase 4** | 整合打磨（menu bar / mini 窗 / 自動語言）| ⏳ 待辦 | — | 見下方第 5.4 節 |
 | **Phase 5** | 長線功能 | ⏸️ 暫不動 | — | 個人字典已提前完成 |
 
@@ -50,7 +51,8 @@
 | 去 filler / 修錯 / 標點 | Phase 1 | ✅ v2.1.0 |
 | 自動格式化 | Phase 2 | ✅ v2.1.0 |
 | 即時翻譯 | Phase 5 | ⏸️ 未做 |
-| Voice shortcuts | Phase 3 | ⏳ 待辦 |
+| Voice shortcuts | Phase 3 | ✅ v2.2.0 |
+| 歷史紀錄 / 搜尋 | Phase 3 | ✅ v2.2.0 |
 | 100+ 應用整合 | 繼承 auto-paste | ✅ |
 | 每月無限使用 | 天生免費 | ✅ |
 | 雲端 AI | 不做 | ❌（維持本地 Ollama）|
@@ -66,11 +68,15 @@
 
 ### 下一步建議
 
-**先用一週**（§7.3 原則：每個 Phase 做完拉長使用一週再進下一個）。期間完成 v2.1.0 驗收實測（見 CLAUDE.md §11 末段清單），收集真實使用回饋。
+v2.2.0 已含 Phase 3 全部內容。**先用一週**（§7.3 原則）累積真實使用資料（歷史紀錄就是最好的觀察點），再評估 Phase 4。
 
 之後二擇一：
-- **Phase 3**（Voice Shortcuts + 歷史紀錄，約 1-2 天）— 擴功能
-- **打磨**（間距統一、等寬數字、reduce-motion、App Icon、移除舊 token 別名）— 收尾
+- **Phase 4**（menu bar / mini 窗 / 自動語言 / 匯入匯出 / 首次啟動引導，約 2-3 天）— 收尾到「日常使用順手度」Speakly 同級
+- **打磨**（間距統一、等寬數字、reduce-motion、App Icon 實作、移除舊 token 別名）— 小改動，可插隊做
+
+v2.2.0 的 Phase 4 決策點：
+- **4.2 menu bar** 有 `rumps` + tkinter event loop 併存風險，建議先 PoC 30 min
+- **4.1 App Icon** 設計稿已在 `docs/superpowers/specs/2026-04-22-app-icon-splash-design.md`；產出 PNG + `.icns` 即可
 
 ---
 

@@ -2,19 +2,21 @@
 
 > 這份檔案讓任何新的 Claude session 能無縫接手這個專案。
 > 位置：`/Users/jerrychen/project/Claude_code/CLAUDE.md`
-> 最後更新：2026-04-24
+> 最後更新：2026-04-24（v2.2.0 發佈）
 
 ---
 
 ## 1. 專案快照
 
-**Whisper Pro v2.1.0** — macOS 桌面語音轉文字 GUI 應用程式，含本地 AI 潤飾與情境路由。
+**Whisper Pro v2.2.0** — macOS 桌面語音轉文字 GUI 應用程式，含本地 AI 潤飾、情境路由、Voice Shortcuts、歷史紀錄。
 
 - **使用者語言**：繁體中文（回覆一律用繁體中文；程式碼註解可中英混用）
 - **目標使用者**：中英夾雜的開發者 / 知識工作者
 - **核心流程**：按 `⌘⌥R` → 錄音 → faster-whisper large-v3-turbo 轉錄 →（可選）Ollama 潤飾 → 自動貼上到游標處
-- **隱私**：100% 本地運算，不送雲端（Whisper + Ollama 都在本機跑）
-- **v2.1.0 定位**：Speakly 對標 Phase 1 + 2 完成（Ollama 潤飾管線 + 情境 preset 路由 + 個人字典 + 熱重載）
+- **隱私**：100% 本地運算，不送雲端（Whisper + Ollama 都在本機跑；歷史紀錄存本地 SQLite）
+- **版本定位**：
+  - v2.1.0（2026-04-23）：Speakly Phase 1 + 2（潤飾管線 + preset 路由 + 字典 + 熱重載）
+  - **v2.2.0（2026-04-24）：Speakly Phase 3（Voice Shortcuts + SQLite 歷史紀錄）**
 
 ---
 
@@ -62,6 +64,7 @@ Python 版本：**3.13 arm64**（Apple Silicon）。
 ├── dictionary.py         # ★ Phase 2：個人字典（~/.whisper_app/dictionary.json）
 ├── prompt_reloader.py    # ★ Phase 2：prompts.py / presets.py mtime 熱重載（2s 輪詢）
 ├── eval_runner.py        # ★ Phase 2：regression CLI，輸出 CSV 到 tests/reports/
+├── history.py            # ★ Phase 3.2：SQLite 歷史紀錄（FTS5 trigram + CRUD）
 ├── vad.py                # VAD 靜音偵測（輔助模組）
 ├── test_hotkey.py        # 快捷鍵互動測試（legacy）
 └── test_full_app.py      # 整合測試（legacy）
@@ -226,8 +229,8 @@ class Config:
 ## 8. 目前 Git／Release 狀態（2026-04-24）
 
 ### 目前版本
-- `main` 位於 `301fef2`（Merge PR #12）
-- 最新 tag：**`v2.1.0`**（2026-04-23 發）
+- `main` 位於 `ddfb4d3`（Phase 3.2 歷史紀錄）+ 後續 docs commit
+- 最新 tag：**`v2.2.0`**（2026-04-24 發）
 - 目前沒有 open PR
 
 ### 版本時間軸
@@ -235,7 +238,8 @@ class Config:
 |---|---|---|
 | `v1.0.0` | 初版 | 基本錄音 / 轉錄 / 貼上 |
 | `v2.0.0` | 2026-04-19 | Ambient Chamber 光場錄音鈕 + 穩定性修復 + Speakly 規劃書 |
-| **`v2.1.0`** | 2026-04-23 | Phase 1 Ollama 潤飾 + Phase 2 preset / 字典 / 熱重載 + 統一日誌 + 錄音完整性 |
+| `v2.1.0` | 2026-04-23 | Phase 1 Ollama 潤飾 + Phase 2 preset / 字典 / 熱重載 + 統一日誌 + 錄音完整性 |
+| **`v2.2.0`** | 2026-04-24 | Phase 3.1 Voice Shortcuts（3 action preset）+ Phase 3.2 SQLite 歷史紀錄 |
 
 ### v2.1.0 PR 歷史（全部已處理）
 | # | 內容 | 狀態 |
@@ -329,6 +333,12 @@ cat ~/.whisper_app/polish_log.jsonl | jq .         # 潤飾紀錄
 - [x] **錄音完整性**（VAD 放寬、音量正規化、segment-level 幻覺過濾、尾音 padding 300ms）
 - [x] **macOS 26.4+ 穩定性修復**（TSM 斷言、CFRunLoop race）
 
+### ✅ v2.2.0 完成項（2026-04-24）— Speakly Phase 3
+- [x] **Phase 3.1 Voice Shortcuts**（3 個 action preset：翻英文 / 條列 / 會議紀錄）
+- [x] **Phase 3.2 SQLite 歷史紀錄**（`history.py` + FTS5 trigram 搜尋 + 重新潤飾）
+- [x] **設定面板**新增歷史紀錄區段（啟用開關 + 保留天數）
+- [x] **使用手冊**補「歷史紀錄」章節 + Voice Shortcuts 使用範例
+
 ### 🟡 隨時可撿起（小打磨）
 - [ ] **間距統一** — 全面套用 `SPACE_*` 常數（目前還有裸數字）
 - [ ] **等寬數字** — 計時器、RMS 數值改用 `FONT_FAMILY_MONO`（部分已用）
@@ -336,13 +346,7 @@ cat ~/.whisper_app/polish_log.jsonl | jq .         # 潤飾紀錄
 - [ ] **舊 token 別名移除** — `SURF1..4`、`TEXT1..4`、`BLUE/GREEN/RED/ORANGE` 過渡期結束
 - [ ] **App Icon + 啟動畫面**（設計文件已寫在 `docs/superpowers/specs/2026-04-22-app-icon-splash-design.md`）
 
-### 📌 Speakly Phase 3 候選（約 1-2 天）
-- [ ] **Voice Shortcuts**（關鍵字路由，命中後從正文剝除）
-  - 例：「翻譯英文」→ 切翻譯 preset、「條列」→ 條列 preset
-- [ ] **歷史紀錄 + 搜尋**（SQLite `~/.whisper_app/history.db`）
-  - 欄位：timestamp / duration / raw / polished / target_app / preset
-
-### 📌 Speakly Phase 4 候選（約 2-3 天）
+### 📌 Speakly Phase 4 候選（約 2-3 天，下一個版本 v2.3.0）
 - [ ] **menu bar icon**（`rumps`，不開主視窗也能錄）
 - [ ] **浮動 mini 錄音窗**（角落電平顯示）
 - [ ] **自動偵測語言**（目前 config 可設但 UX 還沒完全打磨）
@@ -398,10 +402,13 @@ cat ~/.whisper_app/polish_log.jsonl | jq .         # 潤飾紀錄
 | 前景 App 偵測 | `auto_paste.py` `get_frontmost_app()` | osascript，錄音開始就抓（供 preset 路由 + ⌘V 目標） |
 | Ollama 潤飾 | `ollama_client.py` | `process()` + `health_check_async()` |
 | Preset 路由 | `presets.py` | keyword > frontmost_app > default |
-| Ollama prompt | `prompts.py` | 預設 + 4 個 preset，支援熱重載 |
+| Ollama prompt | `prompts.py` | 預設 + 7 個 preset（email/chat/note/code_comment/translate_en/list/meeting_notes），支援熱重載 |
+| Voice Shortcuts | `presets.py` | action preset `triggers_app=set()`，純 keyword 觸發 |
 | 個人字典 | `dictionary.py` | `~/.whisper_app/dictionary.json` |
 | Prompt 熱重載 | `prompt_reloader.py` | 2s 輪詢 mtime + `importlib.reload` |
 | Regression 測試 | `eval_runner.py` | CLI，讀 `tests/golden_set/` → CSV 報告 |
+| 歷史紀錄 CRUD | `history.py` `HistoryStore` | SQLite + FTS5 trigram 搜尋 |
+| 歷史視窗 | `gui.py` `HistoryWindow` | Toplevel，左清單 + 右詳細 + 動作按鈕 |
 | 日誌系統 | `logger.py` | `log_action` / `log_state` / `log_settings` / `log_error` |
 | 首次權限引導 | `main.py` + `gui.py` | pynput 輔助使用權限檢查 |
 | 設定欄位 | `config.py` | dataclass + 原子性儲存 |
