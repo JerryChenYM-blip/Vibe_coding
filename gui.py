@@ -43,6 +43,7 @@ from hotkey_manager import (
 from ollama_client import OllamaClient, OllamaConfig
 import presets as _presets
 import dictionary as _dictionary
+from history import HistoryStore
 from prompt_reloader import PromptReloader
 from recorder import AudioRecorder
 from transcriber import Transcriber, TranscriptionResult
@@ -218,6 +219,18 @@ class AppWindow(ctk.CTkFrame):
         self._prompt_reloader = PromptReloader(on_reload=_on_reload)
         if self.cfg.prompt_hot_reload:
             self._prompt_reloader.start()
+
+        # Phase 3.2 歷史紀錄：每次轉錄完成會 insert，潤飾完成後 update_polish
+        # _current_history_id：最近一筆 insert 的 rowid，供 _finish_polish 更新
+        self.history_store: Optional[HistoryStore] = None
+        self._current_history_id: Optional[int] = None
+        if self.cfg.history_enabled:
+            try:
+                self.history_store = HistoryStore()
+            except Exception:
+                log_error("history_store_init_failed")
+        # 啟動 1 分鐘後跑一次保留策略清理（不阻塞 UI 建構）
+        self.after(60_000, self._run_history_retention)
 
     # ═══════════════════════════════════════════════════════════════════════
     #  BUILD UI
@@ -538,6 +551,13 @@ class AppWindow(ctk.CTkFrame):
         self._apply_polish_button_style(enabled=self.cfg.ollama_enabled, healthy=False)
 
         ctk.CTkButton(
+            row, text="歷史", width=96,
+            image=get_icon("history", icon_size, TEXT_2),
+            compound="left",
+            command=self._open_history, **ghost,
+        ).pack(side="left", padx=4)
+
+        ctk.CTkButton(
             row, text="設定", width=96,
             image=get_icon("settings", icon_size, TEXT_2),
             compound="left",
@@ -790,6 +810,25 @@ class AppWindow(ctk.CTkFrame):
         self._showing_polished = True          # 預設顯示潤飾版（有的話）
         self._apply_toggle_style()             # 新結果暫無潤飾版 → 兩顆灰
 
+        # Phase 3.2：有效轉錄寫入歷史（polished_text 先 NULL，潤飾完再 update）
+        self._current_history_id = None
+        if valid and self.history_store is not None:
+            try:
+                self._current_history_id = self.history_store.insert(
+                    duration_s    = result.duration_seconds,
+                    raw_text      = text,
+                    model_whisper = self._model_var.get(),
+                    target_app    = self._frontmost_app,
+                    preset_used   = "default",   # 走潤飾路徑時會在 _finish_polish 更新
+                    language      = result.language or None,
+                )
+                if self._current_history_id:
+                    log_action("history_saved",
+                               id=self._current_history_id,
+                               has_polish_pending=self.cfg.ollama_enabled)
+            except Exception:
+                log_error("history_insert_on_transcription_done")
+
         # 決定路徑：能潤飾就走潤飾流程，失敗自動降級回原文。
         # 規劃書 6.4「策略 B」：等潤飾完再貼，因此 auto-paste 也延到潤飾後。
         take_polish_path = (
@@ -916,6 +955,20 @@ class AppWindow(ctk.CTkFrame):
                     pyperclip.copy(polished)
                 except Exception:
                     pass
+
+            # Phase 3.2：回頭更新歷史紀錄（潤飾結果 + preset + model）
+            if self._current_history_id is not None and self.history_store is not None:
+                try:
+                    self.history_store.update_polish(
+                        self._current_history_id,
+                        polished_text = polished,
+                        preset_used   = resp.preset_name,
+                        model_ollama  = resp.model,
+                    )
+                except Exception:
+                    log_error("history_update_polish_on_finish",
+                              id=self._current_history_id)
+
             paste_text = polished
 
         # 自動貼上（策略 B：等潤飾完才貼）
@@ -1548,6 +1601,69 @@ class AppWindow(ctk.CTkFrame):
         log_action("settings_opened")
         SettingsWindow(self, self.cfg, self._on_settings_saved)
 
+    def _open_history(self) -> None:
+        """開啟歷史紀錄視窗（Phase 3.2）。"""
+        log_action("history_opened")
+        if self.history_store is None:
+            self._show_toast("歷史紀錄未啟用（請到設定開啟）")
+            return
+        HistoryWindow(self, self.history_store, on_repolish=self._repolish_from_history)
+
+    def _repolish_from_history(self, entry) -> None:
+        """從歷史視窗重新潤飾一筆舊紀錄。
+
+        流程：設 _current_history_id 指到舊筆 → 走 _start_polish → 潤飾完成後
+        `_finish_polish` 會 update_polish 回寫同一筆，不會再 insert 新紀錄。
+        目標貼上位置 target=None（使用者在歷史視窗按的，不猜目標）。
+        """
+        if not self.cfg.ollama_enabled:
+            self._show_toast("AI 潤飾未啟用")
+            return
+        if self.ollama.health_ok is False:
+            self._show_toast("Ollama 服務未啟動")
+            self._refresh_ollama_health()
+            return
+        if self._polish_busy:
+            self._show_toast("目前已在潤飾中，請稍候…")
+            return
+
+        # 更新 AppWindow 狀態指向歷史紀錄
+        self._polish_generation += 1
+        gen = self._polish_generation
+        self._current_history_id = entry.id
+        self._last_raw         = entry.raw_text
+        self._last_llm_input   = None
+        self._last_polished    = None
+        self._showing_polished = True
+        # textbox 換成舊的原文（讓 _finish_polish 的 expect_current 比對過）
+        self._textbox.configure(state="normal")
+        self._textbox.delete("1.0", "end")
+        self._textbox.insert("1.0", entry.raw_text)
+        self._textbox.configure(state="disabled")
+        self._apply_toggle_style()
+        self._frontmost_app = entry.target_app   # 讓 preset 路由走原本的 app
+
+        log_action("history_repolish", id=entry.id)
+        self._start_polish(gen, entry.raw_text, target=None)
+
+    def _run_history_retention(self) -> None:
+        """Phase 3.2：啟動後 1 分鐘跑一次保留策略清理。
+
+        若 `history_retention_days > 0`，刪除 N 天前的紀錄。
+        失敗只 log_error，不影響 UI。
+        """
+        if self.history_store is None:
+            return
+        days = max(0, int(self.cfg.history_retention_days or 0))
+        if days <= 0:
+            return
+        try:
+            removed = self.history_store.delete_before(days)
+            if removed > 0:
+                log.info(f"HISTORY retention: removed {removed} rows older than {days}d")
+        except Exception:
+            log_error("history_retention_failed", days=days)
+
     def _on_settings_saved(self, cfg: Config) -> None:
         """設定視窗儲存後：同步 cfg、重啟 listener（若 hotkey 有變），刷新所有 UI。"""
         old_hotkey = self.cfg.hotkey
@@ -1598,6 +1714,18 @@ class AppWindow(ctk.CTkFrame):
                 self._prompt_reloader.start()
             else:
                 reloader.stop()
+
+        # Phase 3.2：歷史紀錄啟用狀態變動 → lazy 建立/釋放 store
+        if cfg.history_enabled and self.history_store is None:
+            try:
+                self.history_store = HistoryStore()
+                log.info("HISTORY: store lazy-initialized after settings change")
+            except Exception:
+                log_error("history_store_lazy_init_failed")
+        elif not cfg.history_enabled and self.history_store is not None:
+            # 停用 → 只是停寫入；既有 DB 檔保留
+            self.history_store = None
+            log.info("HISTORY: store disabled (DB file preserved)")
 
     # ═══════════════════════════════════════════════════════════════════════
     #  HELPERS
@@ -1979,6 +2107,31 @@ class SettingsWindow(ctk.CTkToplevel):
             command=self._open_dictionary_file,
         ).pack(side="right")
 
+        # ── 歷史紀錄 (Phase 3.2) ─────────────────────────────────────────
+        hist = section("歷史紀錄 (Phase 3.2)")
+        self._history_enabled_var = ctk.BooleanVar(value=self.cfg.history_enabled)
+        row(hist, "寫入 ~/.whisper_app/history.db",
+            make_sw(self._history_enabled_var, ACCENT))
+        sep_line(hist)
+
+        retention_row = ctk.CTkFrame(hist, fg_color="transparent", height=52)
+        retention_row.pack(fill="x", padx=16, pady=4)
+        retention_row.pack_propagate(False)
+        ctk.CTkLabel(
+            retention_row, text="保留天數（0 = 永久）", anchor="w",
+            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT1,
+        ).pack(side="left")
+        self._history_retention_var = tk.StringVar(
+            value=str(self.cfg.history_retention_days)
+        )
+        ctk.CTkEntry(
+            retention_row, textvariable=self._history_retention_var,
+            width=90, height=30, corner_radius=8,
+            fg_color=SURF2, border_color=SURF3, text_color=TEXT1,
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 13),
+            justify="right",
+        ).pack(side="right")
+
         # ── 關於 ──────────────────────────────────────────────────────────
         about = section("關於")
         for label, path in [
@@ -2095,6 +2248,15 @@ class SettingsWindow(ctk.CTkToplevel):
         # ── #4 字典 ──────────────────────────────────────────────────────
         self.cfg.dictionary_enabled = self._dict_enabled_var.get()
         self.cfg.dictionary_path    = self._dict_path_var.get().strip()
+        # ── Phase 3.2 歷史紀錄 ─────────────────────────────────────────────
+        self.cfg.history_enabled = self._history_enabled_var.get()
+        try:
+            days = int(self._history_retention_var.get().strip() or "0")
+            self.cfg.history_retention_days = max(0, days)
+        except ValueError:
+            # 非法輸入保留原值，避免吃掉使用者其他改動
+            log_error("history_retention_parse_failed",
+                      value=self._history_retention_var.get())
         self.cfg.save()
         self._on_save_cb(self.cfg)   # 通知主視窗（destroy 由 _save 的 finally 負責）
 
@@ -2441,6 +2603,365 @@ class AccessibilityDialog(ctk.CTkToplevel):
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
         ])
         self.destroy()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  HistoryWindow（Phase 3.2 歷史紀錄檢視）
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HistoryWindow(ctk.CTkToplevel):
+    """歷史紀錄視窗（modal-less）。
+
+    左側：搜尋框 + 清單（時間、preset 標籤、摘要）
+    右側：選中項目的詳細內容（raw / polished 並排）+ 動作按鈕
+
+    動作：
+      • 複製 — 把 raw 或 polished 複製到剪貼簿
+      • 重新潤飾 — 呼叫主視窗的 _repolish_from_history
+      • 刪除 — 從 DB 刪除並刷新清單
+    """
+
+    WIN_W = 980
+    WIN_H = 640
+
+    def __init__(self, parent, store, on_repolish) -> None:
+        """Args:
+            parent:      AppWindow 實例（master）
+            store:       HistoryStore 實例
+            on_repolish: 按「重新潤飾」時呼叫 on_repolish(entry)
+        """
+        super().__init__(parent)
+        self._parent     = parent
+        self._store      = store
+        self._on_repolish = on_repolish
+
+        self.title("歷史紀錄")
+        self.geometry(f"{self.WIN_W}x{self.WIN_H}")
+        self.minsize(800, 480)
+        self.configure(fg_color=BG)
+        self.transient(parent)
+        self.after(50, self.lift)
+
+        self._entries: list = []
+        self._selected_id: Optional[int] = None
+
+        self._build_ui()
+        self._refresh(query="")
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        # 搜尋列
+        top = ctk.CTkFrame(self, height=56, fg_color=SURF_1, corner_radius=0)
+        top.pack(fill="x", side="top")
+        top.pack_propagate(False)
+
+        row = ctk.CTkFrame(top, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=12)
+
+        ctk.CTkLabel(
+            row, text="搜尋",
+            font=ctk.CTkFont("SF Pro Text", 13),
+            text_color=TEXT_3,
+        ).pack(side="left", padx=(0, 8))
+
+        self._search_var = tk.StringVar(value="")
+        entry = ctk.CTkEntry(
+            row,
+            textvariable=self._search_var,
+            width=380, height=32,
+            font=ctk.CTkFont("SF Pro Text", 13),
+            fg_color=SURF_2, border_color=SURF_3, text_color=TEXT_1,
+            placeholder_text="輸入關鍵字（中文 ≥ 2 字、英文 ≥ 3 字）",
+        )
+        entry.pack(side="left", padx=4)
+        self._search_var.trace_add("write", lambda *_: self._on_search_changed())
+
+        self._count_label = ctk.CTkLabel(
+            row, text="",
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 12),
+            text_color=TEXT_3,
+        )
+        self._count_label.pack(side="right", padx=8)
+
+        # 主區：左清單 + 右詳細
+        body = ctk.CTkFrame(self, fg_color=BG)
+        body.pack(fill="both", expand=True, padx=0, pady=0)
+
+        # 左清單（CTkScrollableFrame）
+        self._list_frame = ctk.CTkScrollableFrame(
+            body,
+            width=340,
+            fg_color=SURF_1,
+            corner_radius=0,
+            scrollbar_button_color=SURF_3,
+            scrollbar_button_hover_color=SURF_4,
+        )
+        self._list_frame.pack(side="left", fill="y")
+
+        # 分隔線
+        ctk.CTkFrame(body, width=1, fg_color=SURF_3).pack(side="left", fill="y")
+
+        # 右詳細
+        self._detail_frame = ctk.CTkFrame(body, fg_color=BG)
+        self._detail_frame.pack(side="left", fill="both", expand=True)
+
+        self._build_empty_detail()
+
+    def _build_empty_detail(self) -> None:
+        """未選取時的空態畫面。"""
+        for w in self._detail_frame.winfo_children():
+            w.destroy()
+        ctk.CTkLabel(
+            self._detail_frame,
+            text="← 從左側選取一筆紀錄",
+            font=ctk.CTkFont("SF Pro Text", 14),
+            text_color=TEXT_3,
+        ).pack(expand=True)
+
+    # ── 資料刷新 ──────────────────────────────────────────────────────────────
+
+    def _on_search_changed(self) -> None:
+        self.after(180, lambda q=self._search_var.get(): self._refresh(q))
+
+    def _refresh(self, query: str) -> None:
+        """重新查詢並重建清單。"""
+        # 若搜尋框的內容已變動（使用者繼續打字），放棄這次舊 query
+        if query != self._search_var.get():
+            return
+        if query.strip():
+            self._entries = self._store.search(query, limit=200)
+        else:
+            self._entries = self._store.list_recent(limit=200)
+
+        self._count_label.configure(text=f"{len(self._entries)} / {self._store.count()}")
+
+        # 清空舊 list widgets
+        for w in self._list_frame.winfo_children():
+            w.destroy()
+
+        if not self._entries:
+            ctk.CTkLabel(
+                self._list_frame, text="（沒有符合的紀錄）",
+                font=ctk.CTkFont("SF Pro Text", 13),
+                text_color=TEXT_4,
+            ).pack(pady=20)
+            self._build_empty_detail()
+            return
+
+        # 渲染每筆
+        for entry in self._entries:
+            self._render_list_row(entry)
+
+        # 自動選第一筆
+        if self._entries:
+            self._select(self._entries[0])
+
+    def _render_list_row(self, entry) -> None:
+        """渲染單筆清單 row（可點擊卡片）。"""
+        import datetime as _dt
+        selected = (entry.id == self._selected_id)
+        card = ctk.CTkFrame(
+            self._list_frame,
+            fg_color=SURF_2 if selected else SURF_1,
+            corner_radius=8,
+            border_width=1,
+            border_color=ACCENT if selected else SURF_3,
+        )
+        card.pack(fill="x", padx=8, pady=4)
+
+        time_str = _dt.datetime.fromtimestamp(entry.timestamp).strftime("%m/%d %H:%M")
+        preset = entry.preset_used
+        preset_badge = ""
+        if preset != "default":
+            display = _presets.PRESETS.get(preset)
+            preset_badge = display.display_name if display else preset
+
+        header = ctk.CTkFrame(card, fg_color="transparent")
+        header.pack(fill="x", padx=10, pady=(8, 2))
+        ctk.CTkLabel(
+            header, text=time_str,
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 11),
+            text_color=TEXT_3,
+        ).pack(side="left")
+        if preset_badge:
+            ctk.CTkLabel(
+                header, text=f"· {preset_badge}",
+                font=ctk.CTkFont("SF Pro Text", 11),
+                text_color=ACCENT,
+            ).pack(side="left", padx=(6, 0))
+        if entry.has_polish():
+            ctk.CTkLabel(
+                header, text="✨",
+                font=ctk.CTkFont("SF Pro Text", 11),
+                text_color=INDIGO,
+            ).pack(side="right")
+
+        ctk.CTkLabel(
+            card, text=entry.summary(46),
+            font=ctk.CTkFont("SF Pro Text", 13),
+            text_color=TEXT_1 if selected else TEXT_2,
+            wraplength=310, justify="left", anchor="w",
+        ).pack(fill="x", padx=10, pady=(0, 8))
+
+        # 整張卡片可點擊
+        for w in (card, *_walk_children(card)):
+            w.bind("<Button-1>", lambda e, en=entry: self._select(en))
+
+    def _select(self, entry) -> None:
+        """選中某筆後刷新右側詳細。"""
+        self._selected_id = entry.id
+        # 重新渲染清單以更新 selected 視覺
+        # （不用重新查 DB，直接用快取的 self._entries）
+        for w in self._list_frame.winfo_children():
+            w.destroy()
+        for e in self._entries:
+            self._render_list_row(e)
+
+        self._build_detail(entry)
+
+    def _build_detail(self, entry) -> None:
+        """右側詳細視圖。"""
+        import datetime as _dt
+        for w in self._detail_frame.winfo_children():
+            w.destroy()
+
+        pad = 20
+        # Header
+        header = ctk.CTkFrame(self._detail_frame, fg_color="transparent")
+        header.pack(fill="x", padx=pad, pady=(pad, 8))
+
+        time_str = _dt.datetime.fromtimestamp(entry.timestamp).strftime("%Y-%m-%d %H:%M:%S")
+        ctk.CTkLabel(
+            header, text=time_str,
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 13),
+            text_color=TEXT_3,
+        ).pack(side="left")
+
+        meta_parts = [f"{entry.duration_s:.1f}s"]
+        if entry.language:
+            meta_parts.append(entry.language)
+        meta_parts.append(entry.model_whisper)
+        if entry.target_app:
+            meta_parts.append(f"→ {entry.target_app}")
+        if entry.preset_used != "default":
+            p = _presets.PRESETS.get(entry.preset_used)
+            meta_parts.append(p.display_name if p else entry.preset_used)
+        ctk.CTkLabel(
+            header, text="  ·  ".join(meta_parts),
+            font=ctk.CTkFont("SF Pro Text", 12),
+            text_color=TEXT_3,
+        ).pack(side="left", padx=12)
+
+        # 原文 / 潤飾 並排（潤飾在上，原文在下；有潤飾就顯示兩段）
+        if entry.polished_text:
+            self._build_text_block(self._detail_frame, "潤飾版", entry.polished_text, ACCENT)
+            self._build_text_block(self._detail_frame, "原文", entry.raw_text, TEXT_3)
+        else:
+            self._build_text_block(self._detail_frame, "原文", entry.raw_text, TEXT_2)
+
+        # 動作列
+        bar = ctk.CTkFrame(self._detail_frame, fg_color="transparent", height=56)
+        bar.pack(fill="x", side="bottom", padx=pad, pady=pad)
+
+        def _copy_text(text: str) -> None:
+            try:
+                import pyperclip
+                pyperclip.copy(text)
+                self._toast("已複製")
+            except Exception:
+                log_error("history_copy_failed")
+
+        ctk.CTkButton(
+            bar, text="複製潤飾版" if entry.polished_text else "複製原文",
+            image=get_icon("copy", 15, TEXT_1),
+            compound="left",
+            width=140, height=32, corner_radius=8,
+            font=ctk.CTkFont("SF Pro Text", 13),
+            fg_color=ACCENT, hover_color=ACCENT_HV, text_color=TEXT_1,
+            command=lambda: _copy_text(entry.polished_text or entry.raw_text),
+        ).pack(side="left", padx=4)
+
+        if entry.polished_text:
+            ctk.CTkButton(
+                bar, text="複製原文",
+                width=110, height=32, corner_radius=8,
+                font=ctk.CTkFont("SF Pro Text", 13),
+                fg_color=SURF_2, hover_color=SURF_3,
+                border_width=1, border_color=SURF_3,
+                text_color=TEXT_2,
+                command=lambda: _copy_text(entry.raw_text),
+            ).pack(side="left", padx=4)
+
+        ctk.CTkButton(
+            bar, text="重新潤飾",
+            image=get_icon("sparkles", 15, TEXT_2),
+            compound="left",
+            width=110, height=32, corner_radius=8,
+            font=ctk.CTkFont("SF Pro Text", 13),
+            fg_color=SURF_2, hover_color=SURF_3,
+            border_width=1, border_color=SURF_3,
+            text_color=TEXT_2,
+            command=lambda: (self._on_repolish(entry), self.destroy()),
+        ).pack(side="left", padx=4)
+
+        ctk.CTkButton(
+            bar, text="刪除",
+            image=get_icon("x", 15, TEXT_3),
+            compound="left",
+            width=90, height=32, corner_radius=8,
+            font=ctk.CTkFont("SF Pro Text", 13),
+            fg_color=SURF_2, hover_color=SURF_3,
+            border_width=1, border_color=SURF_3,
+            text_color=TEXT_3,
+            command=lambda: self._delete_selected(entry.id),
+        ).pack(side="right", padx=4)
+
+    def _build_text_block(self, parent, label: str, text: str, label_color: str) -> None:
+        """渲染一段標籤 + 文字區塊。"""
+        block = ctk.CTkFrame(parent, fg_color="transparent")
+        block.pack(fill="both", expand=True, padx=20, pady=(8, 0))
+
+        ctk.CTkLabel(
+            block, text=label,
+            font=ctk.CTkFont("SF Pro Text", 11, "bold"),
+            text_color=label_color,
+        ).pack(anchor="w", pady=(0, 4))
+
+        box = ctk.CTkTextbox(
+            block,
+            fg_color=SURF_1, border_color=SURF_3, border_width=1,
+            text_color=TEXT_1, font=ctk.CTkFont("SF Pro Text", 14),
+            wrap="word", corner_radius=8,
+            scrollbar_button_color=SURF_3,
+        )
+        box.pack(fill="both", expand=True)
+        box.insert("1.0", text)
+        box.configure(state="disabled")
+
+    def _delete_selected(self, id: int) -> None:
+        """刪除當前選中的紀錄並刷新。"""
+        if not self._store.delete(id):
+            self._toast("刪除失敗")
+            return
+        log_action("history_deleted", id=id)
+        self._toast("已刪除")
+        self._selected_id = None
+        self._refresh(query=self._search_var.get())
+
+    def _toast(self, msg: str) -> None:
+        """沿用 AppWindow 的 toast（在 parent 上顯示）。"""
+        try:
+            self._parent._show_toast(msg)
+        except Exception:
+            pass
+
+
+def _walk_children(widget):
+    """遞迴 yield 一個 widget 底下所有子元件（含深層）。"""
+    for child in widget.winfo_children():
+        yield child
+        yield from _walk_children(child)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

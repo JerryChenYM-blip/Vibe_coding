@@ -107,6 +107,13 @@ class Config:
     # 啟用時每次潤飾完成後在 ~/.whisper_app/polish_log.jsonl 追加一行記錄
     polish_log_enabled: bool = True
 
+    # ── Phase 3.2 歷史紀錄 ──────────────────────────────────────────────────
+
+    # 啟用時每次轉錄（含潤飾）寫入 ~/.whisper_app/history.db
+    history_enabled: bool = True
+    # 保留天數；0 = 永久保留，>0 = 主視窗啟動時刪除 N 天前的紀錄
+    history_retention_days: int = 0
+
     # ── 讀寫介面 ──────────────────────────────────────────────────────────────
 
     @classmethod
