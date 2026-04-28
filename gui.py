@@ -60,20 +60,15 @@ ctk.set_default_color_theme("blue")
 WIN_W, WIN_H = 760, 800   # 視窗預設寬度 × 高度（像素）
 
 # ── 設計 Token（統一從 tokens.py 匯入，此模組內不重複定義任何 hex 色碼）────────
-from tokens import (  # noqa: F401  （legacy 別名在此模組各處使用，不可移除）
+from tokens import (
     # Surfaces
     BG, SURF_1, SURF_2, SURF_3, SURF_4,
-    SURF1, SURF2, SURF3,            # legacy aliases
     # Text
     TEXT_1, TEXT_2, TEXT_3, TEXT_4,
-    TEXT1, TEXT2, TEXT3,            # legacy aliases
     # Accents
     ACCENT, ACCENT_HV, ACCENT_BG,
-    BLUE, BLUE_HV, BLUE_DIM,        # legacy aliases (→ ACCENT)
     SUCCESS, SUCCESS_DIM,
-    GREEN, GREEN_DIM,               # legacy aliases
     DANGER, DANGER_DIM,
-    RED, RED_DIM,                   # legacy aliases
     WARN,
     INDIGO, INDIGO_HV,
     # Typography + spacing
@@ -253,12 +248,12 @@ class AppWindow(ctk.CTkFrame):
 
     def _build_topbar(self) -> None:
         """建立頂部工具列：左側品牌 logo、右側語言與模型選單。"""
-        bar = ctk.CTkFrame(self, height=60, corner_radius=0, fg_color=SURF1)
+        bar = ctk.CTkFrame(self, height=60, corner_radius=0, fg_color=SURF_1)
         bar.pack(fill="x")
         bar.pack_propagate(False)
 
         # Thin bottom separator line
-        ctk.CTkFrame(self, height=1, fg_color=SURF3, corner_radius=0).pack(fill="x")
+        ctk.CTkFrame(self, height=1, fg_color=SURF_3, corner_radius=0).pack(fill="x")
 
         # Left: title
         left = ctk.CTkFrame(bar, fg_color="transparent")
@@ -274,7 +269,7 @@ class AppWindow(ctk.CTkFrame):
             left,
             text="Whisper Pro",
             font=ctk.CTkFont("SF Pro Display", 17, "bold"),
-            text_color=TEXT1,
+            text_color=TEXT_1,
         ).pack(side="left")
 
         # Right: language + model selectors
@@ -293,7 +288,7 @@ class AppWindow(ctk.CTkFrame):
             ctk.CTkLabel(
                 grp, text=label_txt,
                 font=ctk.CTkFont("SF Pro Text", 12),
-                text_color=TEXT3,
+                text_color=TEXT_3,
             ).pack(side="left", padx=(0, 4))
 
             var = ctk.StringVar(value=init_val)
@@ -306,11 +301,11 @@ class AppWindow(ctk.CTkFrame):
                 width=108 if var_attr == "_lang_var" else 148,
                 height=30,
                 corner_radius=8,
-                fg_color=SURF2,
-                button_color=SURF2,
-                button_hover_color=SURF3,
-                dropdown_fg_color=SURF1,
-                text_color=TEXT1,
+                fg_color=SURF_2,
+                button_color=SURF_2,
+                button_hover_color=SURF_3,
+                dropdown_fg_color=SURF_1,
+                text_color=TEXT_1,
                 font=ctk.CTkFont("SF Pro Text", 13),
                 command=cb,
             )
@@ -391,7 +386,7 @@ class AppWindow(ctk.CTkFrame):
         """建立轉錄結果卡片：標題列（含原文/潤飾切換）、文字區、清除按鈕。"""
         card = ctk.CTkFrame(
             self, corner_radius=16,
-            fg_color=SURF1,
+            fg_color=SURF_1,
         )
         card.pack(fill="both", expand=True, padx=16, pady=(0, 6))
 
@@ -457,7 +452,7 @@ class AppWindow(ctk.CTkFrame):
         self._apply_toggle_style()
 
         # Divider
-        ctk.CTkFrame(card, height=1, fg_color=SURF3, corner_radius=0).pack(
+        ctk.CTkFrame(card, height=1, fg_color=SURF_3, corner_radius=0).pack(
             fill="x", padx=20, pady=(6, 0)
         )
 
@@ -469,7 +464,7 @@ class AppWindow(ctk.CTkFrame):
             corner_radius=0,
             border_width=0,
             fg_color="transparent",
-            text_color=TEXT1,
+            text_color=TEXT_1,
             state="disabled",
         )
         self._textbox.pack(fill="both", expand=True, padx=8, pady=(4, 10))
@@ -480,7 +475,7 @@ class AppWindow(ctk.CTkFrame):
     def _build_action_bar(self) -> None:
         """建立動作列：複製、存檔、自動貼上、AI 潤飾、設定五顆按鈕。"""
         # Top separator
-        ctk.CTkFrame(self, height=1, fg_color=SURF3, corner_radius=0).pack(fill="x")
+        ctk.CTkFrame(self, height=1, fg_color=SURF_3, corner_radius=0).pack(fill="x")
 
         bar = ctk.CTkFrame(self, height=58, corner_radius=0, fg_color="transparent")
         bar.pack(fill="x")
@@ -493,10 +488,10 @@ class AppWindow(ctk.CTkFrame):
         ghost = dict(
             height=32, corner_radius=8,
             font=ctk.CTkFont("SF Pro Text", 13),
-            fg_color=SURF1,
-            border_width=1, border_color=SURF3,
-            text_color=TEXT2,
-            hover_color=SURF2,
+            fg_color=SURF_1,
+            border_width=1, border_color=SURF_3,
+            text_color=TEXT_2,
+            hover_color=SURF_2,
         )
 
         # 幽靈按鈕圖示尺寸（15px 在 13pt 字型旁的視覺平衡最佳）
@@ -573,8 +568,8 @@ class AppWindow(ctk.CTkFrame):
 
     def _build_status_bar(self) -> None:
         """建立底部狀態列：狀態點、狀態文字、右側快捷鍵顯示。"""
-        ctk.CTkFrame(self, height=1, fg_color=SURF3, corner_radius=0).pack(fill="x")
-        bar = ctk.CTkFrame(self, height=32, corner_radius=0, fg_color=SURF1)
+        ctk.CTkFrame(self, height=1, fg_color=SURF_3, corner_radius=0).pack(fill="x")
+        bar = ctk.CTkFrame(self, height=32, corner_radius=0, fg_color=SURF_1)
         bar.pack(fill="x", side="bottom")
         bar.pack_propagate(False)
 
@@ -582,7 +577,7 @@ class AppWindow(ctk.CTkFrame):
         inner.pack(fill="x", padx=20, pady=6)
 
         self._status_dot = ctk.CTkLabel(
-            inner, text="●", text_color=GREEN,
+            inner, text="●", text_color=SUCCESS,
             font=ctk.CTkFont(size=8),
         )
         self._status_dot.pack(side="left")
@@ -590,7 +585,7 @@ class AppWindow(ctk.CTkFrame):
         self._status_label = ctk.CTkLabel(
             inner, text="  模型載入中…",
             font=ctk.CTkFont("SF Pro Text", 12),
-            text_color=TEXT3,
+            text_color=TEXT_3,
         )
         self._status_label.pack(side="left")
 
@@ -600,7 +595,7 @@ class AppWindow(ctk.CTkFrame):
         self._hotkey_status = ctk.CTkLabel(
             inner, text=self.cfg.format_hotkey_display(),
             font=ctk.CTkFont("SF Pro Text", 12),
-            text_color=TEXT3,
+            text_color=TEXT_3,
         )
         self._hotkey_status.pack(side="right", padx=16)
 
@@ -1799,11 +1794,11 @@ class AppWindow(ctk.CTkFrame):
                 self.after(0, lambda: self._status_label.configure(
                     text=f"  就緒 ({model} · {label})"
                 ))
-                self.after(0, lambda: self._status_dot.configure(text_color=GREEN))
+                self.after(0, lambda: self._status_dot.configure(text_color=SUCCESS))
             except Exception:
                 log_error("warmup_failed", model=model)
                 self.after(0, lambda: self._status_label.configure(text="  模型載入失敗"))
-                self.after(0, lambda: self._status_dot.configure(text_color=RED))
+                self.after(0, lambda: self._status_dot.configure(text_color=DANGER))
 
         threading.Thread(target=_load, daemon=True).start()
 
@@ -1823,13 +1818,13 @@ class AppWindow(ctk.CTkFrame):
         """在視窗右下角顯示一個浮動 toast，2.8 秒後自動消失。"""
         toast = ctk.CTkFrame(
             self, corner_radius=10,
-            fg_color=SURF2,
-            border_width=1, border_color=SURF3,
+            fg_color=SURF_2,
+            border_width=1, border_color=SURF_3,
         )
         ctk.CTkLabel(
             toast, text=message,
             font=ctk.CTkFont("SF Pro Text", 13),
-            text_color=TEXT1, padx=18, pady=10,
+            text_color=TEXT_1, padx=18, pady=10,
         ).pack()
         toast.place(relx=1.0, rely=1.0, x=-20, y=-52, anchor="se")
         self.after(2800, toast.destroy)
@@ -1887,11 +1882,11 @@ class SettingsWindow(ctk.CTkToplevel):
             ctk.CTkLabel(
                 scroll, text=title.upper(),
                 font=ctk.CTkFont("SF Pro Text", 11),
-                text_color=TEXT3, anchor="w",
+                text_color=TEXT_3, anchor="w",
             ).pack(fill="x", padx=20, pady=(22, 6))
             f = ctk.CTkFrame(
                 scroll, corner_radius=12,
-                fg_color=SURF1,
+                fg_color=SURF_1,
             )
             f.pack(fill="x", padx=16, pady=(0, 4))
             return f
@@ -1903,12 +1898,12 @@ class SettingsWindow(ctk.CTkToplevel):
             ctk.CTkLabel(
                 r, text=label, anchor="w",
                 font=ctk.CTkFont("SF Pro Text", 14),
-                text_color=TEXT1,
+                text_color=TEXT_1,
             ).pack(side="left")
             widget_fn(r)
 
         def sep_line(parent) -> None:
-            ctk.CTkFrame(parent, height=1, fg_color=SURF3).pack(
+            ctk.CTkFrame(parent, height=1, fg_color=SURF_3).pack(
                 fill="x", padx=16, pady=0
             )
 
@@ -1921,10 +1916,10 @@ class SettingsWindow(ctk.CTkToplevel):
                 r, values=list(MODEL_INFO.keys()),
                 variable=self._model_var,
                 width=148, height=30, corner_radius=8,
-                fg_color=SURF2, button_color=SURF2,
-                button_hover_color=SURF3,
-                dropdown_fg_color=SURF1,
-                text_color=TEXT1,
+                fg_color=SURF_2, button_color=SURF_2,
+                button_hover_color=SURF_3,
+                dropdown_fg_color=SURF_1,
+                text_color=TEXT_1,
                 font=ctk.CTkFont("SF Pro Text", 13),
                 command=self._on_model_preview,
             ).pack(side="right")
@@ -1933,7 +1928,7 @@ class SettingsWindow(ctk.CTkToplevel):
         self._model_desc = ctk.CTkLabel(
             stt, text=MODEL_INFO.get(self.cfg.model, ""),
             font=ctk.CTkFont("SF Pro Text", 11),
-            text_color=TEXT3,
+            text_color=TEXT_3,
             wraplength=380, anchor="w",
         )
         self._model_desc.pack(fill="x", padx=16, pady=(0, 10))
@@ -1946,10 +1941,10 @@ class SettingsWindow(ctk.CTkToplevel):
                 r, values=list(LANGUAGE_OPTIONS.keys()),
                 variable=self._lang_var,
                 width=112, height=30, corner_radius=8,
-                fg_color=SURF2, button_color=SURF2,
-                button_hover_color=SURF3,
-                dropdown_fg_color=SURF1,
-                text_color=TEXT1,
+                fg_color=SURF_2, button_color=SURF_2,
+                button_hover_color=SURF_3,
+                dropdown_fg_color=SURF_1,
+                text_color=TEXT_1,
                 font=ctk.CTkFont("SF Pro Text", 13),
             ).pack(side="right")
 
@@ -1963,7 +1958,7 @@ class SettingsWindow(ctk.CTkToplevel):
 
         ctk.CTkLabel(
             hk_row, text="全域快捷鍵", anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT1,
+            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
         ).pack(side="left")
 
         hk_r = ctk.CTkFrame(hk_row, fg_color="transparent")
@@ -1972,17 +1967,17 @@ class SettingsWindow(ctk.CTkToplevel):
         self._hk_label = ctk.CTkLabel(
             hk_r, text=format_hotkey(self.cfg.hotkey),
             font=ctk.CTkFont("SF Pro Text", 13, "bold"),
-            fg_color=SURF2, text_color=TEXT1,
+            fg_color=SURF_2, text_color=TEXT_1,
             corner_radius=8, padx=12, pady=4,
         )
         self._hk_label.pack(side="left", padx=(0, 8))
 
         ctk.CTkButton(
             hk_r, text="重新綁定", width=80, height=28, corner_radius=8,
-            fg_color=BLUE_DIM,
-            hover_color=BLUE,
-            border_width=1, border_color=BLUE,
-            text_color=BLUE_HV,
+            fg_color=ACCENT_BG,
+            hover_color=ACCENT,
+            border_width=1, border_color=ACCENT,
+            text_color=ACCENT_HV,
             font=ctk.CTkFont("SF Pro Text", 12),
             command=self._rebind_hotkey,
         ).pack(side="left")
@@ -1994,10 +1989,10 @@ class SettingsWindow(ctk.CTkToplevel):
         self._autopaste_var = ctk.BooleanVar(value=self.cfg.auto_paste)
 
         sw_style = dict(
-            progress_color=BLUE,
-            button_color=TEXT1,
-            button_hover_color=TEXT2,
-            fg_color=SURF3,
+            progress_color=ACCENT,
+            button_color=TEXT_1,
+            button_hover_color=TEXT_2,
+            fg_color=SURF_3,
         )
 
         def make_sw(var, accent=None):
@@ -2028,14 +2023,14 @@ class SettingsWindow(ctk.CTkToplevel):
         model_row.pack_propagate(False)
         ctk.CTkLabel(
             model_row, text="模型名稱", anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT1,
+            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
         ).pack(side="left")
         self._ollama_model_var = ctk.StringVar(value=self.cfg.ollama_model)
         ctk.CTkEntry(
             model_row, textvariable=self._ollama_model_var,
             width=200, height=30, corner_radius=8,
-            fg_color=SURF2, border_color=SURF3,
-            text_color=TEXT1,
+            fg_color=SURF_2, border_color=SURF_3,
+            text_color=TEXT_1,
             font=ctk.CTkFont(FONT_FAMILY_MONO, 12),
         ).pack(side="right")
         sep_line(ai)
@@ -2046,14 +2041,14 @@ class SettingsWindow(ctk.CTkToplevel):
         url_row.pack_propagate(False)
         ctk.CTkLabel(
             url_row, text="服務位址", anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT1,
+            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
         ).pack(side="left")
         self._ollama_url_var = ctk.StringVar(value=self.cfg.ollama_base_url)
         ctk.CTkEntry(
             url_row, textvariable=self._ollama_url_var,
             width=200, height=30, corner_radius=8,
-            fg_color=SURF2, border_color=SURF3,
-            text_color=TEXT3,
+            fg_color=SURF_2, border_color=SURF_3,
+            text_color=TEXT_3,
             font=ctk.CTkFont(FONT_FAMILY_MONO, 11),
         ).pack(side="right")
         sep_line(ai)
@@ -2064,12 +2059,12 @@ class SettingsWindow(ctk.CTkToplevel):
         diag_row.pack(fill="x", padx=16, pady=(8, 4))
         self._ollama_diag_title = ctk.CTkLabel(
             diag_row, text="正在診斷…", anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 13, "bold"), text_color=TEXT1,
+            font=ctk.CTkFont("SF Pro Text", 13, "bold"), text_color=TEXT_1,
         )
         self._ollama_diag_title.pack(fill="x", padx=12, pady=(10, 2))
         self._ollama_diag_detail = ctk.CTkLabel(
             diag_row, text="", anchor="w", justify="left",
-            font=ctk.CTkFont("SF Pro Text", 11), text_color=TEXT3,
+            font=ctk.CTkFont("SF Pro Text", 11), text_color=TEXT_3,
             wraplength=520,
         )
         self._ollama_diag_detail.pack(fill="x", padx=12, pady=(0, 4))
@@ -2101,14 +2096,14 @@ class SettingsWindow(ctk.CTkToplevel):
         self._ollama_test_status = ctk.CTkLabel(
             test_row, text="（尚未測試）",
             anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 12), text_color=TEXT3,
+            font=ctk.CTkFont("SF Pro Text", 12), text_color=TEXT_3,
         )
         self._ollama_test_status.pack(side="left")
         ctk.CTkButton(
             test_row, text="測試連線", width=100, height=30, corner_radius=8,
-            fg_color=SURF2, text_color=TEXT1,
-            hover_color=SURF3,
-            border_width=1, border_color=SURF3,
+            fg_color=SURF_2, text_color=TEXT_1,
+            hover_color=SURF_3,
+            border_width=1, border_color=SURF_3,
             font=ctk.CTkFont("SF Pro Text", 12),
             command=self._test_ollama,
         ).pack(side="right")
@@ -2138,7 +2133,7 @@ class SettingsWindow(ctk.CTkToplevel):
         hot_row.pack_propagate(False)
         ctk.CTkLabel(
             hot_row, text="Prompt 熱重載", anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT1,
+            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
         ).pack(side="left")
         self._hot_reload_var = ctk.BooleanVar(value=self.cfg.prompt_hot_reload)
         ctk.CTkSwitch(
@@ -2147,8 +2142,8 @@ class SettingsWindow(ctk.CTkToplevel):
         ).pack(side="right", padx=(8, 0))
         ctk.CTkButton(
             hot_row, text="立即重新載入", width=110, height=28, corner_radius=8,
-            fg_color=SURF2, text_color=TEXT1,
-            hover_color=SURF3, border_width=1, border_color=SURF3,
+            fg_color=SURF_2, text_color=TEXT_1,
+            hover_color=SURF_3, border_width=1, border_color=SURF_3,
             font=ctk.CTkFont("SF Pro Text", 12),
             command=self._reload_prompts_now,
         ).pack(side="right", padx=(8, 0))
@@ -2164,15 +2159,15 @@ class SettingsWindow(ctk.CTkToplevel):
         dict_path_row.pack_propagate(False)
         ctk.CTkLabel(
             dict_path_row, text="字典檔路徑", anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT1,
+            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
         ).pack(side="left")
         self._dict_path_var = ctk.StringVar(value=self.cfg.dictionary_path)
         ctk.CTkEntry(
             dict_path_row, textvariable=self._dict_path_var,
             placeholder_text="(預設 ~/.whisper_app/dictionary.json)",
             width=220, height=30, corner_radius=8,
-            fg_color=SURF2, border_color=SURF3,
-            text_color=TEXT3,
+            fg_color=SURF_2, border_color=SURF_3,
+            text_color=TEXT_3,
             font=ctk.CTkFont(FONT_FAMILY_MONO, 11),
         ).pack(side="right")
         sep_line(dsec)
@@ -2182,13 +2177,13 @@ class SettingsWindow(ctk.CTkToplevel):
         dict_btn_row.pack_propagate(False)
         self._dict_status_label = ctk.CTkLabel(
             dict_btn_row, text="", anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 12), text_color=TEXT3,
+            font=ctk.CTkFont("SF Pro Text", 12), text_color=TEXT_3,
         )
         self._dict_status_label.pack(side="left")
         ctk.CTkButton(
             dict_btn_row, text="用預設編輯器開啟", width=150, height=30, corner_radius=8,
-            fg_color=SURF2, text_color=TEXT1,
-            hover_color=SURF3, border_width=1, border_color=SURF3,
+            fg_color=SURF_2, text_color=TEXT_1,
+            hover_color=SURF_3, border_width=1, border_color=SURF_3,
             font=ctk.CTkFont("SF Pro Text", 12),
             command=self._open_dictionary_file,
         ).pack(side="right")
@@ -2211,7 +2206,7 @@ class SettingsWindow(ctk.CTkToplevel):
         retention_row.pack_propagate(False)
         ctk.CTkLabel(
             retention_row, text="保留天數（0 = 永久）", anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT1,
+            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
         ).pack(side="left")
         self._history_retention_var = tk.StringVar(
             value=str(self.cfg.history_retention_days)
@@ -2219,7 +2214,7 @@ class SettingsWindow(ctk.CTkToplevel):
         ctk.CTkEntry(
             retention_row, textvariable=self._history_retention_var,
             width=90, height=30, corner_radius=8,
-            fg_color=SURF2, border_color=SURF3, text_color=TEXT1,
+            fg_color=SURF_2, border_color=SURF_3, text_color=TEXT_1,
             font=ctk.CTkFont(FONT_FAMILY_MONO, 13),
             justify="right",
         ).pack(side="right")
@@ -2235,10 +2230,10 @@ class SettingsWindow(ctk.CTkToplevel):
             pr.pack_propagate(False)
             ctk.CTkLabel(pr, text=label, anchor="w",
                          font=ctk.CTkFont("SF Pro Text", 13),
-                         text_color=TEXT1).pack(side="left")
+                         text_color=TEXT_1).pack(side="left")
             ctk.CTkLabel(pr, text=path, anchor="e",
                          font=ctk.CTkFont("SF Pro Text", 11),
-                         text_color=TEXT3).pack(side="right")
+                         text_color=TEXT_3).pack(side="right")
 
         ctk.CTkButton(
             about, text="開啟設定資料夾", width=156, height=28,
@@ -2283,8 +2278,8 @@ class SettingsWindow(ctk.CTkToplevel):
         ).pack(side="left")
 
         # ── Buttons ───────────────────────────────────────────────────────
-        ctk.CTkFrame(self, height=1, fg_color=SURF3, corner_radius=0).pack(fill="x")
-        btn_bar = ctk.CTkFrame(self, height=60, fg_color=SURF1, corner_radius=0)
+        ctk.CTkFrame(self, height=1, fg_color=SURF_3, corner_radius=0).pack(fill="x")
+        btn_bar = ctk.CTkFrame(self, height=60, fg_color=SURF_1, corner_radius=0)
         btn_bar.pack(fill="x", side="bottom")
         btn_bar.pack_propagate(False)
 
@@ -2293,17 +2288,17 @@ class SettingsWindow(ctk.CTkToplevel):
 
         ctk.CTkButton(
             inner, text="取消", width=88, height=36, corner_radius=8,
-            fg_color=SURF2, text_color=TEXT2,
-            hover_color=SURF3,
-            border_width=1, border_color=SURF3,
+            fg_color=SURF_2, text_color=TEXT_2,
+            hover_color=SURF_3,
+            border_width=1, border_color=SURF_3,
             font=ctk.CTkFont("SF Pro Text", 14),
             command=self.destroy,
         ).pack(side="left", padx=(0, 8))
 
         ctk.CTkButton(
             inner, text="儲存", width=88, height=36, corner_radius=8,
-            fg_color=BLUE, hover_color=BLUE_HV,
-            text_color=TEXT1,
+            fg_color=ACCENT, hover_color=ACCENT_HV,
+            text_color=TEXT_1,
             font=ctk.CTkFont("SF Pro Text", 14, "bold"),
             command=self._save,
         ).pack(side="left")
@@ -2408,7 +2403,7 @@ class SettingsWindow(ctk.CTkToplevel):
         try:
             subprocess.run(["open", str(path)])
             self._dict_status_label.configure(
-                text=f"已開啟 {path.name}", text_color=TEXT3,
+                text=f"已開啟 {path.name}", text_color=TEXT_3,
             )
         except Exception as e:
             self._dict_status_label.configure(
@@ -2425,7 +2420,7 @@ class SettingsWindow(ctk.CTkToplevel):
         url   = self._ollama_url_var.get().strip() or "http://localhost:11434"
         model = self._ollama_model_var.get().strip() or "qwen2.5:3b-instruct"
 
-        self._ollama_test_status.configure(text="測試中…", text_color=TEXT3)
+        self._ollama_test_status.configure(text="測試中…", text_color=TEXT_3)
 
         def _run():
             probe = OllamaClient(OllamaConfig(
@@ -2647,14 +2642,14 @@ class HotkeyBindDialog(ctk.CTkToplevel):
             self,
             text="請按下想要的快捷鍵組合\n（按下後鬆開確認）",
             font=ctk.CTkFont("SF Pro Text", 14),
-            text_color=TEXT2,
+            text_color=TEXT_2,
             justify="center",
         ).pack(pady=(28, 12))
 
         self._detect_label = ctk.CTkLabel(
             self, text="等待按鍵…",
             font=ctk.CTkFont("SF Pro Display", 20, "bold"),
-            fg_color=SURF2, text_color=TEXT1,
+            fg_color=SURF_2, text_color=TEXT_1,
             corner_radius=10, padx=24, pady=12,
         )
         self._detect_label.pack(pady=4)
@@ -2664,9 +2659,9 @@ class HotkeyBindDialog(ctk.CTkToplevel):
 
         ctk.CTkButton(
             bar, text="取消", width=90, height=32, corner_radius=8,
-            fg_color=SURF2, text_color=TEXT2,
-            hover_color=SURF3,
-            border_width=1, border_color=SURF3,
+            fg_color=SURF_2, text_color=TEXT_2,
+            hover_color=SURF_3,
+            border_width=1, border_color=SURF_3,
             font=ctk.CTkFont("SF Pro Text", 13),
             command=self.destroy,
         ).pack(side="left", padx=6)
@@ -2674,8 +2669,8 @@ class HotkeyBindDialog(ctk.CTkToplevel):
         self._apply_btn = ctk.CTkButton(
             bar, text="確認套用", width=90, height=32, corner_radius=8,
             state="disabled",
-            fg_color=BLUE, hover_color=BLUE_HV,
-            text_color=TEXT1,
+            fg_color=ACCENT, hover_color=ACCENT_HV,
+            text_color=TEXT_1,
             font=ctk.CTkFont("SF Pro Text", 13, "bold"),
             command=self._apply,
         )
@@ -2846,7 +2841,7 @@ class AccessibilityDialog(ctk.CTkToplevel):
                 "4. 重新啟動此 App"
             ),
             font=ctk.CTkFont("SF Pro Text", 13),
-            text_color=TEXT2,
+            text_color=TEXT_2,
             justify="left",
         ).pack(padx=32, pady=4)
 
@@ -2855,17 +2850,17 @@ class AccessibilityDialog(ctk.CTkToplevel):
 
         ctk.CTkButton(
             bar, text="跳過", width=110, height=34, corner_radius=8,
-            fg_color=SURF2, text_color=TEXT2,
-            hover_color=SURF3,
-            border_width=1, border_color=SURF3,
+            fg_color=SURF_2, text_color=TEXT_2,
+            hover_color=SURF_3,
+            border_width=1, border_color=SURF_3,
             font=ctk.CTkFont("SF Pro Text", 13),
             command=self.destroy,
         ).pack(side="left", padx=6)
 
         ctk.CTkButton(
             bar, text="開啟系統設定", width=130, height=34, corner_radius=8,
-            fg_color=BLUE, hover_color=BLUE_HV,
-            text_color=TEXT1,
+            fg_color=ACCENT, hover_color=ACCENT_HV,
+            text_color=TEXT_1,
             font=ctk.CTkFont("SF Pro Text", 13, "bold"),
             command=self._open_prefs,
         ).pack(side="left", padx=6)

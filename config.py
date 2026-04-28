@@ -145,6 +145,29 @@ class Config:
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             # 只取 dataclass 有定義的欄位，忽略未知欄位（向前相容）
             valid_data = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
+            # 型別驗證：把不符合 dataclass 宣告型別的欄位「靜默丟棄」回預設值，
+            # 避免有人手動改壞 config.json（例 hotkey=12345）後 .lower() 崩潰。
+            # 因 `from __future__ import annotations`，cls.__annotations__ 的值
+            # 是 string 形式（如 "str"、"bool"、"int"、"Optional[str]"）。
+            # 只做最低限度檢查：str/bool/int 三類；複合（Optional/list/dict）放行。
+            _SIMPLE_TYPE_CHECK = {
+                "str":  lambda v: isinstance(v, str),
+                "bool": lambda v: isinstance(v, bool),
+                "int":  lambda v: isinstance(v, int) and not isinstance(v, bool),
+            }
+            for fname, ftype_str in cls.__annotations__.items():
+                if fname not in valid_data:
+                    continue
+                check = _SIMPLE_TYPE_CHECK.get(ftype_str)
+                if check is None:
+                    continue   # 複合型別不檢
+                v = valid_data[fname]
+                if not check(v):
+                    log.warning(
+                        f"CONFIG: field {fname!r} expected {ftype_str}, "
+                        f"got {type(v).__name__}={v!r}, dropping → 用預設值"
+                    )
+                    valid_data.pop(fname)
             cfg = cls(**valid_data)
 
             # 安全檢查：cmd+shift+space 與 macOS 輸入法熱鍵衝突，強制重設

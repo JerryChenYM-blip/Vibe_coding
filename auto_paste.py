@@ -86,8 +86,11 @@ def paste_to_app(
     # ── 步驟 2：把目標 App 拉到前景 ─────────────────────────────────────────
     if app_name:
         try:
+            # AppleScript 字串內必須 escape 雙引號和反斜線，否則 app 名含
+            # `"`（罕見但理論上可能）會打斷 `tell application "..."` 語法。
+            safe_name = app_name.replace("\\", "\\\\").replace('"', '\\"')
             subprocess.run(
-                ["osascript", "-e", f'tell application "{app_name}" to activate'],
+                ["osascript", "-e", f'tell application "{safe_name}" to activate'],
                 timeout=3,   # 若 App 無回應，最多等 3 秒
             )
             time.sleep(activate_delay)   # 給 App 時間完成視窗切換，再送 ⌘V

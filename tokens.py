@@ -159,34 +159,5 @@ RENDER_TICK_MS        = 50
 SPINNER = ["⠋", "⠙", "⠸", "⠴", "⠦", "⠇"]   # 六格輪播，循環使用
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  向後相容別名（Legacy Aliases）
-#  過渡期保留，讓舊程式碼不需立即修改。
-#  新程式碼請使用上方的正式名稱，舊別名最終將移除。
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# 表面層次舊名
-SURF1 = SURF_1
-SURF2 = SURF_2
-SURF3 = SURF_3
-SURF4 = SURF_4
-
-# 文字層次舊名
-TEXT1 = TEXT_1
-TEXT2 = TEXT_2
-TEXT3 = TEXT_3
-TEXT4 = TEXT_4
-
-# 強調色舊名（→ ACCENT 系列）
-BLUE      = ACCENT
-BLUE_HV   = ACCENT_HV
-BLUE_DIM  = ACCENT_BG
-
-# 語意色舊名
-GREEN     = SUCCESS
-GREEN_DIM = SUCCESS_DIM
-
-RED       = DANGER
-RED_DIM   = DANGER_DIM
-
-ORANGE    = WARN
+# 過渡期的 legacy aliases（SURF1..4 / TEXT1..4 / BLUE / GREEN / RED / ORANGE）
+# 已在 v2.3.1 全部移除。所有使用方都已遷移到正式命名（SURF_1 / ACCENT 等）。
