@@ -24,9 +24,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
+
+from logger import get_logger, log_error
+
+log = get_logger("dictionary")
 
 DEFAULT_PATH = Path.home() / ".whisper_app" / "dictionary.json"
+
+# 公開的 path 型別：接受 str 或 Path（gui.py 多處都把字串路徑直接傳進來）
+PathLike = Union[str, Path]
 
 # 內建範例，讓使用者 json 檔不存在時有東西可以參考
 _BOOTSTRAP = {
@@ -38,28 +45,43 @@ _BOOTSTRAP = {
 }
 
 
-def ensure_file(path: Path = DEFAULT_PATH) -> Path:
-    """檔案不存在時寫入一個最小範例；回傳最終路徑。"""
-    if path.exists():
-        return path
+def ensure_file(path: PathLike = DEFAULT_PATH) -> Path:
+    """檔案不存在時寫入一個最小範例；回傳最終路徑（總是 Path）。"""
+    p = Path(path).expanduser() if not isinstance(path, Path) else path
+    if p.exists():
+        return p
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
             json.dumps(_BOOTSTRAP, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-    except Exception as e:
-        print(f"DICTIONARY: ensure_file failed: {e}")
-    return path
+    except Exception:
+        log_error("dictionary_ensure_file_failed", path=str(p))
+    return p
 
 
-def load_terms(path: Path = DEFAULT_PATH) -> list[str]:
-    """讀字典，回傳純 term 字串 list；任何錯誤回空 list，永不拋例外。"""
+def load_terms(path: PathLike = DEFAULT_PATH) -> list[str]:
+    """讀字典，回傳純 term 字串 list；任何錯誤回空 list，永不拋例外。
+
+    `path` 可以是 `str` 或 `Path`（gui.py 多處傳純字串）。
+    支援兩種 schema：
+      • 純 string list：`["term1", "term2"]`
+      • 物件 list：`{"terms": [{"term": "..."}, ...]}`
+    """
     try:
-        if not path.exists():
+        p = Path(path).expanduser() if not isinstance(path, Path) else path
+        if not p.exists():
             return []
-        data = json.loads(path.read_text(encoding="utf-8"))
-        raw = data.get("terms", [])
+        data = json.loads(p.read_text(encoding="utf-8"))
+        # 支援頂層直接是 list（最簡單格式）或 {"terms": [...]} 物件包裝
+        if isinstance(data, list):
+            raw = data
+        elif isinstance(data, dict):
+            raw = data.get("terms", [])
+        else:
+            raw = []
+
         out: list[str] = []
         for entry in raw:
             if isinstance(entry, str):
@@ -80,6 +102,6 @@ def load_terms(path: Path = DEFAULT_PATH) -> list[str]:
             seen.add(k)
             dedup.append(t)
         return dedup
-    except Exception as e:
-        print(f"DICTIONARY: load_terms failed: {e}")
+    except Exception:
+        log_error("dictionary_load_terms_failed", path=str(path))
         return []

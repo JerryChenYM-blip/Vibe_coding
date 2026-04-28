@@ -237,7 +237,7 @@ class HistoryStore:
                 with self._connect() as conn:
                     cur = conn.execute(
                         "SELECT * FROM transcriptions "
-                        "ORDER BY timestamp DESC LIMIT ?",
+                        "ORDER BY timestamp DESC, id DESC LIMIT ?",
                         (limit,),
                     )
                     return [_row_to_entry(r) for r in cur.fetchall()]
@@ -270,7 +270,7 @@ class HistoryStore:
                         "SELECT t.* FROM transcriptions t "
                         "JOIN transcriptions_fts f ON t.id = f.rowid "
                         "WHERE transcriptions_fts MATCH ? "
-                        "ORDER BY t.timestamp DESC LIMIT ?",
+                        "ORDER BY t.timestamp DESC, t.id DESC LIMIT ?",
                         (safe, limit),
                     )
                     return [_row_to_entry(r) for r in cur.fetchall()]
@@ -294,7 +294,7 @@ class HistoryStore:
                         "SELECT * FROM transcriptions "
                         "WHERE raw_text LIKE ? ESCAPE '\\' "
                         "   OR polished_text LIKE ? ESCAPE '\\' "
-                        "ORDER BY timestamp DESC LIMIT ?",
+                        "ORDER BY timestamp DESC, id DESC LIMIT ?",
                         (like_pat, like_pat, limit),
                     )
                     return [_row_to_entry(r) for r in cur.fetchall()]

@@ -196,13 +196,20 @@ class Config:
         return LANGUAGE_OPTIONS.get(self.language)
 
     def format_hotkey_display(self) -> str:
-        """將熱鍵字串格式化為 macOS 符號表示，例如 'cmd+alt+r' → '⌘⌥R'。"""
+        """將熱鍵字串格式化為 macOS 符號表示，例如 'cmd+alt+r' → '⌘⌥R'。
+
+        支援 macOS 慣稱別名（option/command/control/opt 等）。為避免與
+        hotkey_manager._SYMBOL_MAP 重複維護，此處 inline 同樣表。
+        """
         symbols = {
-            "cmd":   "⌘",
-            "ctrl":  "⌃",
-            "alt":   "⌥",
+            "cmd": "⌘", "command": "⌘",
+            "ctrl": "⌃", "control": "⌃",
+            "alt": "⌥", "option": "⌥", "opt": "⌥",
             "shift": "⇧",
             "space": "Space",
+            "return": "↩", "enter": "↩",
+            "tab": "⇥",
+            "esc": "⎋", "escape": "⎋",
         }
         parts = self.hotkey.lower().split("+")
-        return "".join(symbols.get(p, p.capitalize()) for p in parts)
+        return "".join(symbols.get(p, p.upper()) for p in parts)

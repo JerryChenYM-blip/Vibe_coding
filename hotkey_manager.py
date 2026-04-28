@@ -61,12 +61,22 @@ def check_accessibility() -> bool:
 # ── 符號對照表 ────────────────────────────────────────────────────────────────
 
 # 組合鍵字串中的修飾鍵名稱 → macOS 鍵盤符號
+# 同時支援 macOS 慣稱：option=alt（⌥）、command=cmd（⌘）、return=enter
 _SYMBOL_MAP: dict[str, str] = {
-    "cmd":   "⌘",
-    "ctrl":  "⌃",
-    "alt":   "⌥",
-    "shift": "⇧",
-    "space": "Space",
+    "cmd":     "⌘",
+    "command": "⌘",
+    "ctrl":    "⌃",
+    "control": "⌃",
+    "alt":     "⌥",
+    "option":  "⌥",   # macOS 慣稱
+    "opt":     "⌥",
+    "shift":   "⇧",
+    "space":   "Space",
+    "return":  "↩",
+    "enter":   "↩",
+    "tab":     "⇥",
+    "esc":     "⎋",
+    "escape":  "⎋",
 }
 
 
@@ -86,16 +96,23 @@ def parse_hotkey(combo: str) -> set:
     res: set = set()
     for p in combo.lower().split("+"):
         p = p.strip()
+        # 接受 macOS 慣稱：option=alt、command=cmd、control=ctrl、opt=alt
         if p in ("cmd", "command"):
             res.add(Key.cmd)
         elif p == "shift":
             res.add(Key.shift)
-        elif p == "alt":
+        elif p in ("alt", "option", "opt"):
             res.add(Key.alt)
-        elif p == "ctrl":
+        elif p in ("ctrl", "control"):
             res.add(Key.ctrl)
         elif p == "space":
             res.add(Key.space)
+        elif p in ("return", "enter"):
+            res.add(Key.enter)
+        elif p == "tab":
+            res.add(Key.tab)
+        elif p in ("esc", "escape"):
+            res.add(Key.esc)
         elif len(p) == 1:
             res.add(p)   # 單字元直接加入（例如 "r"）
         else:

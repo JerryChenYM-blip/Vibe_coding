@@ -1529,7 +1529,7 @@ class AppWindow(ctk.CTkFrame):
         terms = _dictionary.load_terms(path)
         self._dictionary_terms = terms
         self.transcriber.set_dictionary_terms(terms)
-        print(f"DICTIONARY: loaded {len(terms)} terms from {path}")
+        log.info(f"DICTIONARY: loaded {len(terms)} terms from {path}")
 
     def _dictionary_path(self):
         """回傳字典檔路徑（cfg 自訂或預設）。"""
