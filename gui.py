@@ -2008,6 +2008,42 @@ class SettingsWindow(ctk.CTkToplevel):
         ).pack(side="right")
         sep_line(ai)
 
+        # ── 環境診斷（Phase 4.5）─────────────────────────────────────────
+        # 給首次安裝、Ollama 缺東少西的使用者一行明確指引（含建議命令）。
+        diag_row = ctk.CTkFrame(ai, fg_color=SURF_2, corner_radius=8)
+        diag_row.pack(fill="x", padx=16, pady=(8, 4))
+        self._ollama_diag_title = ctk.CTkLabel(
+            diag_row, text="正在診斷…", anchor="w",
+            font=ctk.CTkFont("SF Pro Text", 13, "bold"), text_color=TEXT1,
+        )
+        self._ollama_diag_title.pack(fill="x", padx=12, pady=(10, 2))
+        self._ollama_diag_detail = ctk.CTkLabel(
+            diag_row, text="", anchor="w", justify="left",
+            font=ctk.CTkFont("SF Pro Text", 11), text_color=TEXT3,
+            wraplength=520,
+        )
+        self._ollama_diag_detail.pack(fill="x", padx=12, pady=(0, 4))
+        # 建議命令以等寬字 + 一鍵複製
+        self._ollama_diag_cmd_frame = ctk.CTkFrame(diag_row, fg_color="transparent")
+        self._ollama_diag_cmd_frame.pack(fill="x", padx=12, pady=(0, 10))
+        self._ollama_diag_cmd = ctk.CTkLabel(
+            self._ollama_diag_cmd_frame, text="", anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 11), text_color=ACCENT,
+            wraplength=400,
+        )
+        self._ollama_diag_cmd.pack(side="left", padx=(0, 8))
+        self._ollama_diag_copy_btn = ctk.CTkButton(
+            self._ollama_diag_cmd_frame, text="複製命令",
+            width=84, height=24, corner_radius=6,
+            font=ctk.CTkFont("SF Pro Text", 11),
+            fg_color=SURF_3, hover_color=SURF_4, text_color=TEXT_2,
+        )
+        self._ollama_diag_copy_btn.pack(side="right")
+        self._ollama_diag_copy_btn.pack_forget()   # 預設隱藏，有命令才顯示
+
+        # 啟動後立即跑一次背景診斷
+        self.after(100, self._refresh_ollama_diagnostic)
+
         # 測試連線 + 狀態標籤
         test_row = ctk.CTkFrame(ai, fg_color="transparent", height=52)
         test_row.pack(fill="x", padx=16, pady=(4, 8))
@@ -2334,6 +2370,52 @@ class SettingsWindow(ctk.CTkToplevel):
                     text=f"△ 連線成功但找不到 {model}。本機模型：{preview}",
                     text_color=WARN,
                 )
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _refresh_ollama_diagnostic(self) -> None:
+        """背景執行緒跑 onboarding.diagnose_ollama；完成後在主執行緒更新 UI。
+
+        Phase 4.5：給使用者「下一步該做什麼」的明確指示，含一鍵複製命令。
+        """
+        import onboarding
+
+        def _run():
+            url   = self._ollama_url_var.get().strip() or "http://localhost:11434"
+            model = self._ollama_model_var.get().strip() or "qwen2.5:3b-instruct"
+            try:
+                diag = onboarding.diagnose_ollama(base_url=url, recommended=model)
+                title, detail, cmd = onboarding.summarize(diag)
+            except Exception:
+                log_error("ollama_diagnostic_failed")
+                title, detail, cmd = "△ 診斷失敗", "請見終端 log", None
+            self.after(0, _apply, title, detail, cmd)
+
+        def _apply(title: str, detail: str, cmd: Optional[str]):
+            # 標題顏色：✓ 綠 / ⚠ 橙 / ✗ 紅 / 其他灰
+            color = TEXT_1
+            if   title.startswith("✓"): color = SUCCESS
+            elif title.startswith("⚠"): color = WARN
+            elif title.startswith("✗"): color = DANGER
+            self._ollama_diag_title.configure(text=title, text_color=color)
+            self._ollama_diag_detail.configure(text=detail)
+
+            if cmd:
+                self._ollama_diag_cmd.configure(text=f"$ {cmd}")
+                self._ollama_diag_copy_btn.pack(side="right")
+                # 重綁複製命令（lambda 捕獲當下的 cmd）
+                def _do_copy(c=cmd):
+                    try:
+                        import pyperclip
+                        pyperclip.copy(c)
+                        self._ollama_diag_copy_btn.configure(text="已複製")
+                        self.after(1500, lambda: self._ollama_diag_copy_btn.configure(text="複製命令"))
+                    except Exception:
+                        log_error("ollama_diag_copy_failed")
+                self._ollama_diag_copy_btn.configure(command=_do_copy)
+            else:
+                self._ollama_diag_cmd.configure(text="")
+                self._ollama_diag_copy_btn.pack_forget()
 
         threading.Thread(target=_run, daemon=True).start()
 

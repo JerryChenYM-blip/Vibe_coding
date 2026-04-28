@@ -91,11 +91,43 @@ def main() -> None:
     root.minsize(640, 750)               # 允許縮放但設最小值，防止 UI 擠爆
     root.resizable(True, True)
 
-    # macOS：嘗試設定視窗圖示（目前傳空值，待 app_icon.py 完成後填入）
+    # ── 3a. App Icon（Phase 4.1）──────────────────────────────────────────
+    # 載入 assets/icon.png 設定到 Dock / ⌘+Tab / 標題列
+    # 找不到 / PIL 載入失敗一律靜默退化為「無 icon」狀態
+    _icon_photo = None
     try:
-        root.tk.call("wm", "iconphoto", root._w)
+        from PIL import Image, ImageTk
+        icon_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "assets", "icon.png",
+        )
+        if os.path.exists(icon_path):
+            _icon_img = Image.open(icon_path).resize(
+                (128, 128), Image.Resampling.LANCZOS,
+            )
+            _icon_photo = ImageTk.PhotoImage(_icon_img)
+            root.iconphoto(True, _icon_photo)
+            # 保留 reference 防止 PhotoImage 被 GC
+            root._whisper_icon = _icon_photo
+            log.debug(f"ICON: loaded from {icon_path}")
     except Exception:
         log_error("set_dock_icon_failed")   # 非致命，只記不拋
+
+    # ── 3b. 啟動畫面（Phase 4.1）─────────────────────────────────────────
+    # 主視窗先 withdraw，splash 顯示 1.5s 後淡出 200ms，淡出完才 deiconify。
+    # 即使 splash 模組載入失敗也不能讓主視窗永久隱藏 → 用 try/finally 兜住。
+    root.withdraw()
+    try:
+        from splash import SplashScreen
+        SplashScreen(
+            root,
+            on_done=lambda: (root.deiconify(), root.lift()),
+            version="v2.2.0",
+        )
+    except Exception:
+        log_error("splash_init_failed")
+        # 無 splash 直接顯示主視窗
+        root.deiconify()
 
     # ── 4. 建立主應用程式視窗 ─────────────────────────────────────────────────
     app = AppWindow(root, cfg)
