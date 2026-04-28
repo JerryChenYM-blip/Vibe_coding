@@ -2,13 +2,13 @@
 
 > 這份檔案讓任何新的 Claude session 能無縫接手這個專案。
 > 位置：`/Users/jerrychen/project/Claude_code/CLAUDE.md`
-> 最後更新：2026-04-24（v2.2.0 發佈）
+> 最後更新：2026-04-28（v2.3.0 發佈）
 
 ---
 
 ## 1. 專案快照
 
-**Whisper Pro v2.2.0** — macOS 桌面語音轉文字 GUI 應用程式，含本地 AI 潤飾、情境路由、Voice Shortcuts、歷史紀錄。
+**Whisper Pro v2.3.0** — macOS 桌面語音轉文字 GUI 應用程式，含本地 AI 潤飾、情境路由、Voice Shortcuts、歷史紀錄、App Icon、Splash、Mini HUD、Ollama 環境診斷、設定匯入匯出。
 
 - **使用者語言**：繁體中文（回覆一律用繁體中文；程式碼註解可中英混用）
 - **目標使用者**：中英夾雜的開發者 / 知識工作者
@@ -16,7 +16,8 @@
 - **隱私**：100% 本地運算，不送雲端（Whisper + Ollama 都在本機跑；歷史紀錄存本地 SQLite）
 - **版本定位**：
   - v2.1.0（2026-04-23）：Speakly Phase 1 + 2（潤飾管線 + preset 路由 + 字典 + 熱重載）
-  - **v2.2.0（2026-04-24）：Speakly Phase 3（Voice Shortcuts + SQLite 歷史紀錄）**
+  - v2.2.0（2026-04-24）：Speakly Phase 3（Voice Shortcuts + SQLite 歷史紀錄）
+  - **v2.3.0（2026-04-28）：Speakly Phase 4.1/4.3/4.4/4.5（App Icon + Splash + Mini HUD + 匯入匯出 + Ollama 環境診斷）**
 
 ---
 
@@ -65,6 +66,10 @@ Python 版本：**3.13 arm64**（Apple Silicon）。
 ├── prompt_reloader.py    # ★ Phase 2：prompts.py / presets.py mtime 熱重載（2s 輪詢）
 ├── eval_runner.py        # ★ Phase 2：regression CLI，輸出 CSV 到 tests/reports/
 ├── history.py            # ★ Phase 3.2：SQLite 歷史紀錄（FTS5 trigram + CRUD）
+├── app_icon.py           # ★ Phase 4.1：純 PIL 手繪 App Icon 生成器（CLI）
+├── splash.py             # ★ Phase 4.1：啟動畫面 SplashScreen
+├── onboarding.py         # ★ Phase 4.5：Ollama 環境診斷（純函式，給設定 UI 用）
+├── assets/               # ★ Phase 4.1：icon.png / icon.iconset/ / WhisperPro.icns
 ├── vad.py                # VAD 靜音偵測（輔助模組）
 ├── test_hotkey.py        # 快捷鍵互動測試（legacy）
 └── test_full_app.py      # 整合測試（legacy）
@@ -229,8 +234,8 @@ class Config:
 ## 8. 目前 Git／Release 狀態（2026-04-24）
 
 ### 目前版本
-- `main` 位於 `ddfb4d3`（Phase 3.2 歷史紀錄）+ 後續 docs commit
-- 最新 tag：**`v2.2.0`**（2026-04-24 發）
+- `main` 位於 `8101349`（Phase 4.3 + 4.4）+ 後續 docs commit
+- 最新 tag：**`v2.3.0`**（2026-04-28 發）
 - 目前沒有 open PR
 
 ### 版本時間軸
@@ -239,7 +244,8 @@ class Config:
 | `v1.0.0` | 初版 | 基本錄音 / 轉錄 / 貼上 |
 | `v2.0.0` | 2026-04-19 | Ambient Chamber 光場錄音鈕 + 穩定性修復 + Speakly 規劃書 |
 | `v2.1.0` | 2026-04-23 | Phase 1 Ollama 潤飾 + Phase 2 preset / 字典 / 熱重載 + 統一日誌 + 錄音完整性 |
-| **`v2.2.0`** | 2026-04-24 | Phase 3.1 Voice Shortcuts（3 action preset）+ Phase 3.2 SQLite 歷史紀錄 |
+| `v2.2.0` | 2026-04-24 | Phase 3.1 Voice Shortcuts（3 action preset）+ Phase 3.2 SQLite 歷史紀錄 |
+| **`v2.3.0`** | 2026-04-28 | Phase 4.1 App Icon + Splash / 4.3 浮動 mini HUD / 4.4 設定匯入匯出 / 4.5 Ollama 環境診斷（4.2 menu bar 跳過待 PoC）|
 
 ### v2.1.0 PR 歷史（全部已處理）
 | # | 內容 | 狀態 |
@@ -339,6 +345,13 @@ cat ~/.whisper_app/polish_log.jsonl | jq .         # 潤飾紀錄
 - [x] **設定面板**新增歷史紀錄區段（啟用開關 + 保留天數）
 - [x] **使用手冊**補「歷史紀錄」章節 + Voice Shortcuts 使用範例
 
+### ✅ v2.3.0 完成項（2026-04-28）— Speakly Phase 4（部分）
+- [x] **Phase 4.1 App Icon + 啟動畫面**（`app_icon.py` 純 PIL 手繪生成器、`splash.py` 1.5s + 200ms 淡出、`assets/icon.png` + `WhisperPro.icns`）
+- [x] **Phase 4.3 浮動 mini HUD**（`MiniRecordingWindow` Toplevel，140×38，always-on-top，狀態圓點+計時，可開關）
+- [x] **Phase 4.4 設定匯入/匯出**（zip 含 config.json + dictionary.json + manifest.json，schema_version=1，排除隱私 history.db）
+- [x] **Phase 4.5 Ollama 環境診斷**（`onboarding.py` 純函式，4 種狀態 + 一鍵複製建議命令；自動語言偵測在 v2.1.0 已就位）
+- [ ] **Phase 4.2 menu bar icon**：因 `rumps` + tkinter event loop 共存風險，刻意跳過。要做需先 PoC 30 min
+
 ### 🟡 隨時可撿起（小打磨）
 - [ ] **間距統一** — 全面套用 `SPACE_*` 常數（目前還有裸數字）
 - [ ] **等寬數字** — 計時器、RMS 數值改用 `FONT_FAMILY_MONO`（部分已用）
@@ -346,12 +359,9 @@ cat ~/.whisper_app/polish_log.jsonl | jq .         # 潤飾紀錄
 - [ ] **舊 token 別名移除** — `SURF1..4`、`TEXT1..4`、`BLUE/GREEN/RED/ORANGE` 過渡期結束
 - [ ] **App Icon + 啟動畫面**（設計文件已寫在 `docs/superpowers/specs/2026-04-22-app-icon-splash-design.md`）
 
-### 📌 Speakly Phase 4 候選（約 2-3 天，下一個版本 v2.3.0）
-- [ ] **menu bar icon**（`rumps`，不開主視窗也能錄）
-- [ ] **浮動 mini 錄音窗**（角落電平顯示）
-- [ ] **自動偵測語言**（目前 config 可設但 UX 還沒完全打磨）
-- [ ] **設定匯入／匯出**（preset / prompt / 歷史一鍵備份）
-- [ ] **首次啟動引導**（Ollama 沒裝時提示安裝命令）
+### 📌 剩餘 Phase 4 候選（短打磨輪）
+- [ ] **Phase 4.2 menu bar icon**（`rumps`，要先做 30 min PoC 確認與 tk event loop 不衝突）
+- [ ] App Icon 視覺微調（目前膠囊轉角已平、想再優化的項目見 `assets/icon.png` 視覺檢查）
 
 ### ⏸️ Phase 5（長線，暫不規劃）
 - 即時翻譯、speaker diarization、Obsidian/Notion API 整合、iOS 端
@@ -409,6 +419,11 @@ cat ~/.whisper_app/polish_log.jsonl | jq .         # 潤飾紀錄
 | Regression 測試 | `eval_runner.py` | CLI，讀 `tests/golden_set/` → CSV 報告 |
 | 歷史紀錄 CRUD | `history.py` `HistoryStore` | SQLite + FTS5 trigram 搜尋 |
 | 歷史視窗 | `gui.py` `HistoryWindow` | Toplevel，左清單 + 右詳細 + 動作按鈕 |
+| App Icon 生成 | `app_icon.py` | 純 PIL 手繪 → 1024 主圖 + Apple iconset + `.icns` |
+| 啟動畫面 | `splash.py` `SplashScreen` | tk.Toplevel 無邊框，1.5s + 200ms 淡出 |
+| Mini 錄音 HUD | `gui.py` `MiniRecordingWindow` | 140×38 always-on-top，狀態圓點+計時 |
+| Ollama 環境診斷 | `onboarding.py` | 純函式：missing_binary / not_running / no_models / ready |
+| 設定匯入匯出 | `gui.py` SettingsWindow `_export_settings` / `_import_settings` | zip + manifest.json schema_version=1 |
 | 日誌系統 | `logger.py` | `log_action` / `log_state` / `log_settings` / `log_error` |
 | 首次權限引導 | `main.py` + `gui.py` | pynput 輔助使用權限檢查 |
 | 設定欄位 | `config.py` | dataclass + 原子性儲存 |

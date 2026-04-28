@@ -23,7 +23,11 @@
 | Regression CLI（規劃外追加）| `eval_runner.py` | ✅ 完成 | v2.1.0 | 跑 `tests/golden_set/` → CSV |
 | **Phase 3.1** | Voice Shortcuts（action preset）| ✅ 完成 | v2.2.0（`abe79be`）| 翻英文 / 條列 / 會議紀錄 3 個 action preset |
 | **Phase 3.2** | SQLite 歷史紀錄 | ✅ 完成 | v2.2.0（`ddfb4d3`）| FTS5 trigram 搜尋 + CJK LIKE fallback + 重新潤飾 |
-| **Phase 4** | 整合打磨（menu bar / mini 窗 / 自動語言）| ⏳ 待辦 | — | 見下方第 5.4 節 |
+| **Phase 4.1** | App Icon + 啟動畫面 | ✅ 完成 | v2.3.0（`9fd50b0`）| 純 PIL 手繪 + iconutil → `.icns`、SplashScreen 1.5s + 200ms 淡出 |
+| **Phase 4.2** | menu bar icon（rumps）| ⏸️ 跳過 | — | 與 tkinter event loop 共存風險，需先 PoC 30 min 才動手 |
+| **Phase 4.3** | 浮動 mini 錄音窗 | ✅ 完成 | v2.3.0（`8101349`）| MiniRecordingWindow 140×38 always-on-top，狀態圓點 + 計時 |
+| **Phase 4.4** | 設定匯入 / 匯出 | ✅ 完成 | v2.3.0（`8101349`）| zip + manifest schema_v1，排除 history.db / log |
+| **Phase 4.5** | Ollama 環境診斷 | ✅ 完成 | v2.3.0（`9fd50b0`）| 4 種狀態 + 一鍵複製建議命令；自動語言已在 v2.1 就位 |
 | **Phase 5** | 長線功能 | ⏸️ 暫不動 | — | 個人字典已提前完成 |
 
 ### Phase 1 驗收狀態（§1 末，第 265 行）
@@ -68,15 +72,11 @@
 
 ### 下一步建議
 
-v2.2.0 已含 Phase 3 全部內容。**先用一週**（§7.3 原則）累積真實使用資料（歷史紀錄就是最好的觀察點），再評估 Phase 4。
+v2.3.0 完成 Phase 4 的 4.1 / 4.3 / 4.4 / 4.5。**先用一週**累積真實使用資料（mini HUD 視覺體驗、設定匯出可用性、Ollama 引導對新機是否清楚），再評估剩下這些：
 
-之後二擇一：
-- **Phase 4**（menu bar / mini 窗 / 自動語言 / 匯入匯出 / 首次啟動引導，約 2-3 天）— 收尾到「日常使用順手度」Speakly 同級
-- **打磨**（間距統一、等寬數字、reduce-motion、App Icon 實作、移除舊 token 別名）— 小改動，可插隊做
-
-v2.2.0 的 Phase 4 決策點：
-- **4.2 menu bar** 有 `rumps` + tkinter event loop 併存風險，建議先 PoC 30 min
-- **4.1 App Icon** 設計稿已在 `docs/superpowers/specs/2026-04-22-app-icon-splash-design.md`；產出 PNG + `.icns` 即可
+- **Phase 4.2 menu bar icon** — 需先做 30 min PoC 確認 `rumps` 與 tkinter event loop 不衝突
+- **打磨**（間距統一、等寬數字、reduce-motion、移除舊 token 別名、App Icon 視覺微調）— 隨時可插
+- **Phase 5 長線**（即時翻譯／diarization／iOS）— 仍維持「先不做」立場
 
 ---
 
