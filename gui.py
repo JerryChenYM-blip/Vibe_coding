@@ -232,6 +232,11 @@ class AppWindow(ctk.CTkFrame):
         # 啟動 1 分鐘後跑一次保留策略清理（不阻塞 UI 建構）
         self.after(60_000, self._run_history_retention)
 
+        # Phase 4.3 浮動 mini 錄音窗（lazy 建立；toggle off 時為 None）
+        self._mini_window: Optional[MiniRecordingWindow] = None
+        if self.cfg.mini_recording_window:
+            self._ensure_mini_window()
+
     # ═══════════════════════════════════════════════════════════════════════
     #  BUILD UI
     # ═══════════════════════════════════════════════════════════════════════
@@ -663,6 +668,10 @@ class AppWindow(ctk.CTkFrame):
         # _stream_tick 方法已保留，未來啟用時直接排程即可。
         self._stream_tick_id = None
 
+        # Phase 4.3 mini 視窗：開啟錄音 HUD
+        if self._mini_window is not None:
+            self._mini_window.show_recording()
+
     def _transition_to_processing(self) -> None:
         """狀態機：recording → processing。停止麥克風並在背景執行緒跑 Whisper。"""
         if self._state != "recording":
@@ -698,6 +707,10 @@ class AppWindow(ctk.CTkFrame):
             daemon=True,
         ).start()
 
+        # Phase 4.3 mini 視窗：切到處理中色（琥珀）
+        if self._mini_window is not None:
+            self._mini_window.show_processing()
+
     def _transition_to_idle(self, result: Optional[TranscriptionResult] = None) -> None:
         """狀態機：任何狀態 → idle。恢復 UI 操作性；若 result 非 None 則顯示結果。"""
         if result is not None:
@@ -713,6 +726,10 @@ class AppWindow(ctk.CTkFrame):
         self._state            = "idle"
         self._state_start_time = time.perf_counter()
         self._ripples.clear()
+
+        # Phase 4.3 mini 視窗：閒置時隱藏（不 destroy，下次錄音再 show）
+        if self._mini_window is not None:
+            self._mini_window.hide()
 
         self._timer_label.configure(text="")
         self._hotkey_hint.configure(
@@ -1327,6 +1344,9 @@ class AppWindow(ctk.CTkFrame):
         elapsed = int(time.perf_counter() - self._rec_start)
         mm, ss  = divmod(elapsed, 60)
         self._timer_label.configure(text=f"{mm:02d}:{ss:02d}")
+        # Phase 4.3 mini 視窗：同步計時器
+        if self._mini_window is not None:
+            self._mini_window.update_timer(elapsed)
         self.after(1000, self._update_timer)
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -1646,6 +1666,28 @@ class AppWindow(ctk.CTkFrame):
         log_action("history_repolish", id=entry.id)
         self._start_polish(gen, entry.raw_text, target=None)
 
+    # ── Phase 4.3 mini 錄音窗 ──────────────────────────────────────────────
+
+    def _ensure_mini_window(self) -> None:
+        """Lazy 建立 MiniRecordingWindow；toggle on 時呼叫。"""
+        if self._mini_window is not None:
+            return
+        try:
+            self._mini_window = MiniRecordingWindow(self)
+        except Exception:
+            log_error("mini_window_init_failed")
+            self._mini_window = None
+
+    def _destroy_mini_window(self) -> None:
+        """Toggle off 時銷毀 mini 視窗。"""
+        if self._mini_window is None:
+            return
+        try:
+            self._mini_window.close()
+        except Exception:
+            log_error("mini_window_close_failed")
+        self._mini_window = None
+
     def _run_history_retention(self) -> None:
         """Phase 3.2：啟動後 1 分鐘跑一次保留策略清理。
 
@@ -1727,6 +1769,12 @@ class AppWindow(ctk.CTkFrame):
             self.history_store = None
             log.info("HISTORY: store disabled (DB file preserved)")
 
+        # Phase 4.3：mini 視窗 toggle 變動
+        if cfg.mini_recording_window and self._mini_window is None:
+            self._ensure_mini_window()
+        elif not cfg.mini_recording_window and self._mini_window is not None:
+            self._destroy_mini_window()
+
     # ═══════════════════════════════════════════════════════════════════════
     #  HELPERS
     # ═══════════════════════════════════════════════════════════════════════
@@ -1799,6 +1847,8 @@ class AppWindow(ctk.CTkFrame):
                 self.recorder.stop()
             except Exception:
                 log_error("recorder_stop_on_close_failed")
+        # Phase 4.3 mini 視窗也要 destroy，避免主視窗關了 HUD 還浮著
+        self._destroy_mini_window()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2143,6 +2193,12 @@ class SettingsWindow(ctk.CTkToplevel):
             command=self._open_dictionary_file,
         ).pack(side="right")
 
+        # ── 介面 (Phase 4.3) ────────────────────────────────────────────
+        ui_sec = section("介面")
+        self._mini_window_var = ctk.BooleanVar(value=self.cfg.mini_recording_window)
+        row(ui_sec, "錄音時顯示浮動 mini 視窗（右下角）",
+            make_sw(self._mini_window_var, ACCENT))
+
         # ── 歷史紀錄 (Phase 3.2) ─────────────────────────────────────────
         hist = section("歷史紀錄 (Phase 3.2)")
         self._history_enabled_var = ctk.BooleanVar(value=self.cfg.history_enabled)
@@ -2197,7 +2253,34 @@ class SettingsWindow(ctk.CTkToplevel):
             command=lambda: subprocess.run(
                 ["open", os.path.expanduser("~/.whisper_app")]
             ),
-        ).pack(anchor="w", padx=16, pady=(0, 14))
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        # 匯入 / 匯出（Phase 4.4）—— 設定 + 字典 + preset 覆寫 → zip
+        # 不含 history.db（隱私）與 polish_log.jsonl（debug 用、可能很大）
+        ie_row = ctk.CTkFrame(about, fg_color="transparent")
+        ie_row.pack(anchor="w", padx=16, pady=(0, 14))
+        ctk.CTkButton(
+            ie_row, text="匯出設定…", width=120, height=28,
+            image=get_icon("download", 14, ACCENT_HV),
+            compound="left",
+            fg_color="transparent",
+            border_width=1, border_color=SURF_3,
+            text_color=ACCENT_HV, hover_color=SURF_2,
+            font=ctk.CTkFont("SF Pro Text", 12),
+            corner_radius=8,
+            command=self._export_settings,
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            ie_row, text="匯入設定…", width=120, height=28,
+            image=get_icon("file-text", 14, ACCENT_HV),
+            compound="left",
+            fg_color="transparent",
+            border_width=1, border_color=SURF_3,
+            text_color=ACCENT_HV, hover_color=SURF_2,
+            font=ctk.CTkFont("SF Pro Text", 12),
+            corner_radius=8,
+            command=self._import_settings,
+        ).pack(side="left")
 
         # ── Buttons ───────────────────────────────────────────────────────
         ctk.CTkFrame(self, height=1, fg_color=SURF3, corner_radius=0).pack(fill="x")
@@ -2293,6 +2376,8 @@ class SettingsWindow(ctk.CTkToplevel):
             # 非法輸入保留原值，避免吃掉使用者其他改動
             log_error("history_retention_parse_failed",
                       value=self._history_retention_var.get())
+        # ── Phase 4.3 mini 視窗 ─────────────────────────────────────────
+        self.cfg.mini_recording_window = self._mini_window_var.get()
         self.cfg.save()
         self._on_save_cb(self.cfg)   # 通知主視窗（destroy 由 _save 的 finally 負責）
 
@@ -2418,6 +2503,113 @@ class SettingsWindow(ctk.CTkToplevel):
                 self._ollama_diag_copy_btn.pack_forget()
 
         threading.Thread(target=_run, daemon=True).start()
+
+    # ── 匯入 / 匯出（Phase 4.4）─────────────────────────────────────────────
+
+    _EXPORT_SCHEMA_VERSION = 1
+    _EXPORT_INCLUDED = ("config.json", "dictionary.json")
+    _EXPORT_EXCLUDED_REASON = {
+        "history.db":         "privacy — 個人語音轉錄內容不應隨設定流通",
+        "polish_log.jsonl":   "size — debug log，匯出無意義",
+        "logs/":              "size — App 運行紀錄",
+    }
+
+    def _export_settings(self) -> None:
+        """打包 config.json + dictionary.json 成單一 zip 給使用者另存。
+
+        刻意不含 history.db（隱私）、polish_log.jsonl / logs/（debug 用）。
+        """
+        import datetime, json, zipfile
+
+        default_name = f"whisper-pro-settings-{datetime.date.today():%Y%m%d}.zip"
+        out = fd.asksaveasfilename(
+            defaultextension=".zip",
+            initialfile=default_name,
+            filetypes=[("Whisper Pro 設定", "*.zip"), ("所有檔案", "*.*")],
+            title="匯出 Whisper Pro 設定",
+        )
+        if not out:
+            log_action("export_settings_cancelled")
+            return
+
+        whisper_dir = os.path.expanduser("~/.whisper_app")
+        manifest = {
+            "schema_version": self._EXPORT_SCHEMA_VERSION,
+            "exported_at":    datetime.datetime.now().isoformat(timespec="seconds"),
+            "app_version":    "v2.2.0",
+            "files":          [],
+            "excluded":       self._EXPORT_EXCLUDED_REASON,
+        }
+        try:
+            with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+                for fname in self._EXPORT_INCLUDED:
+                    src = os.path.join(whisper_dir, fname)
+                    if os.path.exists(src):
+                        zf.write(src, arcname=fname)
+                        manifest["files"].append(fname)
+                # manifest 固定寫最後（即便其他檔案缺失）
+                zf.writestr("manifest.json",
+                            json.dumps(manifest, indent=2, ensure_ascii=False))
+            log_action("export_settings_succeeded",
+                       path=out, files=",".join(manifest["files"]))
+            self._toast_via_parent(f"設定已匯出 → {os.path.basename(out)}")
+        except Exception:
+            log_error("export_settings_failed", path=out)
+            self._toast_via_parent("匯出失敗（請看 log）")
+
+    def _import_settings(self) -> None:
+        """從 zip 匯入設定；先驗證 manifest，再備份舊檔再覆寫，最後重新載入。"""
+        import json, shutil, zipfile
+
+        path = fd.askopenfilename(
+            filetypes=[("Whisper Pro 設定", "*.zip"), ("所有檔案", "*.*")],
+            title="匯入 Whisper Pro 設定",
+        )
+        if not path:
+            log_action("import_settings_cancelled")
+            return
+
+        whisper_dir = os.path.expanduser("~/.whisper_app")
+        os.makedirs(whisper_dir, exist_ok=True)
+
+        try:
+            with zipfile.ZipFile(path, "r") as zf:
+                names = zf.namelist()
+                if "manifest.json" not in names:
+                    raise ValueError("zip 內缺 manifest.json，這不是 Whisper Pro 設定檔")
+                manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+                # schema_version 檢查（目前只支援 v1）
+                if manifest.get("schema_version") != self._EXPORT_SCHEMA_VERSION:
+                    raise ValueError(
+                        f"schema_version 不相容（檔案 v{manifest.get('schema_version')}, "
+                        f"目前支援 v{self._EXPORT_SCHEMA_VERSION}）"
+                    )
+                # 備份既有檔（加 .imported_bak 後綴）+ 解出新檔
+                imported: list[str] = []
+                for fname in self._EXPORT_INCLUDED:
+                    if fname not in names:
+                        continue
+                    dst = os.path.join(whisper_dir, fname)
+                    if os.path.exists(dst):
+                        shutil.copy2(dst, dst + ".imported_bak")
+                    with zf.open(fname) as src, open(dst, "wb") as out:
+                        shutil.copyfileobj(src, out)
+                    imported.append(fname)
+            log_action("import_settings_succeeded",
+                       path=path, files=",".join(imported))
+            self._toast_via_parent(
+                f"已匯入 {len(imported)} 個檔案。請重新啟動 App 套用設定。"
+            )
+        except Exception as e:
+            log_error("import_settings_failed", path=path)
+            self._toast_via_parent(f"匯入失敗：{e}")
+
+    def _toast_via_parent(self, msg: str) -> None:
+        """從 SettingsWindow 觸發主視窗的 toast（避免設定視窗本身懸浮一個 toast）。"""
+        try:
+            self._parent._show_toast(msg)
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3044,6 +3236,133 @@ def _walk_children(widget):
     for child in widget.winfo_children():
         yield child
         yield from _walk_children(child)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MiniRecordingWindow（Phase 4.3 浮動小型 HUD）
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MiniRecordingWindow(tk.Toplevel):
+    """錄音 / 處理中的浮動 mini HUD。
+
+    螢幕右下角固定 140×38 無邊框視窗，always-on-top，跟隨 AppWindow 狀態
+    自動顯示／隱藏。內容：狀態圓點（依狀態色）+ 計時器（mm:ss）。
+    點擊 → lift 主視窗到前景。
+
+    AppWindow 透過 `update(state, elapsed_s, rms)` 推進狀態；不該由 mini
+    自己 polling，避免狀態真相分散。
+    """
+
+    WIN_W = 140
+    WIN_H = 38
+    OFFSET_X = 24    # 距螢幕右邊緣
+    OFFSET_Y = 60    # 距螢幕底邊緣（避開 Dock）
+
+    def __init__(self, master) -> None:
+        super().__init__(master)
+        self._master = master
+        self._closed = False
+
+        # 無邊框 + always-on-top
+        self.overrideredirect(True)
+        try:
+            self.attributes("-topmost", True)
+        except Exception:
+            pass
+        try:
+            self.attributes("-alpha", 0.94)
+        except Exception:
+            pass
+        self.configure(bg=SURF_2)
+
+        # 置於螢幕右下
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = sw - self.WIN_W - self.OFFSET_X
+        y = sh - self.WIN_H - self.OFFSET_Y
+        self.geometry(f"{self.WIN_W}x{self.WIN_H}+{x}+{y}")
+
+        # 1px SURF_4 邊框
+        outer = tk.Frame(self, bg=SURF_4, highlightthickness=0)
+        outer.pack(fill="both", expand=True)
+        inner = tk.Frame(outer, bg=SURF_2, highlightthickness=0)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+        # 狀態圓點 + 文字 + 計時器
+        self._dot = tk.Label(
+            inner, text="●",
+            font=(FONT_FAMILY_TEXT, 14),
+            fg=DANGER, bg=SURF_2,
+        )
+        self._dot.pack(side="left", padx=(12, 6))
+
+        self._label = tk.Label(
+            inner, text="錄音中",
+            font=(FONT_FAMILY_TEXT, 12),
+            fg=TEXT_1, bg=SURF_2,
+        )
+        self._label.pack(side="left")
+
+        self._timer = tk.Label(
+            inner, text="00:00",
+            font=(FONT_FAMILY_MONO, 12),
+            fg=TEXT_3, bg=SURF_2,
+        )
+        self._timer.pack(side="right", padx=12)
+
+        # 點擊任何處 → 把主視窗拉前
+        for w in (self, outer, inner, self._dot, self._label, self._timer):
+            w.bind("<Button-1>", self._on_click)
+
+        # 預設隱藏；由 AppWindow 透過 .show() 顯示
+        self.withdraw()
+
+    def show_recording(self) -> None:
+        """進入錄音狀態 → 顯示紅點 + 「錄音中」+ 0:00 計時。"""
+        if self._closed:
+            return
+        self._dot.configure(fg=DANGER)
+        self._label.configure(text="錄音中")
+        self._timer.configure(text="00:00")
+        self.deiconify()
+
+    def show_processing(self) -> None:
+        """進入處理中狀態 → 琥珀色 + 「轉錄中」。"""
+        if self._closed:
+            return
+        self._dot.configure(fg=WARN)
+        self._label.configure(text="轉錄中")
+        self.deiconify()
+
+    def update_timer(self, seconds: float) -> None:
+        """錄音中每秒呼叫一次更新計時器。"""
+        if self._closed:
+            return
+        s = int(seconds)
+        self._timer.configure(text=f"{s // 60:02d}:{s % 60:02d}")
+
+    def hide(self) -> None:
+        if self._closed:
+            return
+        self.withdraw()
+
+    def _on_click(self, _event) -> None:
+        """點擊 → 把主視窗拉到前景（不關閉 mini，等 AppWindow 自己 hide）。"""
+        try:
+            self._master.deiconify()
+            self._master.lift()
+            self._master.focus_force()
+        except Exception:
+            log_error("mini_window_lift_main_failed")
+
+    def close(self) -> None:
+        """主視窗關閉時呼叫，徹底銷毀避 X server 殘留 widget。"""
+        self._closed = True
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────

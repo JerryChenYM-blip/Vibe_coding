@@ -114,6 +114,11 @@ class Config:
     # 保留天數；0 = 永久保留，>0 = 主視窗啟動時刪除 N 天前的紀錄
     history_retention_days: int = 0
 
+    # ── Phase 4.3 浮動 mini 錄音窗 ──────────────────────────────────────────
+
+    # 啟用後錄音 / 處理中會在螢幕右下角顯示小型 HUD（120×40 always-on-top）
+    mini_recording_window: bool = False
+
     # ── 讀寫介面 ──────────────────────────────────────────────────────────────
 
     @classmethod
