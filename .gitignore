@@ -55,3 +55,4 @@ node_modules/
 
 # macOS 截圖等本機 artefact
 image/iShot_*.png
+tests/reports/

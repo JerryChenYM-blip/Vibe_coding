@@ -92,19 +92,50 @@ def _is_silence(audio) -> bool:
 
 
 def _is_hallucination(text: str) -> bool:
-    """判斷文字是否包含已知 Whisper 幻覺片段。
+    """判斷文字是否包含已知 Whisper 幻覺片段或重複 pattern。
 
-    寬容策略：只對「短句（< 20 字）」才用子字串檢查。長句子即使包含
-    「訂閱」「感謝」等常見幻覺關鍵字，也視為正當句子保留 — 避免誤殺。
+    雙層防護：
+      1. 重複 pattern：Whisper 在純噪音/合成音訊卡住時會輸出
+         「我先記我先記我先記...」這類同一短 unit 重複 ≥80% 的文字。
+         這類即使長度 ≥20 字也要當幻覺。
+      2. 短句關鍵字：只對「< 20 字」才用子字串檢查訂閱／字幕／作詞等
+         常見幻覺。長句即使含這些關鍵字也視為正當（避免誤殺）。
     """
     if not text:
         return True   # 空字串也算幻覺
     # 去除空白與換行後進行子字串比對
     lower = text.lower().replace(" ", "").replace("\n", "")
-    # 長句（≥ 20 字）免檢查 — 幾乎不會有 20 字以上的純幻覺
+
+    # 第一層：偵測重複 pattern（卡迴圈型幻覺）
+    if _is_repetitive(lower):
+        return True
+
+    # 第二層：長句（≥ 20 字）免檢關鍵字 — 幾乎不會有 20 字以上的純幻覺
     if len(lower) >= 20:
         return False
     return any(h.lower().replace(" ", "") in lower for h in _HALLUCINATIONS)
+
+
+def _is_repetitive(text: str) -> bool:
+    """偵測 Whisper 卡迴圈產生的重複 pattern。
+
+    判定條件：存在某長度 2–6 字的 unit，重複 ≥ 8 次且佔總文字 ≥ 80%。
+    短文字（< 16 字）跳過此檢查（短重複是正常的口語特徵）。
+    """
+    n = len(text)
+    if n < 16:
+        return False
+    for unit_len in range(2, 7):
+        # 從前 5 個位置取 unit 試算（不需 O(n²) 全掃）
+        for start in range(min(5, n - unit_len)):
+            unit = text[start:start + unit_len]
+            if not unit.strip():
+                continue
+            count = text.count(unit)
+            # 重複 ≥ 8 次且 unit × count 佔總長 ≥ 80% → 卡迴圈
+            if count >= 8 and count * unit_len / n >= 0.8:
+                return True
+    return False
 
 
 def _normalize_volume(audio, target_peak: float = 0.9, min_peak: float = 0.5):
