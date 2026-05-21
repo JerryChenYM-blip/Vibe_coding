@@ -220,6 +220,13 @@ class AppWindow(ctk.CTkFrame):
         # 穩定性（Fix 1 / 2026-05-21）：每 5 秒檢查 pynput Listener 是否還活著，
         # 死掉就自動 restart（macOS CGEventTap 偶爾會被系統內部停掉，零 log）
         self.after(self.HOTKEY_WATCHDOG_INTERVAL_MS, self._hotkey_watchdog)
+        # 穩定性（Fix 5 / 2026-05-22）：macOS Dock icon 點擊把最小化的視窗叫回來。
+        # Tk-on-macOS 透過 ::tk::mac::ReopenApplication 接收 dock reopen 事件；
+        # 非 macOS 或舊版 Tk 沒此 command，try/except 靜默 fallback。
+        try:
+            self.createcommand('::tk::mac::ReopenApplication', self._on_dock_reopen)
+        except Exception:
+            pass
         self.after(1500, self._warmup_model)
         # 開啟著的話再去探 Ollama；即使 Ollama 離線也不會卡 UI 建構。
         self.after(2000, self._refresh_ollama_health)
@@ -1865,6 +1872,21 @@ class AppWindow(ctk.CTkFrame):
             log_error("hotkey_watchdog_failed")
         finally:
             self.after(self.HOTKEY_WATCHDOG_INTERVAL_MS, self._hotkey_watchdog)
+
+    def _on_dock_reopen(self) -> None:
+        """macOS：點 Dock icon 把最小化的視窗叫回來（Fix 5 / 2026-05-22）。
+
+        Tk-on-macOS 在使用者點 Dock icon 或 reactivate App 時會呼叫
+        ::tk::mac::ReopenApplication。預設行為對 tkinter app 不一定有效
+        （視窗可能停留在 iconified 狀態），所以這裡顯式 deiconify + lift。
+        """
+        try:
+            self.deiconify()      # 取消 iconify／minimize 狀態
+            self.lift()           # 提到視窗最上層
+            self.focus_force()    # 強制取焦點
+            log_action("dock_reopen_recovered")
+        except Exception:
+            log_error("dock_reopen_failed")
 
     def _warmup_model(self) -> None:
         """背景預熱 Whisper 模型（延遲 1.5s 後執行，避免阻礙 UI 初始化）。"""
