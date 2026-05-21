@@ -1889,39 +1889,42 @@ class AppWindow(ctk.CTkFrame):
         finally:
             self.after(self.HOTKEY_WATCHDOG_INTERVAL_MS, self._hotkey_watchdog)
 
-    def _on_dock_reopen(self) -> None:
-        """macOS：點 Dock icon 把最小化的視窗叫回來（Fix 5 / 2026-05-22）。
+    # ── 視窗復原 helper（Fix 5d / 2026-05-22）─────────────────────────
+    # 根因：AppWindow 是 CTkFrame，不是 Toplevel。所有 wm_state/deiconify/iconify
+    # 方法必須在 self.winfo_toplevel()（真正的 Tk root）上呼叫，不能在 self 上。
+    # 之前 5 層保險絲全部在 self 呼叫 → 全部 AttributeError silent crash。
+    def _restore_root_if_minimized(self, source: str) -> None:
+        """共用 helper：根視窗若在 iconic/withdrawn 狀態 → 強制 deiconify + lift。
 
-        Tk-on-macOS 在使用者點 Dock icon 或 reactivate App 時會呼叫
-        ::tk::mac::ReopenApplication。預設行為對 tkinter app 不一定有效
-        （視窗可能停留在 iconified 狀態），所以這裡顯式 deiconify + lift。
+        必須走 winfo_toplevel() 拿到真正的 Tk root，因為 AppWindow 是 CTkFrame
+        本身沒有 wm_state/deiconify 等視窗管理方法。
         """
         try:
-            self.deiconify()      # 取消 iconify／minimize 狀態
-            self.lift()           # 提到視窗最上層
-            self.focus_force()    # 強制取焦點
-            log_action("dock_reopen_recovered", source="ReopenApplication")
-        except Exception:
-            log_error("dock_reopen_failed", source="ReopenApplication")
+            top = self.winfo_toplevel()
+            state = top.wm_state()  # 'normal' / 'iconic' / 'withdrawn'
+            if state in ("iconic", "withdrawn"):
+                top.deiconify()
+                top.lift()
+                log_action("dock_reopen_recovered", source=source, state=state)
+        except Exception as e:
+            log_error("dock_reopen_failed", source=source, error=str(e))
+
+    def _on_dock_reopen(self) -> None:
+        """macOS：點 Dock icon 把最小化的視窗叫回來（Fix 5 / 2026-05-22）。"""
+        try:
+            top = self.winfo_toplevel()
+            state = top.wm_state()
+            if state in ("iconic", "withdrawn"):
+                top.deiconify()
+                top.lift()
+                top.focus_force()  # 只有 ReopenApplication 顯式強制取焦
+                log_action("dock_reopen_recovered", source="ReopenApplication", state=state)
+        except Exception as e:
+            log_error("dock_reopen_failed", source="ReopenApplication", error=str(e))
 
     def _on_app_activate(self, event=None) -> None:
-        """macOS Fix 5b：App 取得焦點時若視窗是最小化狀態，自動 deiconify。
-
-        Tk <<Activate>> 虛擬事件在 App 取得焦點時觸發。比 Apple Event
-        ReopenApplication 更可靠（後者需要 Cocoa AE handler 完整註冊，
-        在 shim Python.app 上不一定 work）。
-
-        只在 iconic / withdrawn 狀態才 deiconify，避免每次 focus 都
-        干擾使用者（例如使用者只是 ⌘+Tab 切過來看一眼）。
-        """
-        try:
-            state = self.state()  # 'normal' / 'iconic' / 'withdrawn'
-            if state in ("iconic", "withdrawn"):
-                self.deiconify()
-                self.lift()
-                log_action("dock_reopen_recovered", source="Activate", state=state)
-        except Exception:
-            log_error("dock_reopen_failed", source="Activate")
+        """macOS Fix 5b：App 取得焦點時若視窗是最小化狀態，自動 deiconify。"""
+        self._restore_root_if_minimized("Activate")
 
     def _install_cocoa_activation_observer(self) -> None:
         """Fix 5c：用 PyObjC 掛 Cocoa 層通知，繞過 Tk 的 AppleEvent 投遞。
@@ -2000,14 +2003,7 @@ class AppWindow(ctk.CTkFrame):
 
     def _on_cocoa_app_activated(self) -> None:
         """Fix 5c：NSApplicationDidBecomeActive 抵達 → 視窗若最小化則 deiconify。"""
-        try:
-            state = self.state()  # 'normal' / 'iconic' / 'withdrawn'
-            if state in ("iconic", "withdrawn"):
-                self.deiconify()
-                self.lift()
-                log_action("dock_reopen_recovered", source="CocoaActive", state=state)
-        except Exception:
-            log_error("dock_reopen_failed", source="CocoaActive")
+        self._restore_root_if_minimized("CocoaActive")
 
     def _on_cocoa_app_will_activate(self) -> None:
         """Plan B / Fix 5c v2：NSApplicationWillBecomeActive 抵達（最關鍵的 fallback）。
@@ -2016,14 +2012,7 @@ class AppWindow(ctk.CTkFrame):
         不依賴 delegate、不被 Tk 的 applicationShouldHandleReopen=NO 攔截。
         當 Dock 點擊／視窗縮圖點擊／Cmd+Tab／Spotlight 開啟本 App 時都會送達。
         """
-        try:
-            state = self.state()
-            if state in ("iconic", "withdrawn"):
-                self.deiconify()
-                self.lift()
-                log_action("dock_reopen_recovered", source="CocoaWillActive", state=state)
-        except Exception:
-            log_error("dock_reopen_failed", source="CocoaWillActive")
+        self._restore_root_if_minimized("CocoaWillActive")
 
     def _poll_window_visibility(self) -> None:
         """Plan C / Fix 5c v3：每 500ms 輪詢，偵測「App 重新 active + 視窗 iconic」。
@@ -2042,13 +2031,9 @@ class AppWindow(ctk.CTkFrame):
             self._last_nsapp_active = now_active
 
             if transitioned_to_active:
-                state = self.state()
-                if state in ("iconic", "withdrawn"):
-                    self.deiconify()
-                    self.lift()
-                    log_action("dock_reopen_recovered", source="Poll", state=state)
-        except Exception:
-            log_error("poll_visibility_failed")
+                self._restore_root_if_minimized("Poll")
+        except Exception as e:
+            log_error("poll_visibility_failed", error=str(e))
         finally:
             self.after(500, self._poll_window_visibility)
 
