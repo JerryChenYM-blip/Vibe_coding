@@ -145,6 +145,12 @@ class AppWindow(ctk.CTkFrame):
     快捷鍵管理（pynput）、自動貼上（auto_paste）等所有核心邏輯。
     """
 
+    # 穩定性（Fix 1 / 2026-05-21）：pynput Listener 心跳檢查週期。
+    # macOS CGEventTap 在 focus 切換、TCC state change、sleep/wake 後偶爾會失效；
+    # pynput 內部不會自動恢復，listener thread 安靜結束、零 log 線索。
+    # 5 秒是權衡：> 10s 使用者感知太慢，< 1s 過密無意義（running 檢查 ~µs）。
+    HOTKEY_WATCHDOG_INTERVAL_MS = 5000
+
     def __init__(self, master: ctk.CTk, cfg: Config) -> None:
         super().__init__(master, fg_color=BG, corner_radius=0)
         self.pack(fill="both", expand=True)
@@ -206,6 +212,9 @@ class AppWindow(ctk.CTkFrame):
         self.after(0, lambda: log.info(
             f"GUI: first idle tick reached at t={time.monotonic():.3f}"
         ))
+        # 穩定性（Fix 1 / 2026-05-21）：每 5 秒檢查 pynput Listener 是否還活著，
+        # 死掉就自動 restart（macOS CGEventTap 偶爾會被系統內部停掉，零 log）
+        self.after(self.HOTKEY_WATCHDOG_INTERVAL_MS, self._hotkey_watchdog)
         self.after(1500, self._warmup_model)
         # 開啟著的話再去探 Ollama；即使 Ollama 離線也不會卡 UI 建構。
         self.after(2000, self._refresh_ollama_health)
@@ -1807,6 +1816,25 @@ class AppWindow(ctk.CTkFrame):
         if not is_pynput_available():
             return
         self.hotkey_mgr.restart(self.cfg.hotkey)
+
+    def _hotkey_watchdog(self) -> None:
+        """週期性檢查 pynput Listener 還活著嗎；死了就 restart。
+
+        Fix 1 / 2026-05-21：macOS CGEventTap 在 focus 切換、TCC state change、
+        sleep/wake 後偶爾會失效。pynput 內部不會自動恢復、listener thread
+        安靜結束，沒有任何 log（這是最坑的地方）。watchdog 是補救網。
+        """
+        try:
+            mgr = self.hotkey_mgr
+            if is_pynput_available() and mgr._listener is not None:
+                if not mgr._listener.running:
+                    log.warning("HOTKEY: listener died unexpectedly — restarting")
+                    log_action("hotkey_listener_auto_restarted")
+                    mgr.restart(self.cfg.hotkey)
+        except Exception:
+            log_error("hotkey_watchdog_failed")
+        finally:
+            self.after(self.HOTKEY_WATCHDOG_INTERVAL_MS, self._hotkey_watchdog)
 
     def _warmup_model(self) -> None:
         """背景預熱 Whisper 模型（延遲 1.5s 後執行，避免阻礙 UI 初始化）。"""
