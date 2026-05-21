@@ -1930,11 +1930,26 @@ class AppWindow(ctk.CTkFrame):
         """
         try:
             import objc
-            from Foundation import NSObject, NSNotificationCenter
+            from Foundation import NSObject, NSNotificationCenter, NSBundle
             from AppKit import (
                 NSApplication,
                 NSApplicationDidBecomeActiveNotification,
+                NSApplicationWillBecomeActiveNotification,
             )
+
+            # === Runtime 診斷（Fix 5c v2 / 2026-05-22）===
+            # 根因確認：bash launcher exec Python 可能讓 LaunchServices 沒
+            # 把 PID 綁到 shim Python.app 的 bundle id → AppleEvent 寄不到。
+            # 印出 runtime bundle id + delegate 狀態確認假設。
+            try:
+                bid = NSBundle.mainBundle().bundleIdentifier()
+                delegate = NSApplication.sharedApplication().delegate()
+                log.info(
+                    f"COCOA DIAG: bundle_id={bid!r} "
+                    f"delegate={type(delegate).__name__ if delegate else 'None'}"
+                )
+            except Exception as e:
+                log.warning(f"COCOA DIAG: failed - {e}")
 
             # 用 closure 把 self 帶進 Objective-C method（避免 NSObject 子類保
             # 留 tk 物件參照造成循環引用）
@@ -1948,20 +1963,37 @@ class AppWindow(ctk.CTkFrame):
                     except Exception:
                         pass
 
+                def appWillBecomeActive_(self, notification):
+                    # Plan B（Apple Dev Forum 706772）：用 WillBecomeActive 而非
+                    # DidBecomeActive，因為前者由 NSApplication core 觸發、不經
+                    # delegate、不被 Tk 的 applicationShouldHandleReopen=NO 影響。
+                    try:
+                        tk_root.after(0, tk_root._on_cocoa_app_will_activate)
+                    except Exception:
+                        pass
+
             self._cocoa_activation_observer = _ActivationObserver.alloc().init()
-            NSNotificationCenter.defaultCenter() \
-                .addObserver_selector_name_object_(
-                    self._cocoa_activation_observer,
-                    b"appBecameActive:",
-                    NSApplicationDidBecomeActiveNotification,
-                    NSApplication.sharedApplication(),
-                )
-            log.info("COCOA: NSApplicationDidBecomeActive observer installed")
+            nc = NSNotificationCenter.defaultCenter()
+            # 雙保險：DidBecomeActive（事後）+ WillBecomeActive（事前）
+            # 後者是 Plan B 重點 — SwiftUI 同類 bug 驗證唯一有效的 workaround
+            nc.addObserver_selector_name_object_(
+                self._cocoa_activation_observer,
+                b"appBecameActive:",
+                NSApplicationDidBecomeActiveNotification,
+                NSApplication.sharedApplication(),
+            )
+            nc.addObserver_selector_name_object_(
+                self._cocoa_activation_observer,
+                b"appWillBecomeActive:",
+                NSApplicationWillBecomeActiveNotification,
+                NSApplication.sharedApplication(),
+            )
+            log.info("COCOA: observers installed (Did + Will BecomeActive)")
         except Exception as e:
             log_error("cocoa_observer_install_failed", error=str(e))
 
     def _on_cocoa_app_activated(self) -> None:
-        """Fix 5c：Cocoa 通知抵達主執行緒 → 視窗若最小化則 deiconify。"""
+        """Fix 5c：NSApplicationDidBecomeActive 抵達 → 視窗若最小化則 deiconify。"""
         try:
             state = self.state()  # 'normal' / 'iconic' / 'withdrawn'
             if state in ("iconic", "withdrawn"):
@@ -1970,6 +2002,22 @@ class AppWindow(ctk.CTkFrame):
                 log_action("dock_reopen_recovered", source="CocoaActive", state=state)
         except Exception:
             log_error("dock_reopen_failed", source="CocoaActive")
+
+    def _on_cocoa_app_will_activate(self) -> None:
+        """Plan B / Fix 5c v2：NSApplicationWillBecomeActive 抵達（最關鍵的 fallback）。
+
+        Apple Dev Forum 706772 + FB9754295 確認此通知是 NSApplication core 觸發，
+        不依賴 delegate、不被 Tk 的 applicationShouldHandleReopen=NO 攔截。
+        當 Dock 點擊／視窗縮圖點擊／Cmd+Tab／Spotlight 開啟本 App 時都會送達。
+        """
+        try:
+            state = self.state()
+            if state in ("iconic", "withdrawn"):
+                self.deiconify()
+                self.lift()
+                log_action("dock_reopen_recovered", source="CocoaWillActive", state=state)
+        except Exception:
+            log_error("dock_reopen_failed", source="CocoaWillActive")
 
     def _warmup_model(self) -> None:
         """背景預熱 Whisper 模型（延遲 1.5s 後執行，避免阻礙 UI 初始化）。"""
