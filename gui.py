@@ -231,6 +231,12 @@ class AppWindow(ctk.CTkFrame):
         except Exception:
             pass
         self.bind("<<Activate>>", self._on_app_activate)
+        # Fix 5c / 2026-05-22：實測診斷顯示 NSApp delegate 為 None — Tk 沒設好
+        # NSApplicationDelegate，AppleEvent kAEReopenApplication 沒人接收，所以
+        # 上面兩條（::tk::mac::ReopenApplication + <<Activate>>）都不會觸發。
+        # 改用 PyObjC 直接掛 Cocoa 層的 NSApplicationDidBecomeActiveNotification，
+        # 不依賴 Tk 中介。失敗只 log，不阻擋啟動。
+        self._install_cocoa_activation_observer()
         self.after(1500, self._warmup_model)
         # 開啟著的話再去探 Ollama；即使 Ollama 離線也不會卡 UI 建構。
         self.after(2000, self._refresh_ollama_health)
@@ -1910,6 +1916,60 @@ class AppWindow(ctk.CTkFrame):
                 log_action("dock_reopen_recovered", source="Activate", state=state)
         except Exception:
             log_error("dock_reopen_failed", source="Activate")
+
+    def _install_cocoa_activation_observer(self) -> None:
+        """Fix 5c：用 PyObjC 掛 Cocoa 層通知，繞過 Tk 的 AppleEvent 投遞。
+
+        實測診斷顯示我們 process 的 NSApp.delegate 為 None — kAEReopenApplication
+        沒有人接收。Tk 也沒有把 reopen 事件正確轉成 <<Activate>>。所以從
+        Cocoa NSNotificationCenter 直接訂閱 NSApplicationDidBecomeActive，
+        不依賴 Tk / AppleEvent / delegate。
+
+        當任何方式讓本 App 取得焦點（Dock 圖示／視窗縮圖、Cmd+Tab、Mission
+        Control、Spotlight）→ 通知抵達 → 主執行緒 deiconify。
+        """
+        try:
+            import objc
+            from Foundation import NSObject, NSNotificationCenter
+            from AppKit import (
+                NSApplication,
+                NSApplicationDidBecomeActiveNotification,
+            )
+
+            # 用 closure 把 self 帶進 Objective-C method（避免 NSObject 子類保
+            # 留 tk 物件參照造成循環引用）
+            tk_root = self
+
+            class _ActivationObserver(NSObject):
+                def appBecameActive_(self, notification):
+                    # 任何 thread 抵達 — marshal 回 Tk 主執行緒
+                    try:
+                        tk_root.after(0, tk_root._on_cocoa_app_activated)
+                    except Exception:
+                        pass
+
+            self._cocoa_activation_observer = _ActivationObserver.alloc().init()
+            NSNotificationCenter.defaultCenter() \
+                .addObserver_selector_name_object_(
+                    self._cocoa_activation_observer,
+                    b"appBecameActive:",
+                    NSApplicationDidBecomeActiveNotification,
+                    NSApplication.sharedApplication(),
+                )
+            log.info("COCOA: NSApplicationDidBecomeActive observer installed")
+        except Exception as e:
+            log_error("cocoa_observer_install_failed", error=str(e))
+
+    def _on_cocoa_app_activated(self) -> None:
+        """Fix 5c：Cocoa 通知抵達主執行緒 → 視窗若最小化則 deiconify。"""
+        try:
+            state = self.state()  # 'normal' / 'iconic' / 'withdrawn'
+            if state in ("iconic", "withdrawn"):
+                self.deiconify()
+                self.lift()
+                log_action("dock_reopen_recovered", source="CocoaActive", state=state)
+        except Exception:
+            log_error("dock_reopen_failed", source="CocoaActive")
 
     def _warmup_model(self) -> None:
         """背景預熱 Whisper 模型（延遲 1.5s 後執行，避免阻礙 UI 初始化）。"""
