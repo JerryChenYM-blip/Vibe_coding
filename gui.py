@@ -237,6 +237,12 @@ class AppWindow(ctk.CTkFrame):
         # 改用 PyObjC 直接掛 Cocoa 層的 NSApplicationDidBecomeActiveNotification，
         # 不依賴 Tk 中介。失敗只 log，不阻擋啟動。
         self._install_cocoa_activation_observer()
+        # Plan C / Fix 5c v3：終極保險絲 — 每 500ms 輪詢 NSApp.isActive 狀態轉換。
+        # 若上面 4 層（Tk createcommand / <<Activate>> / Cocoa Did+Will Active）
+        # 都沒觸發，這層會在 user 重新 focus 我們時最多 500ms 內恢復視窗。
+        # 純 Python 計時器，不依賴任何 macOS 通知 — 連通知系統壞掉都救得到。
+        self._last_nsapp_active = False  # boot 時非 active
+        self.after(500, self._poll_window_visibility)
         self.after(1500, self._warmup_model)
         # 開啟著的話再去探 Ollama；即使 Ollama 離線也不會卡 UI 建構。
         self.after(2000, self._refresh_ollama_health)
@@ -2018,6 +2024,33 @@ class AppWindow(ctk.CTkFrame):
                 log_action("dock_reopen_recovered", source="CocoaWillActive", state=state)
         except Exception:
             log_error("dock_reopen_failed", source="CocoaWillActive")
+
+    def _poll_window_visibility(self) -> None:
+        """Plan C / Fix 5c v3：每 500ms 輪詢，偵測「App 重新 active + 視窗 iconic」。
+
+        終極保險絲：如果上面所有通知層（Tk + Cocoa）都沒觸發，這層用純
+        Python 計時器確保 user 重新 focus 我們時視窗一定能在 500ms 內恢復。
+
+        關鍵：只在 NSApp.isActive 從 False → True 轉換時動作。這避免：
+        - User 主動 minimize 時誤觸發（那時 NSApp 還是 active，不算轉換）
+        - 我們是 active 期間偶發的 iconic 假狀態（極罕見）
+        """
+        try:
+            from AppKit import NSApplication
+            now_active = bool(NSApplication.sharedApplication().isActive())
+            transitioned_to_active = (not self._last_nsapp_active) and now_active
+            self._last_nsapp_active = now_active
+
+            if transitioned_to_active:
+                state = self.state()
+                if state in ("iconic", "withdrawn"):
+                    self.deiconify()
+                    self.lift()
+                    log_action("dock_reopen_recovered", source="Poll", state=state)
+        except Exception:
+            log_error("poll_visibility_failed")
+        finally:
+            self.after(500, self._poll_window_visibility)
 
     def _warmup_model(self) -> None:
         """背景預熱 Whisper 模型（延遲 1.5s 後執行，避免阻礙 UI 初始化）。"""
