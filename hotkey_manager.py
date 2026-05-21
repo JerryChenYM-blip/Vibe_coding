@@ -438,78 +438,91 @@ class HotkeyManager:
         Lone-modifier 模式：偵測目標 modifier 單獨按下；其他鍵介入則 disarm。
 
         Tap 模式下 press 階段**不**觸發 callback；fire 在 release 上。
+
+        穩定性（Fix 2 / 2026-05-21）：整個函式體包 try/except，任何 callback
+        例外都不能讓 pynput Listener 停掉（不同 pynput 版本對 callback exception
+        行為不一致，統一在這吃掉 + log_error）。
         """
-        # 診斷：第一個 press 事件抵達時間戳（B 任務）—— 任何鍵都算數
-        if not self._first_press_logged:
-            self._first_press_logged = True
-            log.info(
-                f"HOTKEY: first press event received at t={time.monotonic():.3f}, key={key!r}"
-            )
+        try:
+            # 診斷：第一個 press 事件抵達時間戳（B 任務）—— 任何鍵都算數
+            if not self._first_press_logged:
+                self._first_press_logged = True
+                log.info(
+                    f"HOTKEY: first press event received at t={time.monotonic():.3f}, key={key!r}"
+                )
 
-        # ── 模式分流 ──
-        if self._is_lone_mode:
-            self._on_p_lone(key)
-            return
+            # ── 模式分流 ──
+            if self._is_lone_mode:
+                self._on_p_lone(key)
+                return
 
-        # ── Combo 模式（既有邏輯）──
-        nk  = self._normalize(key)
-        now = time.monotonic()
-        armed  = False
-        healed = False
+            # ── Combo 模式（既有邏輯）──
+            nk  = self._normalize(key)
+            now = time.monotonic()
+            armed  = False
+            healed = False
 
-        with self._lock:
-            # 自我修復：combo_active 卡太久 = pynput 漏收 release 事件，強制重置
-            if (
-                self._combo_active
-                and (now - self._combo_active_at) > _STALE_COMBO_SEC
-            ):
-                healed = True
-                self._combo_active = False
-                self._pressed.clear()
+            with self._lock:
+                # 自我修復：combo_active 卡太久 = pynput 漏收 release 事件，強制重置
+                if (
+                    self._combo_active
+                    and (now - self._combo_active_at) > _STALE_COMBO_SEC
+                ):
+                    healed = True
+                    self._combo_active = False
+                    self._pressed.clear()
 
-            self._pressed.add(nk)
-            self._last_event_at = now
+                self._pressed.add(nk)
+                self._last_event_at = now
 
-            # 所有必要鍵都已按下 → 標記「已 armed，等 release 觸發 tap」（不重複標記）
-            if not self._combo_active and self._hotkeys.issubset(self._pressed):
-                self._combo_active    = True
-                self._combo_active_at = now
-                armed = True
+                # 所有必要鍵都已按下 → 標記「已 armed，等 release 觸發 tap」（不重複標記）
+                if not self._combo_active and self._hotkeys.issubset(self._pressed):
+                    self._combo_active    = True
+                    self._combo_active_at = now
+                    armed = True
 
-        if healed:
-            log.warning("HOTKEY: self-heal — stale combo_active cleared")
-        if nk in self._hotkeys:
-            log.debug(f"HOTKEY: press   {nk!r:>10}  pressed={sorted(self._pressed, key=str)}")
-        if armed:
-            combo = getattr(self, "_combo_str", "?")
-            log.debug(f"HOTKEY: combo armed (combo={combo}), waiting for release to fire tap")
+            if healed:
+                log.warning("HOTKEY: self-heal — stale combo_active cleared")
+            if nk in self._hotkeys:
+                log.debug(f"HOTKEY: press   {nk!r:>10}  pressed={sorted(self._pressed, key=str)}")
+            if armed:
+                combo = getattr(self, "_combo_str", "?")
+                log.debug(f"HOTKEY: combo armed (combo={combo}), waiting for release to fire tap")
+        except Exception:
+            log_error("hotkey_on_p_failed", key=repr(key))
 
     def _on_r(self, key) -> None:
-        """pynput 放開事件：兩種模式分流。"""
-        # ── 模式分流 ──
-        if self._is_lone_mode:
-            self._on_r_lone(key)
-            return
+        """pynput 放開事件：兩種模式分流。
 
-        # ── Combo 模式（既有邏輯）──
-        nk  = self._normalize(key)
-        now = time.monotonic()
-        fire = False
+        穩定性（Fix 2 / 2026-05-21）：整個函式體包 try/except；同 _on_p 註解。
+        """
+        try:
+            # ── 模式分流 ──
+            if self._is_lone_mode:
+                self._on_r_lone(key)
+                return
 
-        with self._lock:
-            # 只有「combo 已完整按下」（armed）且放開的是組合中的鍵時才 fire tap
-            if self._combo_active and nk in self._hotkeys:
-                self._combo_active = False
-                fire = True
-            self._pressed.discard(nk)
-            self._last_event_at = now
+            # ── Combo 模式（既有邏輯）──
+            nk  = self._normalize(key)
+            now = time.monotonic()
+            fire = False
 
-        if nk in self._hotkeys:
-            log.debug(f"HOTKEY: release {nk!r:>10}  pressed={sorted(self._pressed, key=str)}")
-        if fire:
-            combo = getattr(self, "_combo_str", "?")
-            log_action("hotkey_tap", combo=combo)
-            self._on_tap_cb()   # 在鎖外呼叫，避免 callback 內持鎖死鎖
+            with self._lock:
+                # 只有「combo 已完整按下」（armed）且放開的是組合中的鍵時才 fire tap
+                if self._combo_active and nk in self._hotkeys:
+                    self._combo_active = False
+                    fire = True
+                self._pressed.discard(nk)
+                self._last_event_at = now
+
+            if nk in self._hotkeys:
+                log.debug(f"HOTKEY: release {nk!r:>10}  pressed={sorted(self._pressed, key=str)}")
+            if fire:
+                combo = getattr(self, "_combo_str", "?")
+                log_action("hotkey_tap", combo=combo)
+                self._on_tap_cb()   # 在鎖外呼叫，避免 callback 內持鎖死鎖
+        except Exception:
+            log_error("hotkey_on_r_failed", key=repr(key))
 
     # ── Lone-modifier 模式分支 ─────────────────────────────────────────────
 
@@ -521,42 +534,47 @@ class HotkeyManager:
           • armed 期間有其他鍵被按下 → 設 _other_key_during_press = True，
             release 時不會 fire（這是正常的 modifier + 字母組合，例如
             Right Option + e 打 é；保護不誤觸發）
+
+        穩定性（Fix 2 / 2026-05-21）：整個函式體包 try/except。
         """
-        nk_sided = _normalize_key_sided(key)
-        now      = time.monotonic()
-        armed    = False
-        healed   = False
+        try:
+            nk_sided = _normalize_key_sided(key)
+            now      = time.monotonic()
+            armed    = False
+            healed   = False
 
-        with self._lock:
-            # 自我修復：armed 卡太久也清掉
-            if self._combo_active and (now - self._combo_active_at) > _STALE_COMBO_SEC:
-                healed = True
-                self._combo_active = False
-                self._other_key_during_press = False
-                self._pressed.clear()
-
-            is_target = (nk_sided == self._lone_target_key)
-            self._last_event_at = now
-
-            if is_target:
-                # 目標 modifier press —— 只在當下沒有其他鍵按住時才 armed
-                if not self._combo_active and len(self._pressed) == 0:
-                    self._combo_active = True
-                    self._combo_active_at = now
+            with self._lock:
+                # 自我修復：armed 卡太久也清掉
+                if self._combo_active and (now - self._combo_active_at) > _STALE_COMBO_SEC:
+                    healed = True
+                    self._combo_active = False
                     self._other_key_during_press = False
-                    armed = True
-                self._pressed.add(nk_sided)
-            else:
-                # 非目標鍵 press —— 若已 armed 則標記 disarm（不重置 _combo_active，
-                # 等 release 時判斷是否該抑制 fire）
-                if self._combo_active:
-                    self._other_key_during_press = True
-                self._pressed.add(nk_sided)
+                    self._pressed.clear()
 
-        if healed:
-            log.warning("HOTKEY: self-heal — stale lone-mode active cleared")
-        if armed:
-            log.debug(f"HOTKEY: lone armed (target={self._lone_target_key!r})")
+                is_target = (nk_sided == self._lone_target_key)
+                self._last_event_at = now
+
+                if is_target:
+                    # 目標 modifier press —— 只在當下沒有其他鍵按住時才 armed
+                    if not self._combo_active and len(self._pressed) == 0:
+                        self._combo_active = True
+                        self._combo_active_at = now
+                        self._other_key_during_press = False
+                        armed = True
+                    self._pressed.add(nk_sided)
+                else:
+                    # 非目標鍵 press —— 若已 armed 則標記 disarm（不重置 _combo_active，
+                    # 等 release 時判斷是否該抑制 fire）
+                    if self._combo_active:
+                        self._other_key_during_press = True
+                    self._pressed.add(nk_sided)
+
+            if healed:
+                log.warning("HOTKEY: self-heal — stale lone-mode active cleared")
+            if armed:
+                log.debug(f"HOTKEY: lone armed (target={self._lone_target_key!r})")
+        except Exception:
+            log_error("hotkey_on_p_lone_failed", key=repr(key))
 
     def _on_r_lone(self, key) -> None:
         """Lone-modifier 模式 release handler。
@@ -566,23 +584,28 @@ class HotkeyManager:
           • _combo_active=True 且 _other_key_during_press=True  → 不 fire
             （這是 modifier + 其他鍵組合，例如 Right Option + e 打 é，保護不誤觸發）
         無論是否 fire，狀態都重置。
+
+        穩定性（Fix 2 / 2026-05-21）：整個函式體包 try/except。
         """
-        nk_sided = _normalize_key_sided(key)
-        now      = time.monotonic()
-        fire     = False
+        try:
+            nk_sided = _normalize_key_sided(key)
+            now      = time.monotonic()
+            fire     = False
 
-        with self._lock:
-            self._pressed.discard(nk_sided)
-            self._last_event_at = now
-            is_target = (nk_sided == self._lone_target_key)
-            if is_target and self._combo_active:
-                if not self._other_key_during_press:
-                    fire = True
-                # 不論是否 fire，目標 modifier release 後重置狀態
-                self._combo_active = False
-                self._other_key_during_press = False
+            with self._lock:
+                self._pressed.discard(nk_sided)
+                self._last_event_at = now
+                is_target = (nk_sided == self._lone_target_key)
+                if is_target and self._combo_active:
+                    if not self._other_key_during_press:
+                        fire = True
+                    # 不論是否 fire，目標 modifier release 後重置狀態
+                    self._combo_active = False
+                    self._other_key_during_press = False
 
-        if fire:
-            combo = getattr(self, "_combo_str", "?")
-            log_action("hotkey_tap", combo=combo)
-            self._on_tap_cb()
+            if fire:
+                combo = getattr(self, "_combo_str", "?")
+                log_action("hotkey_tap", combo=combo)
+                self._on_tap_cb()
+        except Exception:
+            log_error("hotkey_on_r_lone_failed", key=repr(key))
