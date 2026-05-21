@@ -57,7 +57,10 @@ log = get_logger("gui")
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-WIN_W, WIN_H = 760, 800   # 視窗預設寬度 × 高度（像素）
+WIN_W, WIN_H = 760, 880   # 視窗預設寬度 × 高度（像素）
+# WIN_H 推導：實測 AppWindow.winfo_reqheight() ≈ 858（TopBar 60 + RecordCard 398 +
+# ResultCard 281 + ActionBar 58 + StatusBar 32 + 分隔線×3 + 內邊距），舊值 800
+# 會把 ActionBar（5 顆動作按鈕）與 StatusBar 擠出視窗下緣。預留 22px 緩衝。
 
 # ── 設計 Token（統一從 tokens.py 匯入，此模組內不重複定義任何 hex 色碼）────────
 from tokens import (
@@ -153,13 +156,11 @@ class AppWindow(ctk.CTkFrame):
         # 用設定檔同步 Ollama 參數（base_url / model / enabled / timeout）
         self.ollama.apply_app_config(cfg)
         self.hotkey_mgr  = HotkeyManager(
-            on_press_cb=self._hotkey_press,
-            on_release_cb=self._hotkey_release,
+            on_tap_cb=self._hotkey_tap,
         )
 
         # State
         self._state:       str   = "idle"
-        self._hotkey_held: bool  = False
         self._rec_start:   float = 0.0
 
         # 錄音當下的前景 app：
@@ -199,6 +200,12 @@ class AppWindow(ctk.CTkFrame):
 
         self._build_ui()
         self._start_hotkey_listener()
+        # 診斷（Task B）：mainloop 第一個 idle tick 抵達時間戳，
+        # 配合 hotkey_manager.py 的 listener_fully_started / first_press_received
+        # 可以判斷「首次按鍵丟失」是否落在 listener 啟動 vs. tk 進 mainloop 的 gap
+        self.after(0, lambda: log.info(
+            f"GUI: first idle tick reached at t={time.monotonic():.3f}"
+        ))
         self.after(1500, self._warmup_model)
         # 開啟著的話再去探 Ollama；即使 Ollama 離線也不會卡 UI 建構。
         self.after(2000, self._refresh_ollama_health)
@@ -355,7 +362,7 @@ class AppWindow(ctk.CTkFrame):
         )
         self._target_label.pack()
 
-        # 快捷鍵提示文字：依目前狀態動態切換（「按下…」/「放開…」/「轉錄中…」）
+        # 快捷鍵提示文字：依目前狀態動態切換（「按下…」/「再按…停止」/「轉錄中…」）
         self._hotkey_hint = ctk.CTkLabel(
             card,
             text=f"按下 {self.cfg.format_hotkey_display()} 即時錄音",
@@ -617,7 +624,6 @@ class AppWindow(ctk.CTkFrame):
         self._state            = "recording"
         self._state_start_time = time.perf_counter()
         self._rec_start        = self._state_start_time
-        self._hotkey_held      = True
         self._stream_samples   = 0
         self._stream_chunks    = []
         self._ripples.clear()
@@ -650,7 +656,7 @@ class AppWindow(ctk.CTkFrame):
         # UI：Chamber 渲染迴圈會在下次 tick 時自動依新狀態重繪，不需手動觸發
         self._timer_label.configure(text="00:00")
         self._hotkey_hint.configure(
-            text=f"放開 {self.cfg.format_hotkey_display()} 停止錄音"
+            text=f"再按 {self.cfg.format_hotkey_display()} 停止錄音"
         )
         self._model_menu.configure(state="disabled")
         self._lang_menu.configure(state="disabled")
@@ -676,7 +682,6 @@ class AppWindow(ctk.CTkFrame):
         log_state("recording->processing", duration_s=f"{duration:.2f}")
         self._state            = "processing"
         self._state_start_time = time.perf_counter()
-        self._hotkey_held      = False
 
         if self._stream_tick_id is not None:
             self.after_cancel(self._stream_tick_id)
@@ -875,11 +880,10 @@ class AppWindow(ctk.CTkFrame):
         if self.cfg.auto_paste and valid and self._paste_target:
             target = self._paste_target
             self._paste_target = None
-            threading.Thread(
-                target=self._do_auto_paste,
-                args=(text, target),
-                daemon=True,
-            ).start()
+            # macOS 26.4+ TSM 強制主執行緒：pynput keyboard.Controller 模擬 ⌘V
+            # 必須在主 thread 呼叫，否則 TSMGetInputSourceProperty 會觸發
+            # dispatch_assert_queue_fail 直接閃退。詳見 CLAUDE.md §9.6。
+            self._do_auto_paste(text, target)
 
     # ── 潤飾管線 ────────────────────────────────────────────────────────────
 
@@ -984,12 +988,11 @@ class AppWindow(ctk.CTkFrame):
             paste_text = polished
 
         # 自動貼上（策略 B：等潤飾完才貼）
+        # macOS 26.4+ TSM 強制主執行緒：pynput keyboard.Controller 模擬 ⌘V
+        # 必須在主 thread 呼叫，否則 TSMGetInputSourceProperty 會觸發
+        # dispatch_assert_queue_fail 直接閃退。詳見 CLAUDE.md §9.6。
         if target:
-            threading.Thread(
-                target=self._do_auto_paste,
-                args=(paste_text, target),
-                daemon=True,
-            ).start()
+            self._do_auto_paste(paste_text, target)
 
     # ── 原文 / 潤飾 分段切換 ─────────────────────────────────────────────
 
@@ -1092,12 +1095,18 @@ class AppWindow(ctk.CTkFrame):
         self._result_title.configure(text="".join(parts))
 
     def _do_auto_paste(self, text: str, target: str) -> None:
-        """背景執行緒：呼叫 auto_paste，完成後以 toast 通知使用者。"""
+        """主執行緒：呼叫 auto_paste，完成後以 toast 通知使用者。
+
+        必須在主執行緒呼叫——macOS 26.4+ TSM 對 pynput keyboard.Controller
+        強制主執行緒（背景 thread 會觸發 dispatch_assert_queue_fail 閃退）。
+        典型耗時 ~380ms（osascript activate + 180ms 緩衝 + ⌘V），可接受的
+        UI 短暫凍結，遠優於閃退。詳見 CLAUDE.md §9.6。
+        """
         success = _ap.paste_to_app(text, target)
         if success:
-            self.after(0, lambda: self._show_toast(f"⌨  已貼入 {target}"))
+            self._show_toast(f"⌨  已貼入 {target}")
         else:
-            self.after(0, lambda: self._show_toast("⌨  自動貼上失敗（請確認輔助使用權限）"))
+            self._show_toast("⌨  自動貼上失敗（請確認輔助使用權限）")
 
     def _display_result(self, result: TranscriptionResult) -> None:
         """將轉錄結果插入 textbox，並以 tk mark 圈住最新一段供後續精準替換。"""
@@ -1361,26 +1370,19 @@ class AppWindow(ctk.CTkFrame):
             # Tail padding — 多錄 300ms 再停，抓尾音避免漏字
             self.after(self.TAIL_PADDING_MS, self._try_stop)
 
-    def _hotkey_press(self) -> None:
-        """pynput 執行緒 → 安全 marshal 到主執行緒。"""
-        self.after(0, self._on_hotkey_press)
+    def _hotkey_tap(self) -> None:
+        """pynput 執行緒：tap 觸發（完整按下→放開算 1 次）→ marshal 到主執行緒。
 
-    def _hotkey_release(self) -> None:
-        """pynput 執行緒 → 安全 marshal 到主執行緒。"""
-        self.after(0, self._on_hotkey_release)
+        Tap toggle 語意：每次 tap 等同於點一下螢幕上的錄音鈕，
+        idle → 開始錄音；recording → 停止；processing → 忽略。
+        實際分支邏輯沿用 `_on_record_btn`，不在這裡重複實作。
+        """
+        self.after(0, self._on_hotkey_tap)
 
-    def _on_hotkey_press(self) -> None:
-        """主執行緒：快捷鍵按下時若為 idle 則開始錄音。"""
-        if self._state == "idle" and not self._hotkey_held:
-            log_action("hotkey_triggered_recording", combo=self.cfg.hotkey)
-            self._transition_to_recording()
-
-    def _on_hotkey_release(self) -> None:
-        """主執行緒：快捷鍵放開時若為 recording 則延遲停止（抓尾音）。"""
-        if self._state == "recording":
-            log_action("hotkey_triggered_stop", combo=self.cfg.hotkey)
-            # Tail padding — 多錄 300ms 再停，避免漏最後一兩個字
-            self.after(self.TAIL_PADDING_MS, self._try_stop)
+    def _on_hotkey_tap(self) -> None:
+        """主執行緒：快捷鍵 tap → 直接重用 chamber 按鈕的 toggle handler。"""
+        log_action("hotkey_triggered_toggle", combo=self.cfg.hotkey, state=self._state)
+        self._on_record_btn()
 
     def _try_stop(self) -> None:
         """延遲後真的停錄音。只在仍為 recording 狀態才執行（防重入）。"""
@@ -1718,7 +1720,7 @@ class AppWindow(ctk.CTkFrame):
         # 的 CFRunLoop teardown 完成，避免 macOS Cocoa native race 造成閃退。
         if cfg.hotkey != old_hotkey:
             self.after(100, self._start_hotkey_listener)
-        self._hotkey_hint.configure(text=f"按住 {cfg.format_hotkey_display()} 即時錄音")
+        self._hotkey_hint.configure(text=f"按下 {cfg.format_hotkey_display()} 即時錄音")
         self._hotkey_status.configure(text=cfg.format_hotkey_display())
         self._model_var.set(cfg.model)
         self._lang_var.set(cfg.language)
@@ -2640,11 +2642,11 @@ class HotkeyBindDialog(ctk.CTkToplevel):
         """建立說明文字、偵測標籤、取消和確認套用按鈕。"""
         ctk.CTkLabel(
             self,
-            text="請按下想要的快捷鍵組合\n（按下後鬆開確認）",
+            text="請按下想要的快捷鍵\n可以是單一鍵（如右 Cmd）或組合鍵\n（按下後鬆開確認）",
             font=ctk.CTkFont("SF Pro Text", 14),
             text_color=TEXT_2,
             justify="center",
-        ).pack(pady=(28, 12))
+        ).pack(pady=(20, 10))
 
         self._detect_label = ctk.CTkLabel(
             self, text="等待按鍵…",
@@ -2687,6 +2689,20 @@ class HotkeyBindDialog(ctk.CTkToplevel):
     #   改用 Tk 的 <KeyPress> / <KeyRelease> binding，事件在主執行緒回調，
     #   完全不觸碰 TSM API。唯一代價是對話框必須持續擁有鍵盤焦點（grab_set 已保證）。
     _MODIFIERS = frozenset({"cmd", "ctrl", "alt", "shift"})
+    # 側別 modifier 名稱集合（用於 lone-modifier 偵測）
+    _SIDED_MODIFIERS = frozenset({
+        "right_cmd",    "left_cmd",
+        "right_option", "left_option",
+        "right_ctrl",   "left_ctrl",
+        "right_shift",  "left_shift",
+    })
+    # 側別 → 通用（用於 combo 模式：right_cmd → cmd）
+    _SIDED_TO_GENERIC = {
+        "right_cmd":    "cmd",  "left_cmd":     "cmd",
+        "right_option": "alt",  "left_option":  "alt",
+        "right_ctrl":   "ctrl", "left_ctrl":    "ctrl",
+        "right_shift":  "shift","left_shift":   "shift",
+    }
 
     def _start_capture(self) -> None:
         self._current_keys: set[str] = set()
@@ -2729,18 +2745,35 @@ class HotkeyBindDialog(ctk.CTkToplevel):
         )
 
     def _on_tk_key_release(self, event) -> None:
-        """放開鍵時：若組合含非修飾鍵則鎖定結果；否則提示需加字母鍵。"""
+        """放開鍵時：判定 lone-modifier 或 combo 兩種情境。
+
+        Lone-modifier：max_combo 恰好 1 個元素且為側別 modifier → 鎖定為 lone。
+        Combo：max_combo 含至少 1 個非修飾鍵 → 鎖定為 combo（normalize 側別）。
+        否則（只按了修飾鍵但不是 lone 條件）→ 提示需加字母鍵。
+        """
         name = self._keysym_to_name(event.keysym)
         if name:
             self._current_keys.discard(name)
-        # 在 max_combo 有「至少一個非修飾鍵」且本輪還沒鎖定時 → 鎖定
         if self._captured:
             return
         if not self._max_combo:
             return
-        has_non_mod = any(k not in self._MODIFIERS for k in self._max_combo)
+
+        # Lone-modifier：恰好 1 個鍵且為側別 modifier
+        if len(self._max_combo) == 1:
+            only = next(iter(self._max_combo))
+            if only in self._SIDED_MODIFIERS:
+                self._captured = only
+                self._on_captured(only)
+                return
+
+        # Combo：至少一個非修飾鍵（字母 / 數字 / 空白）
+        has_non_mod = any(
+            k not in self._MODIFIERS and k not in self._SIDED_MODIFIERS
+            for k in self._max_combo
+        )
         if not has_non_mod:
-            # 使用者目前只按了修飾鍵；提示但不鎖定
+            # 只按了修飾鍵但是多個（例如 cmd+alt）→ 需要再加字母鍵
             self._detect_label.configure(
                 text=format_hotkey(self._combo_str(self._max_combo)) + "   ← 需要加字母/數字/空白"
             )
@@ -2751,32 +2784,48 @@ class HotkeyBindDialog(ctk.CTkToplevel):
 
     @staticmethod
     def _keysym_to_name(keysym: str) -> Optional[str]:
-        """Tk keysym → 我們的 combo 命名（'cmd' / 'alt' / 'r' …）。
+        """Tk keysym → 我們的 combo 命名。
 
+        側別 modifier 保留側別資訊（'right_cmd' / 'left_option' ...）；
+        到了 _combo_str 才依模式決定 normalize 或保留。
         回 None 表示此鍵不納入 combo（避免 F-keys、方向鍵等產生奇怪 combo）。
         """
         ks = keysym.lower()
-        mod_map = {
-            "meta_l": "cmd",   "meta_r": "cmd",
-            "command_l": "cmd","command_r": "cmd",
-            "super_l": "cmd",  "super_r": "cmd",  # 非 Mac 備援
-            "control_l": "ctrl","control_r": "ctrl",
-            "alt_l": "alt",    "alt_r": "alt",
-            "option_l": "alt", "option_r": "alt",
-            "shift_l": "shift","shift_r": "shift",
-            "space": "space",
+        # 側別感知映射：保留 left/right 資訊
+        sided_map = {
+            "meta_l":    "left_cmd",    "meta_r":    "right_cmd",
+            "command_l": "left_cmd",    "command_r": "right_cmd",
+            "super_l":   "left_cmd",    "super_r":   "right_cmd",  # 非 Mac 備援
+            "control_l": "left_ctrl",   "control_r": "right_ctrl",
+            "alt_l":     "left_option", "alt_r":     "right_option",
+            "option_l":  "left_option", "option_r":  "right_option",
+            "shift_l":   "left_shift",  "shift_r":   "right_shift",
         }
-        if ks in mod_map:
-            return mod_map[ks]
+        if ks in sided_map:
+            return sided_map[ks]
+        if ks == "space":
+            return "space"
         if len(ks) == 1 and ks.isalnum():
             return ks
         return None
 
-    @staticmethod
-    def _combo_str(keys: set[str]) -> str:
+    @classmethod
+    def _combo_str(cls, keys: set[str]) -> str:
+        """將 sided / 通用 modifier name 集合組成 combo 字串。
+
+        Combo 模式：sided modifier 收斂為通用名稱（right_cmd → cmd）後排序輸出。
+        Lone-modifier 模式：呼叫端在判定為 lone 時直接用 sided name，不走此函式。
+        """
         order = ["cmd", "ctrl", "alt", "shift"]
-        mods    = [m for m in order if m in keys]
-        letters = sorted(k for k in keys if k not in order)
+        # 把 sided modifier 投影成通用名稱，其餘鍵保留
+        normalized: set[str] = set()
+        for k in keys:
+            if k in cls._SIDED_TO_GENERIC:
+                normalized.add(cls._SIDED_TO_GENERIC[k])
+            else:
+                normalized.add(k)
+        mods    = [m for m in order if m in normalized]
+        letters = sorted(k for k in normalized if k not in order)
         return "+".join(mods + letters)
 
     def _on_captured(self, combo: str) -> None:

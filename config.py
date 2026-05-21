@@ -62,7 +62,7 @@ class Config:
 
     # ── 基本操作設定 ──────────────────────────────────────────────────────────
 
-    hotkey:       str           = "cmd+alt+r"        # 全域錄音快捷鍵
+    hotkey:       str           = "right_cmd"        # 全域錄音快捷鍵（單按右 Cmd）
     model:        str           = "large-v3-turbo"   # Whisper 模型大小
     language:     str           = "自動偵測"          # 轉錄語言
     input_device: Optional[str] = None               # 麥克風裝置名稱（None = 系統預設）
@@ -219,11 +219,28 @@ class Config:
         return LANGUAGE_OPTIONS.get(self.language)
 
     def format_hotkey_display(self) -> str:
-        """將熱鍵字串格式化為 macOS 符號表示，例如 'cmd+alt+r' → '⌘⌥R'。
+        """將熱鍵字串格式化為 macOS 符號表示。
 
-        支援 macOS 慣稱別名（option/command/control/opt 等）。為避免與
-        hotkey_manager._SYMBOL_MAP 重複維護，此處 inline 同樣表。
+          'cmd+alt+r'   → '⌘⌥R'
+          'right_cmd'   → 'R⌘'
+          'left_option' → 'L⌥'
+        為避免與 hotkey_manager 內部表重複維護，此處 inline 同樣表。
         """
+        lone_mod_display = {
+            "right_cmd":    "R⌘",
+            "left_cmd":     "L⌘",
+            "right_option": "R⌥",
+            "left_option":  "L⌥",
+            "right_alt":    "R⌥",
+            "left_alt":     "L⌥",
+            "right_ctrl":   "R⌃",
+            "left_ctrl":    "L⌃",
+            "right_shift":  "R⇧",
+            "left_shift":   "L⇧",
+        }
+        c = self.hotkey.lower().strip()
+        if c in lone_mod_display:
+            return lone_mod_display[c]
         symbols = {
             "cmd": "⌘", "command": "⌘",
             "ctrl": "⌃", "control": "⌃",

@@ -6,6 +6,12 @@ macOS 全域快捷鍵管理器。
   • capture_hotkey()：讓使用者互動式輸入新快捷鍵（給 HotkeyBindDialog 用）
   • parse_hotkey() / format_hotkey()：字串解析與格式化工具函式
 
+行為：tap toggle（點按切換）
+  • 一次「完整按下→放開」算一個 tap，fire 在 release 上
+  • 按住 5 秒再放開 → 仍然只算 1 個 tap（不是 start+stop）
+  • 只按部分組合（例如 cmd+alt 沒按 r）→ 不 fire
+  • 由呼叫端（GUI）依目前狀態決定 tap 對應的動作（開始或停止錄音）
+
 執行緒安全修正（相較舊版）：
   1. callback 在鎖外呼叫，消除 callback 內持鎖造成的死鎖風險
   2. stop() 先在鎖內取出 listener 參照、清空狀態，再在鎖外 stop()
@@ -32,8 +38,8 @@ from logger import get_logger, log_action, log_error
 log = get_logger("hotkey")
 
 # combo_active=True 持續超過此秒數仍未見 release，視為 pynput 漏收事件。
-# 選 2 秒：足夠涵蓋正常「按住說話」場景，不會誤觸發重置。
-_STALE_COMBO_SEC = 2.0
+# 選 10 秒：toggle 模式下使用者可能按住很久才放（雖無此必要），給足容忍度。
+_STALE_COMBO_SEC = 10.0
 
 
 # ── 系統查詢 ──────────────────────────────────────────────────────────────────
@@ -85,14 +91,38 @@ _SYMBOL_MAP: dict[str, str] = {
 def parse_hotkey(combo: str) -> set:
     """將 'cmd+alt+r' 格式的字串解析為 pynput Key / char 物件的集合。
 
+    支援兩種格式：
+      (1) 組合鍵：'cmd+alt+r' / 'ctrl+shift+space'
+      (2) Lone modifier（單一鍵）：'right_cmd' / 'left_option' / 'right_ctrl' / ...
+          側別感知，pynput 對應 Key.cmd_r / Key.alt_l / Key.ctrl_r ...
+
     Args:
-        combo: 加號分隔的按鍵組合字串，例如 "cmd+alt+r"。
+        combo: 加號分隔的按鍵組合字串，或單一鍵字串。
 
     Returns:
         pynput 鍵值的集合；pynput 不可用時回傳空集合。
     """
     if not _PYNPUT_AVAILABLE:
         return set()
+
+    # Lone-modifier 字串對照：左右側 modifier 直接 map 到對應的側別 Key
+    _LONE_MOD_MAP = {
+        "right_cmd":    Key.cmd_r,
+        "left_cmd":     Key.cmd_l,
+        "right_option": Key.alt_r,
+        "left_option":  Key.alt_l,
+        "right_alt":    Key.alt_r,
+        "left_alt":     Key.alt_l,
+        "right_ctrl":   Key.ctrl_r,
+        "left_ctrl":    Key.ctrl_l,
+        "right_shift":  Key.shift_r,
+        "left_shift":   Key.shift_l,
+    }
+    c = combo.lower().strip()
+    if c in _LONE_MOD_MAP:
+        # 單鍵 lone modifier — 不展開為左右合一，保持側別資訊
+        return {_LONE_MOD_MAP[c]}
+
     res: set = set()
     for p in combo.lower().split("+"):
         p = p.strip()
@@ -123,8 +153,41 @@ def parse_hotkey(combo: str) -> set:
     return res
 
 
+# Lone-modifier 模式的目標鍵集合（側別感知）
+def _is_lone_modifier_key(key) -> bool:
+    """檢查一個 pynput key 是否為左右側 modifier（用於 lone-modifier 判定）。"""
+    if not _PYNPUT_AVAILABLE:
+        return False
+    return key in (
+        Key.cmd_l,  Key.cmd_r,
+        Key.alt_l,  Key.alt_r,
+        Key.ctrl_l, Key.ctrl_r,
+        Key.shift_l, Key.shift_r,
+    )
+
+
 def format_hotkey(combo: str) -> str:
-    """將組合鍵字串格式化為 macOS 符號顯示，例如 'cmd+alt+r' → '⌘⌥R'。"""
+    """將組合鍵字串格式化為 macOS 符號顯示。
+
+      'cmd+alt+r'   → '⌘⌥R'
+      'right_cmd'   → 'R⌘'   （側別 + 符號）
+      'left_option' → 'L⌥'
+    """
+    _LONE_MOD_DISPLAY = {
+        "right_cmd":    "R⌘",
+        "left_cmd":     "L⌘",
+        "right_option": "R⌥",
+        "left_option":  "L⌥",
+        "right_alt":    "R⌥",
+        "left_alt":     "L⌥",
+        "right_ctrl":   "R⌃",
+        "left_ctrl":    "L⌃",
+        "right_shift":  "R⇧",
+        "left_shift":   "L⇧",
+    }
+    c = combo.lower().strip()
+    if c in _LONE_MOD_DISPLAY:
+        return _LONE_MOD_DISPLAY[c]
     parts = combo.lower().split("+")
     return "".join(_SYMBOL_MAP.get(p.strip(), p.strip().upper()) for p in parts)
 
@@ -132,7 +195,8 @@ def format_hotkey(combo: str) -> str:
 def _normalize_key(key) -> object:
     """將左右修飾鍵（cmd_l / cmd_r 等）統一映射到正規名稱（cmd）。
 
-    pynput 會分別回報左右側修飾鍵；我們的組合比對不需要區分左右。
+    pynput 會分別回報左右側修飾鍵；組合鍵比對不需要區分左右，統一收斂。
+    Lone-modifier 模式需保留側別，請用 `_normalize_key_sided`。
     """
     if not _PYNPUT_AVAILABLE:
         return key
@@ -142,6 +206,32 @@ def _normalize_key(key) -> object:
     if key in (Key.alt,   Key.alt_l,   Key.alt_r):   return Key.alt
     if key in (Key.ctrl,  Key.ctrl_l,  Key.ctrl_r):  return Key.ctrl
     # 有 char 屬性的鍵（字母、數字）取小寫字元
+    if hasattr(key, "char") and key.char:
+        return key.char.lower()
+    return key
+
+
+def _normalize_key_sided(key) -> object:
+    """側別感知的正規化（給 lone-modifier 模式用）。
+
+    左右側 modifier 各自保留（不像 _normalize_key 那樣收斂為 Key.cmd）；
+    其他鍵與 _normalize_key 同。
+    pynput 在 macOS 上可能回 Key.cmd（無側別後綴）—— 視為「不確定側別」，
+    照樣回傳該物件，比對時不會匹配到 Key.cmd_r 等具側別目標，自然忽略。
+    """
+    if not _PYNPUT_AVAILABLE:
+        return key
+    # 側別 modifier 保留原樣
+    if key in (
+        Key.cmd_l,  Key.cmd_r,
+        Key.alt_l,  Key.alt_r,
+        Key.ctrl_l, Key.ctrl_r,
+        Key.shift_l, Key.shift_r,
+    ):
+        return key
+    # 無側別 modifier（少見）也原樣保留
+    if key in (Key.cmd, Key.alt, Key.ctrl, Key.shift):
+        return key
     if hasattr(key, "char") and key.char:
         return key.char.lower()
     return key
@@ -234,44 +324,78 @@ def capture_hotkey(timeout: float = 15.0) -> Optional[str]:
 # ── HotkeyManager ─────────────────────────────────────────────────────────────
 
 class HotkeyManager:
-    """監聽可設定組合鍵的全域快捷鍵管理器。
+    """監聽可設定組合鍵的全域快捷鍵管理器（tap toggle 模式）。
 
     執行緒安全：所有共享狀態受 _lock 保護，但 callback 在鎖外呼叫，
     避免 callback 內持鎖造成死鎖。
 
+    Tap 語意：
+      • 一次「完整按下整個組合 → 任一鍵放開」= 1 個 tap，fire 在 release 上
+      • 只按部分組合（例如只按 cmd+alt 沒按 r）→ 不 fire
+      • 按住 5 秒再放開 → 仍是 1 個 tap（不重複觸發）
+      • 由呼叫端依自身狀態決定 tap 要做的動作（start vs stop）
+
     使用方式：
-        mgr = HotkeyManager(on_press_cb=start_recording, on_release_cb=stop_recording)
+        mgr = HotkeyManager(on_tap_cb=toggle_recording)
         mgr.restart("cmd+alt+r")   # 開始監聽
         mgr.stop()                 # 停止監聽（例如 App 關閉時）
     """
 
-    def __init__(self, on_press_cb: Callable, on_release_cb: Callable) -> None:
+    def __init__(self, on_tap_cb: Callable) -> None:
         """初始化管理器（不立即開始監聽；需呼叫 restart()）。
 
         Args:
-            on_press_cb:   組合鍵按下時的回呼（在主執行緒 marshal 後呼叫）。
-            on_release_cb: 組合鍵放開時的回呼。
+            on_tap_cb: 組合鍵 tap（完整按下後放開）時的回呼；
+                       在 pynput 執行緒呼叫，呼叫端負責 marshal 回主執行緒。
         """
-        self._on_press_cb    = on_press_cb
-        self._on_release_cb  = on_release_cb
+        self._on_tap_cb      = on_tap_cb
         self._hotkeys:       set  = set()            # 目前監聽的鍵值集合
         self._pressed:       Set  = set()            # 目前按住的鍵值集合
-        self._combo_active:  bool = False            # 組合鍵是否已觸發
-        self._combo_active_at: float = 0.0           # 最後一次觸發的時間戳
+        self._combo_active:  bool = False            # 組合鍵是否已完整按下（pending release 觸發 tap）
+        self._combo_active_at: float = 0.0           # 最後一次完整按下的時間戳
         self._last_event_at:   float = 0.0           # 最後一次事件的時間戳
         self._listener: Optional[_kb.Listener] = None
         self._lock = threading.Lock()
+        # Lone-modifier 模式狀態
+        # 啟用條件：len(_hotkeys) == 1 且該鍵為側別 modifier
+        # _is_lone_mode      —— 啟用 lone-modifier 邏輯
+        # _lone_target_key   —— 目標 modifier（如 Key.cmd_r）
+        # _other_key_during_press —— 目標 modifier 按住期間，有沒有其他鍵被按
+        self._is_lone_mode:   bool = False
+        self._lone_target_key      = None
+        self._other_key_during_press: bool = False
+        # _first_press_logged：診斷用，首次 press 事件抵達時打一行 log，
+        # 之後不再重複；listener 重啟時會重置
+        self._first_press_logged: bool = False
 
     def restart(self, combo: str) -> None:
         """停止舊的監聽器並以新組合鍵啟動新監聽器。
 
         Args:
-            combo: 組合鍵字串，例如 "cmd+alt+r"。
+            combo: 組合鍵字串，例如 "cmd+alt+r" 或 lone modifier "right_cmd"。
         """
         self.stop()
         self._hotkeys = parse_hotkey(combo)
         self._combo_str = combo
-        log.info(f"HOTKEY: Starting listener for combo='{combo}' keys={self._hotkeys}")
+        # Lone-modifier 模式偵測：單一鍵 + 該鍵為側別 modifier
+        if len(self._hotkeys) == 1:
+            only_key = next(iter(self._hotkeys))
+            if _is_lone_modifier_key(only_key):
+                self._is_lone_mode = True
+                self._lone_target_key = only_key
+            else:
+                self._is_lone_mode = False
+                self._lone_target_key = None
+        else:
+            self._is_lone_mode = False
+            self._lone_target_key = None
+        self._other_key_during_press = False
+        self._first_press_logged = False
+        mode = "lone-modifier" if self._is_lone_mode else "combo"
+        log.info(
+            f"HOTKEY: Starting listener for combo='{combo}' "
+            f"keys={self._hotkeys} mode={mode}"
+        )
         self._listener = _kb.Listener(
             on_press=self._on_p,
             on_release=self._on_r,
@@ -279,6 +403,8 @@ class HotkeyManager:
         )
         self._listener.daemon = True
         self._listener.start()
+        # 診斷：listener 完整啟動時間戳（B 任務）
+        log.info(f"HOTKEY: listener fully started at t={time.monotonic():.3f}")
 
     def stop(self) -> None:
         """停止監聽器並清空所有狀態。
@@ -292,6 +418,7 @@ class HotkeyManager:
             self._listener   = None
             self._pressed.clear()
             self._combo_active = False
+            self._other_key_during_press = False
         # 在鎖外停止，避免 pynput 執行緒中持鎖等待造成死鎖
         if listener_to_stop is not None:
             log.info("HOTKEY: Stopping listener...")
@@ -305,10 +432,29 @@ class HotkeyManager:
         return _normalize_key(key)
 
     def _on_p(self, key) -> None:
-        """pynput 按鍵事件：追蹤按下的鍵，判斷是否觸發組合鍵。"""
+        """pynput 按鍵事件：兩種模式分流。
+
+        Combo 模式（既有）：追蹤按下的鍵，標記 combo 是否已完整按下（不 fire）。
+        Lone-modifier 模式：偵測目標 modifier 單獨按下；其他鍵介入則 disarm。
+
+        Tap 模式下 press 階段**不**觸發 callback；fire 在 release 上。
+        """
+        # 診斷：第一個 press 事件抵達時間戳（B 任務）—— 任何鍵都算數
+        if not self._first_press_logged:
+            self._first_press_logged = True
+            log.info(
+                f"HOTKEY: first press event received at t={time.monotonic():.3f}, key={key!r}"
+            )
+
+        # ── 模式分流 ──
+        if self._is_lone_mode:
+            self._on_p_lone(key)
+            return
+
+        # ── Combo 模式（既有邏輯）──
         nk  = self._normalize(key)
         now = time.monotonic()
-        fire   = False
+        armed  = False
         healed = False
 
         with self._lock:
@@ -324,29 +470,34 @@ class HotkeyManager:
             self._pressed.add(nk)
             self._last_event_at = now
 
-            # 所有必要鍵都已按下 → 首次觸發（不重複觸發）
+            # 所有必要鍵都已按下 → 標記「已 armed，等 release 觸發 tap」（不重複標記）
             if not self._combo_active and self._hotkeys.issubset(self._pressed):
                 self._combo_active    = True
                 self._combo_active_at = now
-                fire = True
+                armed = True
 
         if healed:
             log.warning("HOTKEY: self-heal — stale combo_active cleared")
         if nk in self._hotkeys:
             log.debug(f"HOTKEY: press   {nk!r:>10}  pressed={sorted(self._pressed, key=str)}")
-        if fire:
+        if armed:
             combo = getattr(self, "_combo_str", "?")
-            log_action("hotkey_pressed", combo=combo)
-            self._on_press_cb()   # 在鎖外呼叫，避免 callback 內持鎖死鎖
+            log.debug(f"HOTKEY: combo armed (combo={combo}), waiting for release to fire tap")
 
     def _on_r(self, key) -> None:
-        """pynput 放開事件：若組合鍵放開則觸發 release callback。"""
+        """pynput 放開事件：兩種模式分流。"""
+        # ── 模式分流 ──
+        if self._is_lone_mode:
+            self._on_r_lone(key)
+            return
+
+        # ── Combo 模式（既有邏輯）──
         nk  = self._normalize(key)
         now = time.monotonic()
         fire = False
 
         with self._lock:
-            # 只有組合鍵中的某個鍵放開時才觸發 release
+            # 只有「combo 已完整按下」（armed）且放開的是組合中的鍵時才 fire tap
             if self._combo_active and nk in self._hotkeys:
                 self._combo_active = False
                 fire = True
@@ -357,5 +508,81 @@ class HotkeyManager:
             log.debug(f"HOTKEY: release {nk!r:>10}  pressed={sorted(self._pressed, key=str)}")
         if fire:
             combo = getattr(self, "_combo_str", "?")
-            log_action("hotkey_released", combo=combo)
-            self._on_release_cb()   # 在鎖外呼叫
+            log_action("hotkey_tap", combo=combo)
+            self._on_tap_cb()   # 在鎖外呼叫，避免 callback 內持鎖死鎖
+
+    # ── Lone-modifier 模式分支 ─────────────────────────────────────────────
+
+    def _on_p_lone(self, key) -> None:
+        """Lone-modifier 模式 press handler。
+
+        Press 階段不 fire；只記錄：
+          • 目標 modifier 被「乾淨地」按下（按下前 _pressed 為空）→ armed
+          • armed 期間有其他鍵被按下 → 設 _other_key_during_press = True，
+            release 時不會 fire（這是正常的 modifier + 字母組合，例如
+            Right Option + e 打 é；保護不誤觸發）
+        """
+        nk_sided = _normalize_key_sided(key)
+        now      = time.monotonic()
+        armed    = False
+        healed   = False
+
+        with self._lock:
+            # 自我修復：armed 卡太久也清掉
+            if self._combo_active and (now - self._combo_active_at) > _STALE_COMBO_SEC:
+                healed = True
+                self._combo_active = False
+                self._other_key_during_press = False
+                self._pressed.clear()
+
+            is_target = (nk_sided == self._lone_target_key)
+            self._last_event_at = now
+
+            if is_target:
+                # 目標 modifier press —— 只在當下沒有其他鍵按住時才 armed
+                if not self._combo_active and len(self._pressed) == 0:
+                    self._combo_active = True
+                    self._combo_active_at = now
+                    self._other_key_during_press = False
+                    armed = True
+                self._pressed.add(nk_sided)
+            else:
+                # 非目標鍵 press —— 若已 armed 則標記 disarm（不重置 _combo_active，
+                # 等 release 時判斷是否該抑制 fire）
+                if self._combo_active:
+                    self._other_key_during_press = True
+                self._pressed.add(nk_sided)
+
+        if healed:
+            log.warning("HOTKEY: self-heal — stale lone-mode active cleared")
+        if armed:
+            log.debug(f"HOTKEY: lone armed (target={self._lone_target_key!r})")
+
+    def _on_r_lone(self, key) -> None:
+        """Lone-modifier 模式 release handler。
+
+        放開目標 modifier 時：
+          • _combo_active=True 且 _other_key_during_press=False → fire tap
+          • _combo_active=True 且 _other_key_during_press=True  → 不 fire
+            （這是 modifier + 其他鍵組合，例如 Right Option + e 打 é，保護不誤觸發）
+        無論是否 fire，狀態都重置。
+        """
+        nk_sided = _normalize_key_sided(key)
+        now      = time.monotonic()
+        fire     = False
+
+        with self._lock:
+            self._pressed.discard(nk_sided)
+            self._last_event_at = now
+            is_target = (nk_sided == self._lone_target_key)
+            if is_target and self._combo_active:
+                if not self._other_key_during_press:
+                    fire = True
+                # 不論是否 fire，目標 modifier release 後重置狀態
+                self._combo_active = False
+                self._other_key_during_press = False
+
+        if fire:
+            combo = getattr(self, "_combo_str", "?")
+            log_action("hotkey_tap", combo=combo)
+            self._on_tap_cb()

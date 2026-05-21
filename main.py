@@ -88,7 +88,9 @@ def main() -> None:
     root = ctk.CTk()
     root.title("🎙 Whisper Pro")
     root.geometry(f"{WIN_W}x{WIN_H}")   # 與 gui.py 的 WIN_W / WIN_H 保持一致
-    root.minsize(640, 750)               # 允許縮放但設最小值，防止 UI 擠爆
+    # minsize 高度 860：AppWindow 自然 reqheight ≈ 858（含 ActionBar 58 +
+    # StatusBar 32 + 分隔線），舊值 750 會把底部兩列擠掉。寬度 640 維持不變。
+    root.minsize(640, 860)
     root.resizable(True, True)
 
     # ── 3a. App Icon（Phase 4.1）──────────────────────────────────────────

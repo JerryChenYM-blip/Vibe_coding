@@ -257,7 +257,12 @@ class Transcriber:
 
         # 靜音防護：能量太低就直接跳過，避免觸發幻覺
         if _is_silence(audio):
-            log.info("WHISPER: Guard - Audio level below threshold, skipping inference.")
+            _peak = float(np.abs(audio).max()) if audio.size else 0.0
+            _rms = float(np.sqrt(np.mean(audio ** 2))) if audio.size else 0.0
+            log.info(
+                f"WHISPER: Guard - Audio peak={_peak:.6f} rms={_rms:.6f} "
+                f"below threshold={_MIN_RMS} (duration={duration:.2f}s), skipping inference."
+            )
             return TranscriptionResult(
                 text="（未偵測到語音內容）",
                 language="", duration_seconds=duration,
