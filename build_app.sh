@@ -1,19 +1,24 @@
 #!/bin/bash
-# build_app.sh — 建構 Whisper Pro 薄殼 .app bundle
+# build_app.sh — 建構 Whisper Pro .app bundle（含 Python shim）
 #
-# 目的：解決 macOS TCC（麥克風 / 輔助使用 / AppleScript）按 responsible process
-# 歸帳的問題。從不同終端機 / shell 啟動 main.py 會被歸到不同的 responsible
-# process，每個都要重新授權。包成 .app bundle 後，所有路徑都歸帳到同一個
-# bundle ID（com.jerrychen.whisperpro），授權一次永遠有效。
+# 目的：解決 macOS TCC（麥克風 / 輔助使用 / AppleScript）的兩個問題：
+#   1. responsible process 歸帳 — 從不同終端機 / shell 啟動 main.py 會歸到不同的
+#      responsible process，每個都要重新授權。包成 .app 後一律歸帳到 bundle ID。
+#   2. silent deny — 系統 Python.app 的 Info.plist 沒有 NSMicrophoneUsageDescription
+#      等字串，macOS TCC 無法跳對話框，直接 silent deny。
+#      解法：在 .app 內塞一個複製來的 Python.app shim，改它的 Info.plist 加 4 條
+#      usage description + 新 bundle id（com.jerrychen.whisperpro.python）。
 #
 # 用法：
 #   bash build_app.sh
 #
 # 結果：
 #   ~/Applications/WhisperPro.app/
-#
-# 這是「薄殼」做法 —— .app 內不含 Python interpreter，只放一個 bash 啟動
-# 腳本，exec 出去呼叫專案 venv 的 python3 main.py。
+#     Contents/
+#       Info.plist            主 bundle（com.jerrychen.whisperpro）
+#       MacOS/WhisperPro      launcher，exec 出去呼叫 shim Python
+#       Frameworks/Python.app shim（com.jerrychen.whisperpro.python，含 4 條 usage description）
+#       Resources/AppIcon.icns
 
 set -euo pipefail
 
@@ -23,15 +28,22 @@ APP_ROOT="$HOME/Applications/WhisperPro.app"
 CONTENTS_DIR="$APP_ROOT/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
+FRAMEWORKS_DIR="$CONTENTS_DIR/Frameworks"
 LAUNCHER="$MACOS_DIR/WhisperPro"
 PLIST="$CONTENTS_DIR/Info.plist"
 ICON_DEST="$RESOURCES_DIR/AppIcon.icns"
 
+SYSTEM_PYTHON_APP="/Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app"
+SHIM_APP="$FRAMEWORKS_DIR/Python.app"
+SHIM_PLIST="$SHIM_APP/Contents/Info.plist"
+
 # ─── Step 1：建立 bundle 結構 ────────────────────────────────────────
 mkdir -p "$HOME/Applications"
-mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
+mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" "$FRAMEWORKS_DIR"
 
-# ─── Step 2：寫 Info.plist ───────────────────────────────────────────
+# ─── Step 2：寫主 Info.plist ─────────────────────────────────────────
+# LSArchitecturePriority=arm64 讓 launchd 一開始就以 arm64 啟動 launcher，
+# 不需要 arch -arm64 包裝（避免弄壞 responsibility chain）。
 cat > "$PLIST" <<'PLIST_EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -57,6 +69,10 @@ cat > "$PLIST" <<'PLIST_EOF'
     <string>13.0</string>
     <key>LSUIElement</key>
     <false/>
+    <key>LSArchitecturePriority</key>
+    <array>
+        <string>arm64</string>
+    </array>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
@@ -72,32 +88,82 @@ cat > "$PLIST" <<'PLIST_EOF'
 PLIST_EOF
 
 # ─── Step 3：寫 launcher 腳本 ────────────────────────────────────────
-# 關鍵：用 exec 替換 process，確保 responsible process 鏈
-# = WhisperPro.app → python3（bash 不殘留為中間層）
+# 用 .app 內建 Python shim（含 NSMicrophoneUsageDescription），TCC 對話框才會跳。
 cat > "$LAUNCHER" <<'LAUNCHER_EOF'
 #!/bin/bash
-# Whisper Pro launcher — keeps macOS Privacy/TCC attribution on this .app bundle.
-# 用 exec 替換 process，確保 responsible process 鏈 = WhisperPro.app → python3
+# Whisper Pro launcher — 用 .app 內建的 Python shim，TCC 歸帳到 com.jerrychen.whisperpro.python
+#
+# 關鍵：
+#   1. 主 Info.plist 已加 LSArchitecturePriority=arm64，launchd 會直接以 arm64 啟動本 launcher，
+#      不需要 arch -arm64 包裝（避免弄壞 responsibility chain）。
+#   2. 用 Contents/Frameworks/Python.app/Contents/MacOS/Python 而非 venv 的 symlink，
+#      讓 TCC 歸帳到 shim 的 bundle id（含 NSMicrophoneUsageDescription 等）。
+#   3. PYTHONPATH 接 venv site-packages 以提供 numpy / sounddevice / customtkinter 等套件。
 
 PROJECT_DIR="/Users/jerrychen/project/Claude_code"
-VENV_PYTHON="$PROJECT_DIR/venv/bin/python3"
+APP_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+SHIM_PYTHON="$APP_DIR/Contents/Frameworks/Python.app/Contents/MacOS/Python"
+STDERR_LOG="$HOME/.whisper_app/launcher_stderr.log"
 
-if [[ ! -x "$VENV_PYTHON" ]]; then
-    osascript -e "display alert \"Whisper Pro 啟動失敗\" message \"找不到 Python venv：$VENV_PYTHON\" as critical"
+mkdir -p "$HOME/.whisper_app"
+exec 2>"$STDERR_LOG"
+echo "=== launcher start $(date '+%F %T') ===" >&2
+
+if [[ ! -x "$SHIM_PYTHON" ]]; then
+    osascript -e "display alert \"Whisper Pro 啟動失敗\" message \"Python shim 不存在：$SHIM_PYTHON。請重跑 build_app.sh 重建。\" as critical"
     exit 1
 fi
 
 cd "$PROJECT_DIR" || {
-    osascript -e "display alert \"Whisper Pro 啟動失敗\" message \"無法切換到專案目錄：$PROJECT_DIR\" as critical"
+    osascript -e "display alert \"Whisper Pro 啟動失敗\" message \"專案目錄不存在：$PROJECT_DIR\" as critical"
     exit 1
 }
 
-exec "$VENV_PYTHON" main.py
+# 接上 venv 的 site-packages（沒有 venv 我們 shim 也跑不起來，因為缺 numpy / sounddevice 等）
+export PYTHONPATH="$PROJECT_DIR/venv/lib/python3.13/site-packages:${PYTHONPATH:-}"
+
+exec "$SHIM_PYTHON" main.py
 LAUNCHER_EOF
 
 chmod +x "$LAUNCHER"
 
-# ─── Step 4：複製圖示 ───────────────────────────────────────────────
+# ─── Step 4：複製 Python.app 並改 Info.plist（shim）──────────────────
+if [[ ! -d "$SYSTEM_PYTHON_APP" ]]; then
+    echo "  ✗ 錯誤：找不到系統 Python.app：$SYSTEM_PYTHON_APP"
+    echo "    請先用 python.org 官方安裝包安裝 Python 3.13。"
+    exit 1
+fi
+
+# 清乾淨再複製，確保 idempotent
+rm -rf "$SHIM_APP"
+cp -R "$SYSTEM_PYTHON_APP" "$SHIM_APP"
+echo "  ✓ 複製 Python.app → Contents/Frameworks/Python.app"
+
+# 改 shim Info.plist（先 convert 成 xml1，再用 plutil -remove/-insert 達成 idempotent）
+plutil -convert xml1 "$SHIM_PLIST"
+
+plutil -replace CFBundleIdentifier -string "com.jerrychen.whisperpro.python" "$SHIM_PLIST"
+plutil -replace CFBundleName -string "Whisper Pro" "$SHIM_PLIST"
+plutil -remove CFBundleDisplayName "$SHIM_PLIST" 2>/dev/null || true
+plutil -insert CFBundleDisplayName -string "Whisper Pro" "$SHIM_PLIST"
+
+for key in NSMicrophoneUsageDescription NSAccessibilityUsageDescription NSInputMonitoringUsageDescription NSAppleEventsUsageDescription; do
+    plutil -remove "$key" "$SHIM_PLIST" 2>/dev/null || true
+done
+plutil -insert NSMicrophoneUsageDescription -string "Whisper Pro 需要存取麥克風以將你的語音轉為文字。" "$SHIM_PLIST"
+plutil -insert NSAccessibilityUsageDescription -string "Whisper Pro 需要輔助使用權限以模擬 ⌘V 自動貼上至游標位置。" "$SHIM_PLIST"
+plutil -insert NSInputMonitoringUsageDescription -string "Whisper Pro 需要監聽全域熱鍵以啟動錄音。" "$SHIM_PLIST"
+plutil -insert NSAppleEventsUsageDescription -string "Whisper Pro 需要透過 AppleScript 偵測前景應用程式並自動貼上轉錄文字。" "$SHIM_PLIST"
+
+plutil -lint "$SHIM_PLIST" >/dev/null
+echo "  ✓ shim Info.plist 已注入 bundle id 與 4 條 usage description"
+
+# 清掉舊簽章後 adhoc 簽 shim
+xattr -cr "$SHIM_APP"
+codesign --force --deep --sign - "$SHIM_APP" 2>/dev/null
+echo "  ✓ shim adhoc 簽章完成（com.jerrychen.whisperpro.python）"
+
+# ─── Step 5：複製圖示 ───────────────────────────────────────────────
 if [[ -f "$PROJECT_DIR/assets/WhisperPro.icns" ]]; then
     cp "$PROJECT_DIR/assets/WhisperPro.icns" "$ICON_DEST"
     echo "  ✓ 圖示：assets/WhisperPro.icns → Resources/AppIcon.icns"
@@ -108,10 +174,17 @@ else
     echo "  ⚠ 警告：找不到 assets/WhisperPro.icns 或 assets/icon.icns；App 將以預設圖示顯示"
 fi
 
-# ─── Step 5：清掉 quarantine flag ───────────────────────────────────
+# ─── Step 6：清 xattr 並重簽整個 .app ───────────────────────────────
 xattr -cr "$APP_ROOT" 2>/dev/null || true
+codesign --force --deep --sign - "$APP_ROOT" 2>/dev/null
+echo "  ✓ WhisperPro.app adhoc 簽章完成（com.jerrychen.whisperpro）"
 
-# ─── Step 6：報告結果 ───────────────────────────────────────────────
+# ─── Step 7：清掉 TCC 舊紀錄（讓對話框首次重跳）──────────────────────
+for service in Microphone Accessibility ListenEvent AppleEvents; do
+    tccutil reset "$service" com.jerrychen.whisperpro.python 2>/dev/null || true
+done
+
+# ─── Step 8：報告結果 ───────────────────────────────────────────────
 cat <<'REPORT_EOF'
 
 ✓ WhisperPro.app 建構完成
@@ -120,7 +193,8 @@ cat <<'REPORT_EOF'
 首次啟動：
   1. 用 Spotlight 搜 "Whisper Pro"（或從 Finder 雙擊 ~/Applications/WhisperPro.app）
   2. 第一次跳 Gatekeeper 警告：右鍵 → 打開（或系統設定 → 隱私權與安全性 → 允許）
-  3. 按熱鍵開始錄音時會跳 3 個權限對話框，全部「允許」
+  3. 按熱鍵開始錄音時會跳 3 個權限對話框，全部「允許」（會以 shim bundle
+     com.jerrychen.whisperpro.python 名義出現）
 
 之後不管從哪裡開（Spotlight / Dock / Finder）權限都會延續，不用重複授權。
 REPORT_EOF
