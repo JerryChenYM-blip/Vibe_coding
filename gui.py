@@ -151,6 +151,11 @@ class AppWindow(ctk.CTkFrame):
     # 5 秒是權衡：> 10s 使用者感知太慢，< 1s 過密無意義（running 檢查 ~µs）。
     HOTKEY_WATCHDOG_INTERVAL_MS = 5000
 
+    # 穩定性（Fix 4 / 2026-05-21）：processing 狀態超時自癒上限。
+    # MLX 對 large-v3-turbo：RTF ≈ 0.1，60s 音訊 → 6s 推論；cold start +5-10s；
+    # 60s 有 ~40s 緩衝，避免誤殺正常推論。若使用者誤殺再放大或設計可設定。
+    PROCESSING_TIMEOUT_MS = 60_000
+
     def __init__(self, master: ctk.CTk, cfg: Config) -> None:
         super().__init__(master, fg_color=BG, corner_radius=0)
         self.pack(fill="both", expand=True)
@@ -691,6 +696,9 @@ class AppWindow(ctk.CTkFrame):
         log_state("recording->processing", duration_s=f"{duration:.2f}")
         self._state            = "processing"
         self._state_start_time = time.perf_counter()
+        # 穩定性（Fix 4 / 2026-05-21）：記錄 processing 進入時間並排程 60s 自癒檢查
+        self._processing_started_at = time.monotonic()
+        self.after(self.PROCESSING_TIMEOUT_MS, self._processing_timeout_check)
 
         if self._stream_tick_id is not None:
             self.after_cancel(self._stream_tick_id)
@@ -840,6 +848,28 @@ class AppWindow(ctk.CTkFrame):
             )
             self._transition_to_idle(empty)
         self._show_toast("⚠ 轉錄失敗")
+
+    def _processing_timeout_check(self) -> None:
+        """processing 狀態超過 60s 沒結束 → 強制切回 idle（Fix 4 / 2026-05-21）。
+
+        對應 _transition_to_processing 排程的 after。若狀態早已正常切回 idle 則
+        no-op；若超時則 log_warning + log_action + 強制 idle + toast。
+        """
+        if self._state != "processing":
+            return   # 已正常結束，無事
+        elapsed = time.monotonic() - getattr(self, "_processing_started_at", 0)
+        if elapsed >= self.PROCESSING_TIMEOUT_MS / 1000:
+            log.warning(f"STATE: processing stuck >{elapsed:.0f}s — force idle")
+            log_action("state_processing_timeout_recovered", elapsed_s=f"{elapsed:.1f}")
+            empty = TranscriptionResult(
+                text="（轉錄超時，請重試）",
+                language="",
+                duration_seconds=0.0,
+                elapsed_seconds=elapsed,
+                segments=[],
+            )
+            self._transition_to_idle(empty)
+            self._show_toast("⏱ 轉錄超時 — 已自動恢復")
 
     def _on_transcription_done(self, result: TranscriptionResult) -> None:
         """主執行緒：轉錄完成後決定是否走潤飾流程，並觸發剪貼簿 / 自動貼上。"""
