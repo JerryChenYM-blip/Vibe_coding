@@ -221,12 +221,16 @@ class AppWindow(ctk.CTkFrame):
         # 死掉就自動 restart（macOS CGEventTap 偶爾會被系統內部停掉，零 log）
         self.after(self.HOTKEY_WATCHDOG_INTERVAL_MS, self._hotkey_watchdog)
         # 穩定性（Fix 5 / 2026-05-22）：macOS Dock icon 點擊把最小化的視窗叫回來。
-        # Tk-on-macOS 透過 ::tk::mac::ReopenApplication 接收 dock reopen 事件；
-        # 非 macOS 或舊版 Tk 沒此 command，try/except 靜默 fallback。
+        # 兩條保險絲（Apple Event 處理在 shim Python.app 上可能不完整）：
+        #   1. ::tk::mac::ReopenApplication — Tk-on-macOS 的官方 idiom，但需要
+        #      AppleEvent handler 註冊完整才會觸發
+        #   2. <<Activate>> 虛擬事件 — App 取得焦點時觸發，較可靠的 fallback
+        #      （只在 iconic 狀態才 deiconify，避免每次 focus 都干擾）
         try:
             self.createcommand('::tk::mac::ReopenApplication', self._on_dock_reopen)
         except Exception:
             pass
+        self.bind("<<Activate>>", self._on_app_activate)
         self.after(1500, self._warmup_model)
         # 開啟著的話再去探 Ollama；即使 Ollama 離線也不會卡 UI 建構。
         self.after(2000, self._refresh_ollama_health)
@@ -1884,9 +1888,28 @@ class AppWindow(ctk.CTkFrame):
             self.deiconify()      # 取消 iconify／minimize 狀態
             self.lift()           # 提到視窗最上層
             self.focus_force()    # 強制取焦點
-            log_action("dock_reopen_recovered")
+            log_action("dock_reopen_recovered", source="ReopenApplication")
         except Exception:
-            log_error("dock_reopen_failed")
+            log_error("dock_reopen_failed", source="ReopenApplication")
+
+    def _on_app_activate(self, event=None) -> None:
+        """macOS Fix 5b：App 取得焦點時若視窗是最小化狀態，自動 deiconify。
+
+        Tk <<Activate>> 虛擬事件在 App 取得焦點時觸發。比 Apple Event
+        ReopenApplication 更可靠（後者需要 Cocoa AE handler 完整註冊，
+        在 shim Python.app 上不一定 work）。
+
+        只在 iconic / withdrawn 狀態才 deiconify，避免每次 focus 都
+        干擾使用者（例如使用者只是 ⌘+Tab 切過來看一眼）。
+        """
+        try:
+            state = self.state()  # 'normal' / 'iconic' / 'withdrawn'
+            if state in ("iconic", "withdrawn"):
+                self.deiconify()
+                self.lift()
+                log_action("dock_reopen_recovered", source="Activate", state=state)
+        except Exception:
+            log_error("dock_reopen_failed", source="Activate")
 
     def _warmup_model(self) -> None:
         """背景預熱 Whisper 模型（延遲 1.5s 後執行，避免阻礙 UI 初始化）。"""
