@@ -788,23 +788,49 @@ class AppWindow(ctk.CTkFrame):
         """背景執行緒：呼叫 Whisper 做最終轉錄，完成後 marshal 到主執行緒。
 
         若有中段串流結果，將其與最終文字合併後一起回傳。
-        """
-        # 一律用使用者選的模型做最終轉錄，不再因短音檔退化到 transcribe_fast
-        # （那條路徑寫死 small，會嚴重拖垮品質）。
-        result = self.transcriber.transcribe(audio, model_size=model, language=lang)
 
-        prior = list(self._stream_chunks)
-        if prior:
-            tail = result.text if result.text != "（未偵測到語音內容）" else ""
-            combined = "".join(prior) + tail
-            result = result.__class__(
-                text=combined.strip() or "（未偵測到語音內容）",
-                language=result.language,
-                duration_seconds=result.duration_seconds,
-                elapsed_seconds=result.elapsed_seconds,
-                segments=result.segments,
+        穩定性（Fix 3 / 2026-05-21）：整段包 try/except；若 transcribe()
+        throw（模型載入失敗 / OOM / VAD 異常），_on_transcription_done 不會
+        被排程，狀態機會卡在 processing 永不歸位。改在這裡 marshal
+        _on_transcription_failed 回主執行緒把狀態切回 idle。
+        """
+        try:
+            # 一律用使用者選的模型做最終轉錄，不再因短音檔退化到 transcribe_fast
+            # （那條路徑寫死 small，會嚴重拖垮品質）。
+            result = self.transcriber.transcribe(audio, model_size=model, language=lang)
+
+            prior = list(self._stream_chunks)
+            if prior:
+                tail = result.text if result.text != "（未偵測到語音內容）" else ""
+                combined = "".join(prior) + tail
+                result = result.__class__(
+                    text=combined.strip() or "（未偵測到語音內容）",
+                    language=result.language,
+                    duration_seconds=result.duration_seconds,
+                    elapsed_seconds=result.elapsed_seconds,
+                    segments=result.segments,
+                )
+            self.after(0, self._on_transcription_done, result)
+        except Exception as e:
+            log_error("transcription_failed", model=model, error=str(e))
+            self.after(0, self._on_transcription_failed, str(e))
+
+    def _on_transcription_failed(self, err_msg: str) -> None:
+        """主執行緒：轉錄失敗時把狀態從 processing 切回 idle，顯示 toast。
+
+        Fix 3 / 2026-05-21：沿用既有 _transition_to_idle(result) 路徑，
+        不新增狀態；用一個帶失敗訊息的空 TranscriptionResult 觸發回 idle。
+        """
+        if self._state == "processing":
+            empty = TranscriptionResult(
+                text="（轉錄失敗，請查看 log）",
+                language="",
+                duration_seconds=0.0,
+                elapsed_seconds=0.0,
+                segments=[],
             )
-        self.after(0, self._on_transcription_done, result)
+            self._transition_to_idle(empty)
+        self._show_toast("⚠ 轉錄失敗")
 
     def _on_transcription_done(self, result: TranscriptionResult) -> None:
         """主執行緒：轉錄完成後決定是否走潤飾流程，並觸發剪貼簿 / 自動貼上。"""
