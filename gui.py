@@ -3641,6 +3641,54 @@ class MiniRecordingWindow(tk.Toplevel):
         # 預設隱藏；由 AppWindow 透過 .show() 顯示
         self.withdraw()
 
+    # ── 跟游標所在螢幕（Speakly 風格）──────────────────────────────────────
+    def _position_at_cursor_screen_bottom(self) -> None:
+        """把 HUD 移到游標所在螢幕的中下方，距底部 BOTTOM_MARGIN px。
+
+        多螢幕座標換算：NSScreen.frame 用左下原點、Tk geometry 用左上原點，
+        且 origin 不是 (0,0)（副螢幕可能在主螢幕左 / 右 / 上）。
+        Tk 的 y 是相對「主螢幕（screens[0]）」的左上座標。
+        """
+        try:
+            from AppKit import NSScreen, NSEvent  # type: ignore
+
+            mouse_loc = NSEvent.mouseLocation()
+            target_screen = None
+            for screen in NSScreen.screens():
+                f = screen.frame()
+                if (f.origin.x <= mouse_loc.x <= f.origin.x + f.size.width and
+                        f.origin.y <= mouse_loc.y <= f.origin.y + f.size.height):
+                    target_screen = screen
+                    break
+            if target_screen is None:
+                target_screen = NSScreen.mainScreen()
+
+            sf = target_screen.frame()
+            primary_h = NSScreen.screens()[0].frame().size.height
+
+            # x：目標螢幕水平居中
+            ns_x = sf.origin.x + (sf.size.width - self.WIN_W) / 2
+            # y：NS 左下座標 → 目標螢幕底邊 + BOTTOM_MARGIN 為 HUD 下緣
+            ns_y_bottom = sf.origin.y + self.BOTTOM_MARGIN
+            # Tk y（左上原點）= primary_h - HUD 上緣 NS y
+            #                = primary_h - (ns_y_bottom + WIN_H)
+            tk_y = int(primary_h - (ns_y_bottom + self.WIN_H))
+            tk_x = int(ns_x)
+
+            self.geometry(f"{self.WIN_W}x{self.WIN_H}+{tk_x}+{tk_y}")
+        except Exception as e:
+            # 取游標螢幕失敗 → fallback：主螢幕中下方（用 Tk 原生 API）
+            log_error(f"mini_hud_position_failed: {e}")
+            try:
+                self.update_idletasks()
+                sw = self.winfo_screenwidth()
+                sh = self.winfo_screenheight()
+                x = (sw - self.WIN_W) // 2
+                y = sh - self.WIN_H - self.BOTTOM_MARGIN
+                self.geometry(f"{self.WIN_W}x{self.WIN_H}+{x}+{y}")
+            except Exception:
+                pass
+
     # ── PyObjC NSPanel-level 升級 ──────────────────────────────────────────
     def _upgrade_to_panel_level(self) -> None:
         """把對應 NSWindow 升到 NSStatusWindowLevel + collectionBehavior。
@@ -3690,16 +3738,23 @@ class MiniRecordingWindow(tk.Toplevel):
             log_error(f"mini_hud_panel_upgrade_failed: {e}")
 
     def show_recording(self) -> None:
-        """進入錄音狀態 → 顯示紅點 + 「錄音中」+ 0:00 計時。"""
+        """進入錄音狀態 → 顯示紅點 + 「錄音中」+ 0:00 計時。
+
+        每次顯示前重新定位到游標所在螢幕中下方（Speakly 風格）。
+        """
         if self._closed:
             return
+        self._position_at_cursor_screen_bottom()
         self._dot.configure(fg=DANGER)
         self._label.configure(text="錄音中")
         self._timer.configure(text="00:00")
         self.deiconify()
 
     def show_processing(self) -> None:
-        """進入處理中狀態 → 琥珀色 + 「轉錄中」。"""
+        """進入處理中狀態 → 琥珀色 + 「轉錄中」。
+
+        錄音剛結束時延續錄音時的位置；不重定位，避免 HUD 跳動。
+        """
         if self._closed:
             return
         self._dot.configure(fg=WARN)
