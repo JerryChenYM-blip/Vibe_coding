@@ -157,6 +157,12 @@ class AppWindow(ctk.CTkFrame):
     # 60s 有 ~40s 緩衝，避免誤殺正常推論。若使用者誤殺再放大或設計可設定。
     PROCESSING_TIMEOUT_MS = 60_000
 
+    # Fix 9 / 2026-05-22（P2-A）：動態 timeout = max(60s, audio_len_s × RTF_BUDGET)
+    # CPU faster-whisper backend 對 5 分鐘音訊 RTF ≈ 0.3-0.5，需要 90-150s 推論；
+    # 60s 固定 timeout 會 100% 誤殺。給 1.0x 即時當上限，等同 60s 音訊配 60s 推論。
+    PROCESSING_TIMEOUT_BASE_MS = 60_000
+    PROCESSING_TIMEOUT_RTF_BUDGET = 1.0
+
     def __init__(self, master: ctk.CTk, cfg: Config) -> None:
         super().__init__(master, fg_color=BG, corner_radius=0)
         self.pack(fill="both", expand=True)
@@ -712,8 +718,14 @@ class AppWindow(ctk.CTkFrame):
         if self._mini_window is not None:
             self._mini_window.show_recording()
 
-    def _transition_to_processing(self) -> None:
-        """狀態機：recording → processing。停止麥克風並在背景執行緒跑 Whisper。"""
+    def _transition_to_processing(self, audio_duration_s: float = 0.0) -> None:
+        """狀態機：recording → processing。停止麥克風並在背景執行緒跑 Whisper。
+
+        Fix 9 / 2026-05-22（P2-A）：timeout 改成動態（依音訊長度推算）。
+        呼叫端可顯式傳 `audio_duration_s`（測試用）；否則內部 stop 後從
+        `full_audio` 長度自己算（生產路徑）。取兩者大值作為 timeout，
+        保證 BASE 60s 為下限。
+        """
         if self._state != "recording":
             log.debug(f"_transition_to_processing ignored (state={self._state})")
             return
@@ -721,15 +733,29 @@ class AppWindow(ctk.CTkFrame):
         log_state("recording->processing", duration_s=f"{duration:.2f}")
         self._state            = "processing"
         self._state_start_time = time.perf_counter()
-        # 穩定性（Fix 4 / 2026-05-21）：記錄 processing 進入時間並排程 60s 自癒檢查
-        self._processing_started_at = time.monotonic()
-        self.after(self.PROCESSING_TIMEOUT_MS, self._processing_timeout_check)
 
         if self._stream_tick_id is not None:
             self.after_cancel(self._stream_tick_id)
             self._stream_tick_id = None
 
         full_audio = self.recorder.stop()
+
+        # 動態 timeout：取呼叫端傳入值 / 實際錄音長度 / recording 階段 elapsed
+        # 三者最大；至少 BASE 60s 為下限，避免 CPU backend + 長音檔誤殺。
+        measured_audio_s = max(
+            audio_duration_s,
+            len(full_audio) / 16_000.0 if len(full_audio) else 0.0,
+            duration,
+        )
+        dynamic_timeout_ms = max(
+            self.PROCESSING_TIMEOUT_BASE_MS,
+            int(measured_audio_s * self.PROCESSING_TIMEOUT_RTF_BUDGET * 1000),
+        )
+        # 穩定性（Fix 4 / 2026-05-21、Fix 9 / 2026-05-22）：記錄 processing
+        # 進入時間並排程動態自癒檢查
+        self._processing_started_at = time.monotonic()
+        self._processing_timeout_ms = dynamic_timeout_ms
+        self.after(dynamic_timeout_ms, self._processing_timeout_check)
 
         # UI：Chamber 渲染迴圈下一 tick 會自動切換到 WARN 配色 + 粒子旋轉環
         self._timer_label.configure(text="")
@@ -885,15 +911,19 @@ class AppWindow(ctk.CTkFrame):
         self._show_toast("⚠ 轉錄失敗")
 
     def _processing_timeout_check(self) -> None:
-        """processing 狀態超過 60s 沒結束 → 強制切回 idle（Fix 4 / 2026-05-21）。
+        """processing 狀態超過動態 timeout 沒結束 → 強制切回 idle（Fix 4 / 2026-05-21、
+        Fix 9 / 2026-05-22）。
 
         對應 _transition_to_processing 排程的 after。若狀態早已正常切回 idle 則
         no-op；若超時則 log_warning + log_action + 強制 idle + toast。
+        Fix 9：timeout 上限改成依音訊長度動態算，比較 elapsed 用 instance 上記的
+        `_processing_timeout_ms`，無記則 fallback BASE 60s。
         """
         if self._state != "processing":
             return   # 已正常結束，無事
         elapsed = time.monotonic() - getattr(self, "_processing_started_at", 0)
-        if elapsed >= self.PROCESSING_TIMEOUT_MS / 1000:
+        timeout_s = getattr(self, "_processing_timeout_ms", self.PROCESSING_TIMEOUT_BASE_MS) / 1000
+        if elapsed >= timeout_s:
             log.warning(f"STATE: processing stuck >{elapsed:.0f}s — force idle")
             log_action("state_processing_timeout_recovered", elapsed_s=f"{elapsed:.1f}")
             empty = TranscriptionResult(
