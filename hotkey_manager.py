@@ -3,7 +3,7 @@ macOS 全域快捷鍵管理器。
 
 功能：
   • HotkeyManager：監聽可設定的組合鍵，觸發時呼叫 callback
-  • capture_hotkey()：讓使用者互動式輸入新快捷鍵（給 HotkeyBindDialog 用）
+  • capture_hotkey()：DEPRECATED（HotkeyBindDialog 改用 Tk 原生 binding）
   • parse_hotkey() / format_hotkey()：字串解析與格式化工具函式
 
 行為：tap toggle（點按切換）
@@ -12,10 +12,26 @@ macOS 全域快捷鍵管理器。
   • 只按部分組合（例如 cmd+alt 沒按 r）→ 不 fire
   • 由呼叫端（GUI）依目前狀態決定 tap 對應的動作（開始或停止錄音）
 
-執行緒安全修正（相較舊版）：
-  1. callback 在鎖外呼叫，消除 callback 內持鎖造成的死鎖風險
-  2. stop() 先在鎖內取出 listener 參照、清空狀態，再在鎖外 stop()
-  3. 自我修復機制：combo_active 卡住超過 _STALE_COMBO_SEC 秒視為漏收事件，下次 press 自動重置
+後端（2026-05-22 改）：
+  根治 pynput 1.7.7 在 macOS 26.4+ 的所有 crash（TSM 主執行緒斷言、
+  SLEventTapIsEnabled PAC violation、idle timeout disable）。
+  改用 macOS 原生 NSEvent.addGlobalMonitorForEventsMatchingMask_handler_
+  + addLocalMonitorForEventsMatchingMask_handler_。
+    • handler 永遠在主執行緒（Cocoa main runloop）執行；無 thread、無 ctypes、
+      無 TSM 同步問題
+    • global monitor：其他 App 焦點時收事件
+    • local monitor：本 App 焦點時收事件（global 不會發給自己）
+    • NSEvent 不會被 idle 自動 disable（不是 CGEventTap），無需 re-enable
+  pynput 仍 import 用於：
+    • parse_hotkey() 公開介面的 Key 物件回傳值
+    • auto_paste.py 的 keyboard.Controller（送 ⌘V，主執行緒呼叫安全）
+  若 PyObjC 不可用，退化用 pynput Listener 作為 fallback（舊行為）。
+
+執行緒安全要點：
+  1. NSEvent handler 在主執行緒呼叫，可直接動 Tk widget（不需 self.after marshal）
+  2. handler 內仍包 try/except，意外 exception 不可外洩到 Cocoa runtime
+  3. stop() 先在鎖內取出 monitor 參照、清空狀態，再在鎖外 removeMonitor:
+  4. 自我修復機制：combo_active 卡住超過 _STALE_COMBO_SEC 秒視為漏收事件，下次 press 自動重置
 """
 
 from __future__ import annotations
@@ -33,13 +49,89 @@ try:
 except ImportError:
     _PYNPUT_AVAILABLE = False
 
+# NSEvent 後端（PyObjC）。需要：pip install pyobjc-framework-Cocoa（已隨 PyObjC 一併安裝）
+# 載入失敗時自動退化到 pynput fallback（保留舊行為）。
+try:
+    from AppKit import (
+        NSEvent,
+        NSEventMaskFlagsChanged,
+        NSEventMaskKeyDown,
+        NSEventMaskKeyUp,
+        NSEventModifierFlagCommand,
+        NSEventModifierFlagOption,
+        NSEventModifierFlagControl,
+        NSEventModifierFlagShift,
+    )
+    _NSEVENT_AVAILABLE = True
+except ImportError:
+    _NSEVENT_AVAILABLE = False
+
 from logger import get_logger, log_action, log_error
 
 log = get_logger("hotkey")
 
-# combo_active=True 持續超過此秒數仍未見 release，視為 pynput 漏收事件。
+# combo_active=True 持續超過此秒數仍未見 release，視為漏收事件。
 # 選 10 秒：toggle 模式下使用者可能按住很久才放（雖無此必要），給足容忍度。
 _STALE_COMBO_SEC = 10.0
+
+
+# ── macOS 虛擬鍵碼 → 側別感知 modifier ─────────────────────────────────────────
+# 來源：HIToolbox/Events.h（kVK_*）。所有 macOS 鍵盤都遵守此編碼。
+# 用於 NSEvent.keyCode() 對 FlagsChanged 事件的轉換。
+_KEYCODE_TO_SIDED_MOD: dict[int, str] = {
+    54:  "cmd_r",
+    55:  "cmd_l",
+    58:  "alt_l",     # left option
+    61:  "alt_r",     # right option
+    59:  "ctrl_l",
+    62:  "ctrl_r",
+    56:  "shift_l",
+    60:  "shift_r",
+}
+
+# 側別 modifier 名稱 → 該 modifier 對應的 NSEvent 修飾旗標 bit。
+# 用來判斷某顆 modifier 在 FlagsChanged 事件當下是「按下」還是「放開」。
+def _modifier_bit_for(sided_name: str) -> int:
+    if _NSEVENT_AVAILABLE:
+        if sided_name.startswith("cmd"):   return NSEventModifierFlagCommand
+        if sided_name.startswith("alt"):   return NSEventModifierFlagOption
+        if sided_name.startswith("ctrl"):  return NSEventModifierFlagControl
+        if sided_name.startswith("shift"): return NSEventModifierFlagShift
+    return 0
+
+
+# macOS keycode → US keyboard 字元（用於 KeyDown/KeyUp 事件比對 combo 中的字母鍵）。
+# 只需要覆蓋 combo 字串會出現的字母 / 數字 / space。沒列到的鍵照 NSEvent
+# charactersIgnoringModifiers() 回傳，保險用。
+_KEYCODE_TO_CHAR: dict[int, str] = {
+    0:  "a",  11: "b",  8:  "c",  2:  "d",  14: "e",  3:  "f",  5:  "g",  4:  "h",
+    34: "i",  38: "j",  40: "k",  37: "l",  46: "m",  45: "n",  31: "o",  35: "p",
+    12: "q",  15: "r",  1:  "s",  17: "t",  32: "u",  9:  "v",  13: "w",  7:  "x",
+    16: "y",  6:  "z",
+    29: "0",  18: "1",  19: "2",  20: "3",  21: "4",  23: "5",  22: "6",  26: "7",
+    28: "8",  25: "9",
+    49: " ",   # space
+}
+
+
+def _sided_name_to_pynput_key(sided_name: str):
+    """側別 modifier 名稱（cmd_r 等）→ pynput Key 物件（與 parse_hotkey 一致）。
+
+    用於把 NSEvent 收到的 modifier 事件對齊到 _pressed 集合的型別，
+    讓 `_hotkeys.issubset(_pressed)` 等既有邏輯不必改。
+    """
+    if not _PYNPUT_AVAILABLE:
+        return sided_name   # 退化：拿名稱當識別符（不會有匹配，但不會崩）
+    return {
+        "cmd_r":   Key.cmd_r,
+        "cmd_l":   Key.cmd_l,
+        "alt_r":   Key.alt_r,
+        "alt_l":   Key.alt_l,
+        "ctrl_r":  Key.ctrl_r,
+        "ctrl_l":  Key.ctrl_l,
+        "shift_r": Key.shift_r,
+        "shift_l": Key.shift_l,
+    }.get(sided_name, sided_name)
 
 
 # ── 系統查詢 ──────────────────────────────────────────────────────────────────
@@ -47,6 +139,14 @@ _STALE_COMBO_SEC = 10.0
 def is_pynput_available() -> bool:
     """回傳 pynput 是否已安裝且可 import。"""
     return _PYNPUT_AVAILABLE
+
+
+def is_nsevent_available() -> bool:
+    """回傳 PyObjC（AppKit.NSEvent）是否可用。
+
+    NSEvent 後端是 macOS 26.4+ 的首選；不可用時退化到 pynput Listener。
+    """
+    return _NSEVENT_AVAILABLE
 
 
 def check_accessibility() -> bool:
@@ -346,7 +446,7 @@ class HotkeyManager:
 
         Args:
             on_tap_cb: 組合鍵 tap（完整按下後放開）時的回呼；
-                       在 pynput 執行緒呼叫，呼叫端負責 marshal 回主執行緒。
+                       NSEvent 後端在主執行緒呼叫；pynput fallback 後端在背景執行緒。
         """
         self._on_tap_cb      = on_tap_cb
         self._hotkeys:       set  = set()            # 目前監聽的鍵值集合
@@ -354,7 +454,10 @@ class HotkeyManager:
         self._combo_active:  bool = False            # 組合鍵是否已完整按下（pending release 觸發 tap）
         self._combo_active_at: float = 0.0           # 最後一次完整按下的時間戳
         self._last_event_at:   float = 0.0           # 最後一次事件的時間戳
-        self._listener: Optional[_kb.Listener] = None
+        self._listener: Optional[_kb.Listener] = None   # pynput fallback 後端
+        self._monitor_global = None                    # NSEvent 後端：其他 App focus 時收事件
+        self._monitor_local  = None                    # NSEvent 後端：本 App focus 時收事件
+        self._backend:       str = "none"              # "nsevent" / "pynput" / "none"
         self._lock = threading.Lock()
         # Lone-modifier 模式狀態
         # 啟用條件：len(_hotkeys) == 1 且該鍵為側別 modifier
@@ -370,6 +473,8 @@ class HotkeyManager:
 
     def restart(self, combo: str) -> None:
         """停止舊的監聽器並以新組合鍵啟動新監聽器。
+
+        後端優先序：NSEvent（PyObjC 可用時，預設）→ pynput Listener（fallback）。
 
         Args:
             combo: 組合鍵字串，例如 "cmd+alt+r" 或 lone modifier "right_cmd"。
@@ -392,36 +497,174 @@ class HotkeyManager:
         self._other_key_during_press = False
         self._first_press_logged = False
         mode = "lone-modifier" if self._is_lone_mode else "combo"
-        log.info(
-            f"HOTKEY: Starting listener for combo='{combo}' "
-            f"keys={self._hotkeys} mode={mode}"
+
+        # ── 後端選擇 ─────────────────────────────────────────────────
+        if _NSEVENT_AVAILABLE:
+            self._backend = "nsevent"
+            log.info(
+                f"HOTKEY: Starting NSEvent monitor for combo='{combo}' "
+                f"keys={self._hotkeys} mode={mode}"
+            )
+            self._start_nsevent_monitors()
+            log.info(f"HOTKEY: listener fully started at t={time.monotonic():.3f}")
+            return
+
+        if _PYNPUT_AVAILABLE:
+            self._backend = "pynput"
+            log.info(
+                f"HOTKEY: Starting pynput Listener (fallback) for combo='{combo}' "
+                f"keys={self._hotkeys} mode={mode}"
+            )
+            self._listener = _kb.Listener(
+                on_press=self._on_p,
+                on_release=self._on_r,
+                suppress=False,
+            )
+            self._listener.daemon = True
+            self._listener.start()
+            log.info(f"HOTKEY: listener fully started at t={time.monotonic():.3f}")
+            return
+
+        # 兩個後端都不可用：靜默降級（App 不崩潰）
+        self._backend = "none"
+        log.warning("HOTKEY: no backend available (NSEvent & pynput both missing)")
+
+    # ── NSEvent 後端 ────────────────────────────────────────────────────────
+
+    def _start_nsevent_monitors(self) -> None:
+        """安裝 NSEvent global + local monitor。
+
+        global monitor 只在其他 App 焦點時收事件（Cocoa 不發給「自己」），
+        所以同時加 local monitor 讓本 App 焦點時也能收。兩個 handler 共用
+        相同的事件處理函式（_handle_ns_event），語意一致。
+        """
+        mask = (
+            NSEventMaskFlagsChanged
+            | NSEventMaskKeyDown
+            | NSEventMaskKeyUp
         )
-        self._listener = _kb.Listener(
-            on_press=self._on_p,
-            on_release=self._on_r,
-            suppress=False,   # 不阻止按鍵事件傳到其他 App
+        self._monitor_global = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            mask, self._on_ns_event_global,
         )
-        self._listener.daemon = True
-        self._listener.start()
-        # 診斷：listener 完整啟動時間戳（B 任務）
-        log.info(f"HOTKEY: listener fully started at t={time.monotonic():.3f}")
+        # Local monitor：回傳 event 讓事件繼續傳遞給 Tk；回傳 None 會吃掉事件。
+        self._monitor_local = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+            mask, self._on_ns_event_local,
+        )
+
+    def _on_ns_event_global(self, event) -> None:
+        """Global monitor handler——其他 App 焦點時觸發。
+
+        handler 由 Cocoa 在主執行緒呼叫；try/except 包整段防 exception
+        外洩到 Cocoa runtime（會 abort 整個進程）。
+        """
+        try:
+            self._handle_ns_event(event)
+        except Exception:
+            log_error("hotkey_ns_global_failed")
+
+    def _on_ns_event_local(self, event):
+        """Local monitor handler——本 App 焦點時觸發。
+
+        必須回傳 event（讓事件繼續往下傳到 Tk），否則會把所有 key event
+        吃掉，App 自己的鍵盤輸入會壞掉。
+        """
+        try:
+            self._handle_ns_event(event)
+        except Exception:
+            log_error("hotkey_ns_local_failed")
+        return event   # 不要 suppress
+
+    def _handle_ns_event(self, event) -> None:
+        """NSEvent → 既有 _on_p / _on_r 邏輯的橋接器。
+
+        三種事件型別：
+          • FlagsChanged (12)：modifier 改變狀態；用 modifierFlags() 判定按下/放開
+          • KeyDown (10)：一般按鍵按下
+          • KeyUp (11)：一般按鍵放開
+
+        對每個事件決定它是 press 還是 release，再呼叫 _on_p / _on_r。
+        傳給 _on_p / _on_r 的 key 物件刻意做成「與 pynput 相容」的型別
+        （Key.cmd_r、字元 'r' 等），讓既有比對邏輯不必改。
+        """
+        evt_type = event.type()
+        keycode  = event.keyCode()
+
+        if evt_type == 12:   # NSEventTypeFlagsChanged
+            sided_name = _KEYCODE_TO_SIDED_MOD.get(keycode)
+            if sided_name is None:
+                return   # 不認識的 modifier keycode，忽略
+            bit = _modifier_bit_for(sided_name)
+            is_pressed = bool(event.modifierFlags() & bit)
+            key_obj = _sided_name_to_pynput_key(sided_name)
+            if is_pressed:
+                self._on_p(key_obj)
+            else:
+                self._on_r(key_obj)
+            return
+
+        if evt_type == 10:   # NSEventTypeKeyDown
+            self._on_p(self._ns_keycode_to_key(event, keycode))
+            return
+
+        if evt_type == 11:   # NSEventTypeKeyUp
+            self._on_r(self._ns_keycode_to_key(event, keycode))
+            return
+
+    @staticmethod
+    def _ns_keycode_to_key(event, keycode: int):
+        """把 KeyDown/KeyUp 事件的 keycode 轉成「pynput-相容」的 key。
+
+        字母鍵回傳小寫字元 str（與 parse_hotkey 對單字元的處理一致）；
+        space 回傳 Key.space；其他 fallback 用 charactersIgnoringModifiers。
+        """
+        ch = _KEYCODE_TO_CHAR.get(keycode)
+        if ch == " " and _PYNPUT_AVAILABLE:
+            return Key.space
+        if ch is not None:
+            return ch
+        # Fallback：問 NSEvent 自己的字元（忽略 modifier 影響）
+        try:
+            chars = event.charactersIgnoringModifiers()
+            if chars and len(chars) >= 1:
+                return chars[0].lower()
+        except Exception:
+            pass
+        return f"keycode_{keycode}"
 
     def stop(self) -> None:
         """停止監聽器並清空所有狀態。
 
-        設計重點：先在鎖內取出 listener 參照、清空狀態，
-        再在鎖外呼叫 stop()，避免 pynput 執行緒持鎖時造成死鎖。
+        設計重點：先在鎖內取出 monitor / listener 參照、清空狀態，
+        再在鎖外呼叫 removeMonitor: / stop()，避免持鎖時死鎖。
         """
         listener_to_stop = None
+        mon_global = None
+        mon_local  = None
         with self._lock:
             listener_to_stop = self._listener
-            self._listener   = None
+            mon_global       = self._monitor_global
+            mon_local        = self._monitor_local
+            self._listener        = None
+            self._monitor_global  = None
+            self._monitor_local   = None
             self._pressed.clear()
             self._combo_active = False
             self._other_key_during_press = False
-        # 在鎖外停止，避免 pynput 執行緒中持鎖等待造成死鎖
+
+        # NSEvent monitors：在鎖外移除
+        if _NSEVENT_AVAILABLE and (mon_global is not None or mon_local is not None):
+            log.info("HOTKEY: Removing NSEvent monitors...")
+            try:
+                if mon_global is not None:
+                    NSEvent.removeMonitor_(mon_global)
+                if mon_local is not None:
+                    NSEvent.removeMonitor_(mon_local)
+            except Exception:
+                log_error("hotkey_ns_remove_failed")
+
+        # pynput Listener fallback：在鎖外停止
         if listener_to_stop is not None:
-            log.info("HOTKEY: Stopping listener...")
+            log.info("HOTKEY: Stopping pynput listener...")
             try:
                 listener_to_stop.stop()
             except Exception:
