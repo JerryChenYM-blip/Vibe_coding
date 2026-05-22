@@ -116,8 +116,10 @@ class Config:
 
     # ── Phase 4.3 浮動 mini 錄音窗 ──────────────────────────────────────────
 
-    # 啟用後錄音 / 處理中會在螢幕右下角顯示小型 HUD（120×40 always-on-top）
-    mini_recording_window: bool = False
+    # 啟用後錄音 / 處理中會在游標所在螢幕中下方顯示小型 HUD
+    # （140×38 NSPanel-level，跨 Space / 全螢幕仍可見，Speakly 風格）
+    # Fix 8（2026-05-22）：預設翻 True
+    mini_recording_window: bool = True
 
     # ── 讀寫介面 ──────────────────────────────────────────────────────────────
 

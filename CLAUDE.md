@@ -33,6 +33,7 @@
 | 剪貼簿 | `pyperclip 1.9.0` | macOS 原生 pbcopy |
 | 全域快捷鍵 | **PyObjC NSEvent monitor**（主 listener，2026-05-22 換掉 pynput）+ Tk 原生 binding（綁定對話框）| 需「輔助使用」權限；NSEvent handler 永遠在主執行緒、根治 pynput 在 macOS 26.4+ 的 TSM / PAC / idle disable crash |
 | 自動貼上 | `pynput.keyboard.Controller` 按鍵模擬 | ⌘V；主執行緒呼叫安全（已驗證），保留不換 |
+| Mini 錄音 HUD | `tk.Toplevel` + PyObjC `NSWindow.setLevel_` | Fix 8（2026-05-22）：NSStatusWindowLevel + collectionBehavior（跨 Space / 全螢幕仍可見 / 不搶 focus）；Speakly 風格中下方位置；預設打開 |
 | 圖示 | **純 PIL 手繪**（非 SVG） | Lucide 風格 2px 線寬、4 倍超採樣 |
 | AI 潤飾 | Ollama HTTP（預設關閉）| 建議 `qwen2.5:3b-instruct`；timeout 30s；失敗降級回原文 |
 | 日誌系統 | Python `logging`（自訂 rotation）| 寫 `~/.whisper_app/logs/whisper_app.log`，5MB × 5 份 |
@@ -322,6 +323,8 @@ cat ~/.whisper_app/polish_log.jsonl | jq .         # 潤飾紀錄
 12. **背景執行緒安靜死亡** — pynput Listener / Whisper 推論執行緒若 throw 例外或被 macOS 內部停掉，**不會有 log 也不會 crash**。對應穩定性層：listener watchdog（gui.py `_hotkey_watchdog`，5s 心跳）、processing 狀態 60s 超時自癒（`_processing_timeout_check`）、callback 全包 try/except。詳見 `docs/superpowers/plans/2026-05-21-stability-watchdog-and-recovery.md`。
 13. **pynput Listener 閒置後 hotkey 死亡** — pynput 1.7.7 source 沒處理 `kCGEventTapDisabledByTimeout`（macOS App Nap / sleep-wake / CPU pressure 會 disable tap），thread 不死、`listener.running` 仍 True、watchdog 偵測不到。三層保險絲：(1) `_hotkey_watchdog` 每 5s 既有旗標檢查 +（新）每 10 分鐘無條件 force restart、(2)（新）`Quartz.CGEventTapIsEnabled` 體檢 + `CGEventTapEnable` 輕量 re-enable、(3) `main.py` `_disable_app_nap()` 用 `NSProcessInfo.beginActivityWithOptions_` 抑制 App Nap（token 必須 module-level）。詳見 `docs/superpowers/plans/2026-05-22-hotkey-idle-resilience.md`。**Fix 7（2026-05-22）後過時**：pynput Listener 已換成 NSEvent，前兩層保險絲已砍除；App Nap 抑制（第三層）仍保留——NSEvent handler 在主執行緒跑，App Nap 凍 mainloop 仍會影響回應速度。
 14. **pynput Listener 在 macOS 26.4+ 不可用** — pynput 1.7.7 底層用 CGEventTap + ctypes 觸發 8+ 種 crash：`SLEventTapIsEnabled` PAC violation、`TSMGetInputSourceProperty` 主執行緒斷言、`dispatch_assert_queue_fail`、idle timeout disable。**根治：改用 PyObjC `NSEvent.addGlobal/LocalMonitorForEventsMatchingMask_handler_`**（Karabiner / BetterTouchTool / Raycast 都用這個）。handler 永遠在 Cocoa main runloop 主執行緒跑，無 thread、無 ctypes、無 TSM 同步問題。global monitor 收其他 App 焦點時的事件，local monitor 收本 App 焦點時的事件（local handler 必須 `return event` 不要 suppress）。NSEvent 不會被 idle disable、不會被 TCC race 殺掉，watchdog Layer 2（CGEventTap re-enable）與 Layer 3（定時 force restart）一併移除，只保留 Layer 1（monitor 缺席兜底）。`pynput.keyboard.Controller`（auto_paste 送 ⌘V）仍保留——已驗證主執行緒呼叫安全。實作於 `hotkey_manager.py` 的 `_start_nsevent_monitors` / `_handle_ns_event`，事件型別 10/11/12 對應 KeyDown/KeyUp/FlagsChanged，keycode → 既有 lone-modifier / combo 邏輯橋接（透過 `_sided_name_to_pynput_key`）。
+15. **Tk Toplevel 拿 NSWindow handle 沒有官方 API**（Fix 8 / 2026-05-22）— Tk 沒有 method 直接拿到對應的 NSWindow。Workaround：給 Toplevel 設一個獨特 title（如 `WhisperProMiniHUD`），然後從 `NSApp.windows()` 迭代用 `w.title()` 比對找出來。`overrideredirect(True)` 後 title 不會顯示在 UI 上，純當 handle 用。拿到後即可呼叫 `setLevel_` / `setCollectionBehavior_` 把 HUD 升到 NSStatusWindowLevel（25）跨 Space / 全螢幕仍可見。注意 Tk Toplevel 對應的 NSWindow **不是 NSPanel**，所以 `NSWindowStyleMaskNonactivatingPanel` 不能用——`setStyleMask` 對非 panel 會炸；setLevel + collectionBehavior 已是 80% 效果（Speakly 也只用這兩個）。實作於 `gui.py` `MiniRecordingWindow._upgrade_to_panel_level`，整段包 try/except，失敗時 fallback 成普通 Toplevel（only same Space 可見）。
+16. **多螢幕 Tk vs NSScreen 座標換算**（Fix 8）— NSScreen.frame 用左下原點且 origin 不必是 (0,0)（副螢幕可能在主螢幕左/右/上）；Tk geometry 字串用左上原點且 y 相對 `screens[0]`。換算公式：`tk_y = primary_h - (ns_y_bottom + WIN_H)`，其中 `ns_y_bottom = sf.origin.y + BOTTOM_MARGIN`。游標所在螢幕用 `NSEvent.mouseLocation()` 配 `NSScreen.screens()` 比對。實作於 `gui.py` `MiniRecordingWindow._position_at_cursor_screen_bottom`。
 
 ---
 
@@ -453,7 +456,7 @@ cat ~/.whisper_app/polish_log.jsonl | jq .         # 潤飾紀錄
 | 歷史視窗 | `gui.py` `HistoryWindow` | Toplevel，左清單 + 右詳細 + 動作按鈕 |
 | App Icon 生成 | `app_icon.py` | 純 PIL 手繪 → 1024 主圖 + Apple iconset + `.icns` |
 | 啟動畫面 | `splash.py` `SplashScreen` | tk.Toplevel 無邊框，1.5s + 200ms 淡出 |
-| Mini 錄音 HUD | `gui.py` `MiniRecordingWindow` | 140×38 always-on-top，狀態圓點+計時 |
+| Mini 錄音 HUD | `gui.py` `MiniRecordingWindow` | 140×38 NSPanel-level（Fix 8：跨 Space / 全螢幕可見 / 不搶 focus），游標所在螢幕中下方；預設打開 |
 | Ollama 環境診斷 | `onboarding.py` | 純函式：missing_binary / not_running / no_models / ready |
 | 設定匯入匯出 | `gui.py` SettingsWindow `_export_settings` / `_import_settings` | zip + manifest.json schema_version=1 |
 | 日誌系統 | `logger.py` | `log_action` / `log_state` / `log_settings` / `log_error` |
