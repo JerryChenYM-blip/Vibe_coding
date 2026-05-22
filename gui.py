@@ -3626,13 +3626,18 @@ class MiniRecordingWindow(tk.Toplevel):
     BOTTOM_MARGIN = 120
 
     # 用獨特 title 讓 PyObjC 找到對應 NSWindow（Tk 沒有直接拿 handle 的 API）
-    _NS_TITLE = "WhisperProMiniHUD"
+    # Fix 9 / 2026-05-22（P2-B）：title 加 id(self) 後綴避免 toggle 快速
+    # destroy/recreate 時 NSApp.windows() 短暫含舊 instance 的同名 NSWindow，
+    # 迴圈第一個取錯。class const 移除，改 instance attribute。
+    _NS_TITLE_PREFIX = "WhisperProMiniHUD"
 
     def __init__(self, master) -> None:
         super().__init__(master)
         self._master = master
         self._closed = False
         self._ns_window = None   # 升級成功才設
+        # Fix 9 P2-B：每 instance 獨一無二 title，destroy 中的舊 window 不會混淆
+        self._ns_title = f"{self._NS_TITLE_PREFIX}-{id(self):x}"
 
         # 無邊框
         self.overrideredirect(True)
@@ -3645,7 +3650,7 @@ class MiniRecordingWindow(tk.Toplevel):
         # 給獨特 title 讓 PyObjC 比對找出對應 NSWindow
         # （overrideredirect=True 後仍會建立 NSWindow，title 不會顯示在 UI 上）
         try:
-            self.title(self._NS_TITLE)
+            self.title(self._ns_title)
         except Exception:
             pass
 
@@ -3752,11 +3757,11 @@ class MiniRecordingWindow(tk.Toplevel):
         try:
             from AppKit import NSApp  # type: ignore
 
-            # 找到對應 NSWindow（用獨特 title 比對）
+            # 找到對應 NSWindow（用 instance-unique title 比對）
             ns_window = None
             for w in NSApp.windows():
                 try:
-                    if w.title() == self._NS_TITLE:
+                    if w.title() == self._ns_title:
                         ns_window = w
                         break
                 except Exception:
