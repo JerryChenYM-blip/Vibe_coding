@@ -429,20 +429,55 @@ class Transcriber:
     # ── MLX 後端（Apple Silicon Metal GPU）────────────────────────────────────
 
     def _warmup_mlx(self, model_size: str) -> None:
-        """MLX 後端暖機：載入模型並跑一次 0.2 秒靜音。"""
+        """MLX 後端暖機：載入模型並跑一次 1.5s 低振幅 sine wave。
+
+        Fix 11 / 2026-05-23 — 為什麼不是 silence：
+          原本跑 0.2s zeros，但 mlx_whisper 內建 VAD 偵測到靜音會 fast-skip，
+          Metal shader（encoder / decoder / cross-attention 等）**完全沒被編譯**，
+          第一次正式錄音仍是 cold path。曾觀察：warmup 完成後立刻錄 1.6s 音檔，
+          推論花 12 秒（RTF 7.5）；之後同樣 size 的音檔降到 0.2 秒（RTF 0.05）。
+          診斷依據是 5/22 一整天 RTF 都 0.06-0.13，但 5/23 重啟 App 後第一次
+          推論 RTF 7.5。
+
+        修法：用 1.5s 440Hz sine wave at amplitude 0.1
+          • 通過內建 VAD（有能量 → 不被 fast-skip）
+          • 強制走完整 encoder + decoder pipeline → Metal shader 全部編譯
+          • 加 beam_size=1 / temperature=0 / condition_on_previous_text=False
+            斷掉 temperature fallback chain（避免 sine wave 觸發幻覺重試把
+            warmup 自己拖到 10 秒以上）
+
+        Warmup 耗時：~2s → ~5s，但之後第一次正式錄音 RTF 可以維持 ~0.06。
+        """
         import mlx_whisper
         import numpy as np
         hf_repo = _MLX_MODEL_MAP.get(model_size, _MLX_MODEL_MAP["large-v3-turbo"])
-        silence  = np.zeros(3200, dtype=np.float32)   # 0.2 秒靜音
+        sr = 16_000
+        t_axis = np.arange(int(sr * 1.5), dtype=np.float32) / sr
+        audio  = (0.1 * np.sin(2 * np.pi * 440.0 * t_axis)).astype(np.float32)
         with self._transcription_lock:
             try:
-                mlx_whisper.transcribe(
-                    silence,
-                    path_or_hf_repo=hf_repo,
-                    language="zh",    # 指定語言可加速暖機
-                    verbose=False,
-                )
-                log.info(f"WHISPER: Warmup MLX complete (repo={hf_repo})")
+                # Fix 14 / 2026-05-23：mlx_whisper 偵測到 beam_size kwarg 就試圖走
+                # beam-search path（即使值是 1），但 mlx_whisper 該 path 還沒實作
+                # → NotImplementedError("Beam search decoder is not yet implemented")。
+                # 只用 temperature=0 + condition_on_previous_text=False 切斷 fallback chain；
+                # 不要傳 beam_size。greedy decode 是 mlx_whisper 預設行為。
+                try:
+                    mlx_whisper.transcribe(
+                        audio,
+                        path_or_hf_repo=hf_repo,
+                        language="zh",
+                        verbose=False,
+                        temperature=0,
+                        condition_on_previous_text=False,
+                    )
+                except TypeError:
+                    mlx_whisper.transcribe(
+                        audio,
+                        path_or_hf_repo=hf_repo,
+                        language="zh",
+                        verbose=False,
+                    )
+                log.info(f"WHISPER: Warmup MLX complete (repo={hf_repo}, sine-wave 1.5s)")
             except Exception:
                 log_error("warmup_mlx_failed", model=model_size, repo=hf_repo)
 
@@ -452,20 +487,61 @@ class Transcriber:
         model_size: str,
         language: Optional[str],
     ) -> TranscriptionResult:
-        """使用 mlx-whisper 進行推論（Metal GPU 加速）。"""
+        """使用 mlx-whisper 進行推論（Metal GPU 加速）。
+
+        Fix 12 / 2026-05-23 — 短音檔快速路徑（< 3s）：
+          mlx_whisper 預設 temperature fallback chain = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)。
+          對短音檔（1-3s）模型常因資訊量不足而 quality bad → 一路 fallback 到 1.0，
+          每段都重跑 decode，觀察過 1.6s 音檔產生 51 個 hallucination segment、
+          RTF 7.5。長音檔（≥ 3s）資訊足夠不會觸發 fallback，維持預設品質。
+
+          修法：< 3s 強制 beam_size=1 / temperature=0 / condition_on_previous_text=False
+          —— 切斷 fallback chain、抑制幻覺放大、保證單次 decode 完事。
+          中英混講等真實短句的辨識率影響微乎其微（這類短語就算多 beam 也只能
+          靠音訊本身的資訊），但 RTF 7.5 → ~0.3 是 25 倍加速。
+        """
         import mlx_whisper
 
-        hf_repo = _MLX_MODEL_MAP.get(model_size, _MLX_MODEL_MAP["large-v3-turbo"])
+        hf_repo  = _MLX_MODEL_MAP.get(model_size, _MLX_MODEL_MAP["large-v3-turbo"])
+        duration = len(audio) / 16_000
+        is_short = duration < 3.0
+
+        # 短音檔額外 kwargs；長音檔維持 mlx_whisper 預設（品質優先）
+        # Fix 14 / 2026-05-23：不要傳 beam_size（mlx_whisper 偵測 kwarg 就試
+        # beam-search path，該 path 還沒實作 → NotImplementedError）。
+        # 只用 temperature=0 + condition_on_previous_text=False 切 fallback chain。
+        short_kwargs: dict = {}
+        if is_short:
+            short_kwargs = {
+                "temperature":               0,
+                "condition_on_previous_text": False,
+            }
 
         with self._transcription_lock:
             try:
-                output = mlx_whisper.transcribe(
-                    audio,
-                    path_or_hf_repo=hf_repo,
-                    language=language,
-                    initial_prompt=self._build_initial_prompt(),
-                    verbose=False,
-                )
+                try:
+                    output = mlx_whisper.transcribe(
+                        audio,
+                        path_or_hf_repo=hf_repo,
+                        language=language,
+                        initial_prompt=self._build_initial_prompt(),
+                        verbose=False,
+                        **short_kwargs,
+                    )
+                except TypeError:
+                    # 安全降級：mlx_whisper 版本不支援這些 kwargs 時用預設參數
+                    if is_short:
+                        log.warning(
+                            "WHISPER: short-audio fast-path kwargs unsupported, "
+                            "falling back to default mlx_whisper params"
+                        )
+                    output = mlx_whisper.transcribe(
+                        audio,
+                        path_or_hf_repo=hf_repo,
+                        language=language,
+                        initial_prompt=self._build_initial_prompt(),
+                        verbose=False,
+                    )
             except Exception as e:
                 raise RuntimeError(f"MLX transcription failed: {e}")
 

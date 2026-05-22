@@ -152,6 +152,16 @@ class AppWindow(ctk.CTkFrame):
     # 5 秒：權衡 detect latency 與 µs 級檢查成本。
     HOTKEY_WATCHDOG_INTERVAL_MS = 5000
 
+    # Fix 10 / 2026-05-23：NSEvent handler 擱置的 tap 觸發輪詢間隔。
+    # 詳見 _hotkey_tap / _poll_pending_tap 的 docstring（PyObjC + Tk GIL 衝突修法）。
+    # 20ms 是 50 Hz 輪詢，使用者按鍵感受不到延遲；CPU 成本忽略不計。
+    PENDING_TAP_POLL_MS = 20
+
+    # Fix 17 / 2026-05-23：Cocoa observer / AppleEvent handler 擱置動作輪詢間隔。
+    # 50ms（20 Hz）對「click Dock icon → 視窗彈出」UX 足夠快，看不出延遲。
+    # 詳見 _poll_cocoa_pending_actions docstring。
+    COCOA_POLL_MS = 50
+
     # 穩定性（Fix 4 / 2026-05-21）：processing 狀態超時自癒上限。
     # MLX 對 large-v3-turbo：RTF ≈ 0.1，60s 音訊 → 6s 推論；cold start +5-10s；
     # 60s 有 ~40s 緩衝，避免誤殺正常推論。若使用者誤殺再放大或設計可設定。
@@ -176,6 +186,18 @@ class AppWindow(ctk.CTkFrame):
         self.hotkey_mgr  = HotkeyManager(
             on_tap_cb=self._hotkey_tap,
         )
+
+        # Fix 10 / 2026-05-23：NSEvent handler 擱置的 tap 計數。
+        # _hotkey_tap 從 NSEvent monitor handler（PyGILState_Ensure context）被呼叫，
+        # 絕對不能進入 Tk；只能遞增此計數。實際 toggle 由 _poll_pending_tap 在
+        # Tk mainloop iteration（PyEval_SaveThread/RestoreThread context）中分派。
+        self._pending_tap_count: int = 0
+
+        # Fix 17 / 2026-05-23：Cocoa observer / AppleEvent handler 擱置動作。
+        # 同 Fix 10 根因（PyObjC + Tk GIL 衝突），改成 list.append（pure Python，
+        # GIL 由 PyGILState_Ensure 拿著、安全），實際分派由 _poll_cocoa_pending_actions
+        # 在 Tk mainloop iteration 跑。
+        self._cocoa_pending_actions: list = []
 
         # State
         self._state:       str   = "idle"
@@ -228,6 +250,10 @@ class AppWindow(ctk.CTkFrame):
         # 每 5 秒檢查 NSEvent monitor 是否還活著。NSEvent 不會自己死，
         # 但保留 watchdog 框架兜底極端情境。
         self.after(self.HOTKEY_WATCHDOG_INTERVAL_MS, self._hotkey_watchdog)
+        # Fix 10 / 2026-05-23：tap poller —— 詳見 _hotkey_tap docstring。
+        self.after(self.PENDING_TAP_POLL_MS, self._poll_pending_tap)
+        # Fix 17 / 2026-05-23：Cocoa observer poller —— 詳見 _cocoa_pending_actions。
+        self.after(self.COCOA_POLL_MS, self._poll_cocoa_pending_actions)
         # 穩定性（Fix 5 / 2026-05-22）：macOS Dock icon 點擊把最小化的視窗叫回來。
         # 兩條保險絲（Apple Event 處理在 shim Python.app 上可能不完整）：
         #   1. ::tk::mac::ReopenApplication — Tk-on-macOS 的官方 idiom，但需要
@@ -1515,13 +1541,47 @@ class AppWindow(ctk.CTkFrame):
             self.after(self.TAIL_PADDING_MS, self._try_stop)
 
     def _hotkey_tap(self) -> None:
-        """pynput 執行緒：tap 觸發（完整按下→放開算 1 次）→ marshal 到主執行緒。
+        """HotkeyManager callback：tap 觸發（完整按下→放開算 1 次）。
+
+        ⚠️ Fix 10 / 2026-05-23 — **絕對不能在這裡呼叫 self.after() 或任何 Tk 函式**。
+
+        理由（PyObjC + Tk 同執行緒 GIL 衝突）：
+          Fix 7 換成 NSEvent monitor 後，這個 callback 在「主執行緒 +
+          PyObjC PyGILState_Ensure context」下被呼叫。Tk 用的是
+          PyEval_SaveThread/RestoreThread 來管理 GIL，兩套 API 在同執行緒
+          混用會讓 Tk 後續 Tcl_ServiceEvent 拿到 stale thread state →
+          PyEval_RestoreThread 觸發 fatal_error → SIGSEGV at NULL+16。
+          崩潰堆疊：Tcl_ServiceEvent → PythonCmd → PyEval_RestoreThread →
+          fatal_error。100% 重現：每按一次熱鍵都崩。
+
+        修法：純 Python 屬性遞增（GIL 已被 PyGILState_Ensure 拿著、不需要 Tk），
+        實際 toggle 動作由 _poll_pending_tap 在「Tk mainloop iteration」context
+        裡跑（PyEval 系列 GIL 管理乾淨）。20ms 輪詢延遲使用上感受不到。
 
         Tap toggle 語意：每次 tap 等同於點一下螢幕上的錄音鈕，
         idle → 開始錄音；recording → 停止；processing → 忽略。
         實際分支邏輯沿用 `_on_record_btn`，不在這裡重複實作。
         """
-        self.after(0, self._on_hotkey_tap)
+        # 純 Python int 遞增；不呼叫任何 Tk / PyObjC bridge / threading 同步原語
+        self._pending_tap_count += 1
+
+    def _poll_pending_tap(self) -> None:
+        """Tk-side poller：在 mainloop iteration 中安全地把 NSEvent handler
+        擱置的 tap 觸發實際分派到 _on_hotkey_tap。
+
+        Fix 10 / 2026-05-23 配對：詳見 _hotkey_tap docstring。
+        """
+        try:
+            count = self._pending_tap_count
+            if count > 0:
+                self._pending_tap_count = 0
+                # 同一輪 poll 內最多 fire 1 次，避免使用者連按時把 toggle 跑成
+                # 「start→stop→start」這種非預期狀態（每 20ms 跑一次已經夠快）
+                self._on_hotkey_tap()
+        except Exception:
+            log_error("poll_pending_tap_failed")
+        finally:
+            self.after(self.PENDING_TAP_POLL_MS, self._poll_pending_tap)
 
     def _on_hotkey_tap(self) -> None:
         """主執行緒：快捷鍵 tap → 直接重用 chamber 按鈕的 toggle handler。"""
@@ -2008,6 +2068,7 @@ class AppWindow(ctk.CTkFrame):
                 NSApplication,
                 NSApplicationDidBecomeActiveNotification,
                 NSApplicationWillBecomeActiveNotification,
+                NSApplicationWillHideNotification,
             )
 
             # === Runtime 診斷（Fix 5c v2 / 2026-05-22）===
@@ -2029,19 +2090,29 @@ class AppWindow(ctk.CTkFrame):
             tk_root = self
 
             class _ActivationObserver(NSObject):
+                # Fix 17 / 2026-05-23 — 不在 PyObjC context 裡呼叫 tk_root.after()。
+                # 跟 Fix 10 同款根因：PyObjC PyGILState_Ensure 與 Tk PyEval_SaveThread
+                # 衝突，導致 Tcl_ServiceEvent → PyEval_RestoreThread → SIGSEGV at NULL+16。
+                # 改成純 Python list.append（GIL 已由 PyGILState_Ensure 拿著，安全），
+                # 實際分派由 _poll_cocoa_pending_actions 在 Tk mainloop iteration
+                # 跑（PyEval_SaveThread/RestoreThread context 乾淨）。
                 def appBecameActive_(self, notification):
-                    # 任何 thread 抵達 — marshal 回 Tk 主執行緒
                     try:
-                        tk_root.after(0, tk_root._on_cocoa_app_activated)
+                        tk_root._cocoa_pending_actions.append("BecomeActive")
                     except Exception:
                         pass
 
                 def appWillBecomeActive_(self, notification):
-                    # Plan B（Apple Dev Forum 706772）：用 WillBecomeActive 而非
-                    # DidBecomeActive，因為前者由 NSApplication core 觸發、不經
-                    # delegate、不被 Tk 的 applicationShouldHandleReopen=NO 影響。
                     try:
-                        tk_root.after(0, tk_root._on_cocoa_app_will_activate)
+                        tk_root._cocoa_pending_actions.append("WillBecomeActive")
+                    except Exception:
+                        pass
+
+                def appWillHide_(self, notification):
+                    # Fix 16：攔截 macOS「點 frontmost app dock icon = hide」標準行為。
+                    # 詳見 _handle_cocoa_will_hide docstring。
+                    try:
+                        tk_root._cocoa_pending_actions.append("WillHide")
                     except Exception:
                         pass
 
@@ -2061,22 +2132,111 @@ class AppWindow(ctk.CTkFrame):
                 NSApplicationWillBecomeActiveNotification,
                 NSApplication.sharedApplication(),
             )
-            log.info("COCOA: observers installed (Did + Will BecomeActive)")
+            # Fix 16：觀察 WillHide 攔截「click frontmost app dock icon = hide」
+            nc.addObserver_selector_name_object_(
+                self._cocoa_activation_observer,
+                b"appWillHide:",
+                NSApplicationWillHideNotification,
+                NSApplication.sharedApplication(),
+            )
+            log.info("COCOA: observers installed (Did + Will BecomeActive + WillHide)")
+
+            # ── Layer 6（Fix 13 / 2026-05-23）：kAEReopenApplication AppleEvent ──
+            # 補洞理由：黃色鈕 minimize 後再點 Dock icon，本 App 全程仍是
+            # frontmost（NSApp.isActive 不轉換）→ Layer 3/4 BecomeActive 不 fire、
+            # Layer 5 Poll 沒 transition 也不 fire。但 macOS 一定會送
+            # kAEReopenApplication AppleEvent 給程序——此層直接掛到
+            # NSAppleEventManager 接這個 event，不依賴 NSApp.isActive 轉換、
+            # 不依賴 NSApplicationDelegate（後者可能是 TKApplication 但沒轉發）。
+            # 失敗只 log，不阻擋啟動。
+            try:
+                from Foundation import NSAppleEventManager
+                # FourCharCode: 'aevt' = kCoreEventClass, 'rapp' = kAEReopenApplication
+                #   'a'=0x61 'e'=0x65 'v'=0x76 't'=0x74 → 0x61657674
+                #   'r'=0x72 'a'=0x61 'p'=0x70 'p'=0x70 → 0x72617070
+                _kCoreEventClass     = 0x61657674
+                _kAEReopenApplication = 0x72617070
+
+                class _ReopenHandler(NSObject):
+                    def handleReopenEvent_withReplyEvent_(self, event, reply):
+                        # Fix 17：純 Python append，不呼叫 tk_root.after()（GIL 衝突）
+                        try:
+                            tk_root._cocoa_pending_actions.append("AppleEventReopen")
+                        except Exception:
+                            pass
+
+                self._cocoa_reopen_handler = _ReopenHandler.alloc().init()
+                aem = NSAppleEventManager.sharedAppleEventManager()
+                aem.setEventHandler_andSelector_forEventClass_andEventID_(
+                    self._cocoa_reopen_handler,
+                    b"handleReopenEvent:withReplyEvent:",
+                    _kCoreEventClass,
+                    _kAEReopenApplication,
+                )
+                log.info("COCOA: kAEReopenApplication handler installed (Layer 6)")
+            except Exception as e:
+                log_error("cocoa_reopen_handler_install_failed", error=str(e))
         except Exception as e:
             log_error("cocoa_observer_install_failed", error=str(e))
 
-    def _on_cocoa_app_activated(self) -> None:
-        """Fix 5c：NSApplicationDidBecomeActive 抵達 → 視窗若最小化則 deiconify。"""
-        self._restore_root_if_minimized("CocoaActive")
+    def _poll_cocoa_pending_actions(self) -> None:
+        """Fix 17 / 2026-05-23 — Cocoa observer / AppleEvent handler 動作 poller。
 
-    def _on_cocoa_app_will_activate(self) -> None:
-        """Plan B / Fix 5c v2：NSApplicationWillBecomeActive 抵達（最關鍵的 fallback）。
+        在 Tk mainloop iteration 跑（PyEval_SaveThread/RestoreThread context 乾淨），
+        把 PyObjC observer / handler 從 PyGILState context 擱置的動作分派出去。
+        詳見 _cocoa_pending_actions 註解與 Fix 10 模式。
 
-        Apple Dev Forum 706772 + FB9754295 確認此通知是 NSApplication core 觸發，
-        不依賴 delegate、不被 Tk 的 applicationShouldHandleReopen=NO 攔截。
-        當 Dock 點擊／視窗縮圖點擊／Cmd+Tab／Spotlight 開啟本 App 時都會送達。
+        同一輪 poll 內同類動作只執行一次（dedupe），避免短時間連點 Dock icon
+        把同一個 restore 邏輯跑多次。
         """
-        self._restore_root_if_minimized("CocoaWillActive")
+        try:
+            if self._cocoa_pending_actions:
+                actions = self._cocoa_pending_actions
+                self._cocoa_pending_actions = []
+                seen: set = set()
+                for action in actions:
+                    if action in seen:
+                        continue
+                    seen.add(action)
+                    if action == "BecomeActive":
+                        self._restore_root_if_minimized("CocoaActive")
+                    elif action == "WillBecomeActive":
+                        self._restore_root_if_minimized("CocoaWillActive")
+                    elif action == "AppleEventReopen":
+                        self._restore_root_if_minimized("AppleEventReopen")
+                    elif action == "WillHide":
+                        self._handle_cocoa_will_hide()
+        except Exception as e:
+            log_error("poll_cocoa_pending_failed", error=str(e))
+        finally:
+            self.after(self.COCOA_POLL_MS, self._poll_cocoa_pending_actions)
+
+    def _handle_cocoa_will_hide(self) -> None:
+        """Fix 16 / 17 — 攔截 macOS「點 frontmost app dock icon = hide app」。
+
+        判斷邏輯：WillHide 抵達時若有 iconic 視窗 → 是「minimize 後點 Dock」
+        的標準行為，立刻 unhide + deiconify 把視窗叫回來。state 不是 iconic
+        時跳過，避免影響真正的 ⌘H / Hide Others 行為。
+
+        ⚠️ 此方法只能從 _poll_cocoa_pending_actions 呼叫（Tk mainloop context），
+        絕對不能從 NSNotification observer 直接呼叫（PyObjC + Tk GIL 衝突 → crash）。
+        """
+        try:
+            top = self.winfo_toplevel()
+            state = top.wm_state()
+            if state == "iconic":
+                from AppKit import NSApplication
+                # NSApp.unhide 取消 hide；同時 deiconify 把 iconic 視窗叫回
+                NSApplication.sharedApplication().unhide_(None)
+                top.deiconify()
+                top.lift()
+                log_action(
+                    "dock_reopen_recovered",
+                    source="CancelHide",
+                    state="hide+iconic",
+                )
+        except Exception as e:
+            log_error("cancel_hide_failed", error=str(e))
 
     def _poll_window_visibility(self) -> None:
         """Plan C / Fix 5c v3：每 500ms 輪詢，偵測「App 重新 active + 視窗 iconic」。
