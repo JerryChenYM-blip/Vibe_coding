@@ -421,9 +421,6 @@ class HotkeyManager:
         self._monitor_global = None                    # NSEvent 後端：其他 App focus 時收事件
         self._monitor_local  = None                    # NSEvent 後端：本 App focus 時收事件
         self._backend:       str = "none"              # "nsevent" / "none"
-        # 相容性殼：watchdog 仍會檢查 `_listener is not None`（commit 3 才砍）。
-        # 啟用 NSEvent 後此屬性永遠為 None；不再 spawn pynput Listener。
-        self._listener = None
         self._lock = threading.Lock()
         # Lone-modifier 模式狀態
         # 啟用條件：len(_hotkeys) == 1 且該鍵為側別 modifier
@@ -609,15 +606,6 @@ class HotkeyManager:
                     NSEvent.removeMonitor_(mon_local)
             except Exception:
                 log_error("hotkey_ns_remove_failed")
-
-    def get_event_tap(self):
-        """DEPRECATED：NSEvent backend 沒有 CGEventTap 的概念。
-
-        舊 watchdog Layer 2（Fix 6 Step 3）用此函式拿 pynput 的 _tap handle
-        做 CGEventTapIsEnabled 體檢；NSEvent 後端不會被 timeout disable，
-        永遠回 None 讓 watchdog Layer 2 跳過（commit 3 會把整段砍掉）。
-        """
-        return None
 
     def _normalize(self, key) -> object:
         """正規化左右修飾鍵（委派給模組層函式）。"""

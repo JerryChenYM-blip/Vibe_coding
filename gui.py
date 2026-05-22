@@ -145,18 +145,12 @@ class AppWindow(ctk.CTkFrame):
     快捷鍵管理（pynput）、自動貼上（auto_paste）等所有核心邏輯。
     """
 
-    # 穩定性（Fix 1 / 2026-05-21）：pynput Listener 心跳檢查週期。
-    # macOS CGEventTap 在 focus 切換、TCC state change、sleep/wake 後偶爾會失效；
-    # pynput 內部不會自動恢復，listener thread 安靜結束、零 log 線索。
-    # 5 秒是權衡：> 10s 使用者感知太慢，< 1s 過密無意義（running 檢查 ~µs）。
+    # 穩定性（Fix 1 / 2026-05-21、Fix 7 / 2026-05-22 簡化）：
+    # NSEvent monitor 心跳檢查週期。NSEvent 後端不會被 idle disable、
+    # 不會被 TCC race 殺掉、不會自己 GC，watchdog 幾乎不會 fire；
+    # 但仍保留作為極端情境的兜底（例如系統權限被使用者中途撤銷）。
+    # 5 秒：權衡 detect latency 與 µs 級檢查成本。
     HOTKEY_WATCHDOG_INTERVAL_MS = 5000
-
-    # 穩定性（Fix 6 Step 1 / 2026-05-22）：watchdog Layer 3 — 定時無條件
-    # 強制 restart listener。對抗 pynput 1.7.7 沒處理 kCGEventTapDisabledByTimeout
-    # 的情境：tap 已死但 listener thread / running 旗標仍 True，Layer 1 看不出來。
-    # 10 分鐘 = sweet spot：< 5 分鐘會在使用中打斷；> 30 分鐘體感太差。
-    # 代價：restart 期間 ~50-200ms gap，剛好那刻按熱鍵會錯過，可接受。
-    HOTKEY_FORCE_RESTART_INTERVAL_S = 600
 
     # 穩定性（Fix 4 / 2026-05-21）：processing 狀態超時自癒上限。
     # MLX 對 large-v3-turbo：RTF ≈ 0.1，60s 音訊 → 6s 推論；cold start +5-10s；
@@ -224,10 +218,9 @@ class AppWindow(ctk.CTkFrame):
         self.after(0, lambda: log.info(
             f"GUI: first idle tick reached at t={time.monotonic():.3f}"
         ))
-        # 穩定性（Fix 1 / 2026-05-21）：每 5 秒檢查 pynput Listener 是否還活著，
-        # 死掉就自動 restart（macOS CGEventTap 偶爾會被系統內部停掉，零 log）
-        # Fix 6 Step 1 / 2026-05-22：新增 Layer 3 定時 force restart 時間戳
-        self._last_listener_restart: float = time.monotonic()
+        # 穩定性（Fix 1 / 2026-05-21、Fix 7 / 2026-05-22 簡化）：
+        # 每 5 秒檢查 NSEvent monitor 是否還活著。NSEvent 不會自己死，
+        # 但保留 watchdog 框架兜底極端情境。
         self.after(self.HOTKEY_WATCHDOG_INTERVAL_MS, self._hotkey_watchdog)
         # 穩定性（Fix 5 / 2026-05-22）：macOS Dock icon 點擊把最小化的視窗叫回來。
         # 兩條保險絲（Apple Event 處理在 shim Python.app 上可能不完整）：
@@ -1880,57 +1873,27 @@ class AppWindow(ctk.CTkFrame):
         self.hotkey_mgr.restart(self.cfg.hotkey)
 
     def _hotkey_watchdog(self) -> None:
-        """週期性檢查 pynput Listener 還活著嗎；死了就 restart。
+        """週期性檢查 NSEvent monitor 還活著嗎；死了就 restart。
 
-        Fix 1 / 2026-05-21：macOS CGEventTap 在 focus 切換、TCC state change、
-        sleep/wake 後偶爾會失效。pynput 內部不會自動恢復、listener thread
-        安靜結束，沒有任何 log（這是最坑的地方）。watchdog 是補救網。
+        Fix 7 / 2026-05-22：pynput Listener 已換成 NSEvent
+        addGlobal/LocalMonitorForEventsMatchingMask_handler_。NSEvent 不會自己死、
+        不會被 idle timeout disable、不會被 TCC race 殺掉，watchdog 幾乎不會 fire；
+        但仍保留作為極端情境兜底（系統權限被使用者中途撤銷、PyObjC 內部異常等）。
 
-        Fix 6 Step 1 / 2026-05-22：加 Layer 3 — 每 10 分鐘無條件 force restart。
-        對抗 pynput 1.7.7 沒處理 kCGEventTapDisabledByTimeout 的情境：tap
-        已死但 listener thread / running 旗標仍 True，Layer 1 看不出來。
+        Layer 2（CGEventTap re-enable）+ Layer 3（定時 force restart）已隨
+        pynput 一併移除——NSEvent 不需要這兩層補救。
         """
         try:
             mgr = self.hotkey_mgr
-            if is_pynput_available() and mgr._listener is not None:
-                now = time.monotonic()
-                flag_dead = not mgr._listener.running
-
-                # Layer 1（既有）：listener.running 旗標檢查
-                should_restart = flag_dead
-                reason = "flag_dead" if flag_dead else None
-
-                # Layer 2（Fix 6 Step 3 / 2026-05-22）：CGEventTap 健康度體檢
-                # pynput 沒處理 kCGEventTapDisabledByTimeout；tap 死了但 listener
-                # 旗標還是 True。先試 CGEventTapEnable 輕量 re-enable（µs 級），
-                # 比整個 restart 快 1000 倍。失敗才 fallback Layer 3 restart。
-                if not should_restart:
-                    try:
-                        from Quartz import CGEventTapIsEnabled, CGEventTapEnable
-                        tap = mgr.get_event_tap()
-                        if tap is not None and not CGEventTapIsEnabled(tap):
-                            CGEventTapEnable(tap, True)
-                            if CGEventTapIsEnabled(tap):
-                                log.warning("HOTKEY: tap re-enabled in place (no restart needed)")
-                                log_action("hotkey_tap_reenabled")
-                            else:
-                                should_restart = True
-                                reason = "tap_dead_reenable_failed"
-                    except Exception:
-                        log_error("hotkey_tap_health_check_failed")
-
-                # Layer 3（新）：定時 force restart 保險絲
-                if not should_restart:
-                    last = getattr(self, "_last_listener_restart", 0.0)
-                    if (now - last) > self.HOTKEY_FORCE_RESTART_INTERVAL_S:
-                        should_restart = True
-                        reason = "scheduled_force_restart"
-
-                if should_restart:
-                    log.warning(f"HOTKEY: watchdog restarting listener (reason={reason})")
-                    log_action("hotkey_listener_auto_restarted", reason=reason)
-                    mgr.restart(self.cfg.hotkey)
-                    self._last_listener_restart = now
+            # NSEvent backend：monitor 物件不為 None 視為活著
+            monitor_alive = (
+                getattr(mgr, "_monitor_global", None) is not None
+                or getattr(mgr, "_monitor_local", None) is not None
+            )
+            if not monitor_alive:
+                log.warning("HOTKEY: watchdog restarting NSEvent monitor (reason=monitor_missing)")
+                log_action("hotkey_listener_auto_restarted", reason="monitor_missing")
+                mgr.restart(self.cfg.hotkey)
         except Exception:
             log_error("hotkey_watchdog_failed")
         finally:
