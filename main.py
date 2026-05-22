@@ -66,8 +66,48 @@ def check_dependencies() -> list[str]:
     return missing
 
 
+# ── App Nap 抑制（Fix 6 Step 2 / 2026-05-22）─────────────────────────────────
+# macOS App Nap 會在 App 閒置 + 不在前景時提高 callback latency，導致
+# pynput CGEventTap 觸發 kCGEventTapDisabledByTimeout（pynput 1.7.7 沒處理
+# 這個事件）→ 熱鍵永久死亡，listener thread 不死、watchdog 旗標看不出來。
+# 解法：用 NSProcessInfo.beginActivityWithOptions_reason_ 抑制 App Nap。
+#
+# 關鍵：token 必須 module-level 強參照——一旦被 GC，App Nap 立刻復活。
+_APP_NAP_TOKEN = None
+
+
+def _disable_app_nap() -> None:
+    """抑制 macOS App Nap，避免閒置後 pynput CGEventTap callback latency
+    升高觸發 timeout disable（Fix 6 / 2026-05-22）。
+
+    用 NSActivityBackground | NSActivityLatencyCritical（後者單獨只在
+    foreground 有效，必須 OR background flag 才能對 background app 生效）。
+    詳見 plan：docs/superpowers/plans/2026-05-22-hotkey-idle-resilience.md §3 Step 2。
+    """
+    global _APP_NAP_TOKEN
+    if sys.platform != "darwin":
+        return
+    try:
+        from Foundation import NSProcessInfo
+        NSActivityBackground = 0x000000FF
+        NSActivityLatencyCritical = 0xFF00000000
+        opts = NSActivityBackground | NSActivityLatencyCritical
+        _APP_NAP_TOKEN = NSProcessInfo.processInfo() \
+            .beginActivityWithOptions_reason_(
+                opts,
+                "Whisper Pro global hotkey listener must stay responsive",
+            )
+        log.info("APP_NAP: suppression activated (token kept module-level)")
+    except Exception as e:
+        log.warning(f"APP_NAP: suppression failed - {e}")
+
+
 def main() -> None:
     """應用程式主流程：依賴檢查 → 載入設定 → 建立視窗 → 主迴圈。"""
+
+    # ── 0. 抑制 App Nap（Fix 6 Step 2 / 2026-05-22）────────────────────────
+    # 必須在 mainloop 前呼叫；token 由 module-level _APP_NAP_TOKEN 強參照保留。
+    _disable_app_nap()
 
     # ── 1. 套件依賴檢查 ──────────────────────────────────────────────────────
     missing = check_dependencies()
