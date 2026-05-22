@@ -57,7 +57,10 @@ log = get_logger("gui")
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-WIN_W, WIN_H = 760, 800   # 視窗預設寬度 × 高度（像素）
+WIN_W, WIN_H = 760, 880   # 視窗預設寬度 × 高度（像素）
+# WIN_H 推導：實測 AppWindow.winfo_reqheight() ≈ 858（TopBar 60 + RecordCard 398 +
+# ResultCard 281 + ActionBar 58 + StatusBar 32 + 分隔線×3 + 內邊距），舊值 800
+# 會把 ActionBar（5 顆動作按鈕）與 StatusBar 擠出視窗下緣。預留 22px 緩衝。
 
 # ── 設計 Token（統一從 tokens.py 匯入，此模組內不重複定義任何 hex 色碼）────────
 from tokens import (
@@ -142,6 +145,34 @@ class AppWindow(ctk.CTkFrame):
     快捷鍵管理（pynput）、自動貼上（auto_paste）等所有核心邏輯。
     """
 
+    # 穩定性（Fix 1 / 2026-05-21、Fix 7 / 2026-05-22 簡化）：
+    # NSEvent monitor 心跳檢查週期。NSEvent 後端不會被 idle disable、
+    # 不會被 TCC race 殺掉、不會自己 GC，watchdog 幾乎不會 fire；
+    # 但仍保留作為極端情境的兜底（例如系統權限被使用者中途撤銷）。
+    # 5 秒：權衡 detect latency 與 µs 級檢查成本。
+    HOTKEY_WATCHDOG_INTERVAL_MS = 5000
+
+    # Fix 10 / 2026-05-23：NSEvent handler 擱置的 tap 觸發輪詢間隔。
+    # 詳見 _hotkey_tap / _poll_pending_tap 的 docstring（PyObjC + Tk GIL 衝突修法）。
+    # 20ms 是 50 Hz 輪詢，使用者按鍵感受不到延遲；CPU 成本忽略不計。
+    PENDING_TAP_POLL_MS = 20
+
+    # Fix 17 / 2026-05-23：Cocoa observer / AppleEvent handler 擱置動作輪詢間隔。
+    # 50ms（20 Hz）對「click Dock icon → 視窗彈出」UX 足夠快，看不出延遲。
+    # 詳見 _poll_cocoa_pending_actions docstring。
+    COCOA_POLL_MS = 50
+
+    # 穩定性（Fix 4 / 2026-05-21）：processing 狀態超時自癒上限。
+    # MLX 對 large-v3-turbo：RTF ≈ 0.1，60s 音訊 → 6s 推論；cold start +5-10s；
+    # 60s 有 ~40s 緩衝，避免誤殺正常推論。若使用者誤殺再放大或設計可設定。
+    PROCESSING_TIMEOUT_MS = 60_000
+
+    # Fix 9 / 2026-05-22（P2-A）：動態 timeout = max(60s, audio_len_s × RTF_BUDGET)
+    # CPU faster-whisper backend 對 5 分鐘音訊 RTF ≈ 0.3-0.5，需要 90-150s 推論；
+    # 60s 固定 timeout 會 100% 誤殺。給 1.0x 即時當上限，等同 60s 音訊配 60s 推論。
+    PROCESSING_TIMEOUT_BASE_MS = 60_000
+    PROCESSING_TIMEOUT_RTF_BUDGET = 1.0
+
     def __init__(self, master: ctk.CTk, cfg: Config) -> None:
         super().__init__(master, fg_color=BG, corner_radius=0)
         self.pack(fill="both", expand=True)
@@ -153,13 +184,23 @@ class AppWindow(ctk.CTkFrame):
         # 用設定檔同步 Ollama 參數（base_url / model / enabled / timeout）
         self.ollama.apply_app_config(cfg)
         self.hotkey_mgr  = HotkeyManager(
-            on_press_cb=self._hotkey_press,
-            on_release_cb=self._hotkey_release,
+            on_tap_cb=self._hotkey_tap,
         )
+
+        # Fix 10 / 2026-05-23：NSEvent handler 擱置的 tap 計數。
+        # _hotkey_tap 從 NSEvent monitor handler（PyGILState_Ensure context）被呼叫，
+        # 絕對不能進入 Tk；只能遞增此計數。實際 toggle 由 _poll_pending_tap 在
+        # Tk mainloop iteration（PyEval_SaveThread/RestoreThread context）中分派。
+        self._pending_tap_count: int = 0
+
+        # Fix 17 / 2026-05-23：Cocoa observer / AppleEvent handler 擱置動作。
+        # 同 Fix 10 根因（PyObjC + Tk GIL 衝突），改成 list.append（pure Python，
+        # GIL 由 PyGILState_Ensure 拿著、安全），實際分派由 _poll_cocoa_pending_actions
+        # 在 Tk mainloop iteration 跑。
+        self._cocoa_pending_actions: list = []
 
         # State
         self._state:       str   = "idle"
-        self._hotkey_held: bool  = False
         self._rec_start:   float = 0.0
 
         # 錄音當下的前景 app：
@@ -199,6 +240,43 @@ class AppWindow(ctk.CTkFrame):
 
         self._build_ui()
         self._start_hotkey_listener()
+        # 診斷（Task B）：mainloop 第一個 idle tick 抵達時間戳，
+        # 配合 hotkey_manager.py 的 listener_fully_started / first_press_received
+        # 可以判斷「首次按鍵丟失」是否落在 listener 啟動 vs. tk 進 mainloop 的 gap
+        self.after(0, lambda: log.info(
+            f"GUI: first idle tick reached at t={time.monotonic():.3f}"
+        ))
+        # 穩定性（Fix 1 / 2026-05-21、Fix 7 / 2026-05-22 簡化）：
+        # 每 5 秒檢查 NSEvent monitor 是否還活著。NSEvent 不會自己死，
+        # 但保留 watchdog 框架兜底極端情境。
+        self.after(self.HOTKEY_WATCHDOG_INTERVAL_MS, self._hotkey_watchdog)
+        # Fix 10 / 2026-05-23：tap poller —— 詳見 _hotkey_tap docstring。
+        self.after(self.PENDING_TAP_POLL_MS, self._poll_pending_tap)
+        # Fix 17 / 2026-05-23：Cocoa observer poller —— 詳見 _cocoa_pending_actions。
+        self.after(self.COCOA_POLL_MS, self._poll_cocoa_pending_actions)
+        # 穩定性（Fix 5 / 2026-05-22）：macOS Dock icon 點擊把最小化的視窗叫回來。
+        # 兩條保險絲（Apple Event 處理在 shim Python.app 上可能不完整）：
+        #   1. ::tk::mac::ReopenApplication — Tk-on-macOS 的官方 idiom，但需要
+        #      AppleEvent handler 註冊完整才會觸發
+        #   2. <<Activate>> 虛擬事件 — App 取得焦點時觸發，較可靠的 fallback
+        #      （只在 iconic 狀態才 deiconify，避免每次 focus 都干擾）
+        try:
+            self.createcommand('::tk::mac::ReopenApplication', self._on_dock_reopen)
+        except Exception:
+            pass
+        self.bind("<<Activate>>", self._on_app_activate)
+        # Fix 5c / 2026-05-22：實測診斷顯示 NSApp delegate 為 None — Tk 沒設好
+        # NSApplicationDelegate，AppleEvent kAEReopenApplication 沒人接收，所以
+        # 上面兩條（::tk::mac::ReopenApplication + <<Activate>>）都不會觸發。
+        # 改用 PyObjC 直接掛 Cocoa 層的 NSApplicationDidBecomeActiveNotification，
+        # 不依賴 Tk 中介。失敗只 log，不阻擋啟動。
+        self._install_cocoa_activation_observer()
+        # Plan C / Fix 5c v3：終極保險絲 — 每 500ms 輪詢 NSApp.isActive 狀態轉換。
+        # 若上面 4 層（Tk createcommand / <<Activate>> / Cocoa Did+Will Active）
+        # 都沒觸發，這層會在 user 重新 focus 我們時最多 500ms 內恢復視窗。
+        # 純 Python 計時器，不依賴任何 macOS 通知 — 連通知系統壞掉都救得到。
+        self._last_nsapp_active = False  # boot 時非 active
+        self.after(500, self._poll_window_visibility)
         self.after(1500, self._warmup_model)
         # 開啟著的話再去探 Ollama；即使 Ollama 離線也不會卡 UI 建構。
         self.after(2000, self._refresh_ollama_health)
@@ -355,7 +433,7 @@ class AppWindow(ctk.CTkFrame):
         )
         self._target_label.pack()
 
-        # 快捷鍵提示文字：依目前狀態動態切換（「按下…」/「放開…」/「轉錄中…」）
+        # 快捷鍵提示文字：依目前狀態動態切換（「按下…」/「再按…停止」/「轉錄中…」）
         self._hotkey_hint = ctk.CTkLabel(
             card,
             text=f"按下 {self.cfg.format_hotkey_display()} 即時錄音",
@@ -617,7 +695,6 @@ class AppWindow(ctk.CTkFrame):
         self._state            = "recording"
         self._state_start_time = time.perf_counter()
         self._rec_start        = self._state_start_time
-        self._hotkey_held      = True
         self._stream_samples   = 0
         self._stream_chunks    = []
         self._ripples.clear()
@@ -650,7 +727,7 @@ class AppWindow(ctk.CTkFrame):
         # UI：Chamber 渲染迴圈會在下次 tick 時自動依新狀態重繪，不需手動觸發
         self._timer_label.configure(text="00:00")
         self._hotkey_hint.configure(
-            text=f"放開 {self.cfg.format_hotkey_display()} 停止錄音"
+            text=f"再按 {self.cfg.format_hotkey_display()} 停止錄音"
         )
         self._model_menu.configure(state="disabled")
         self._lang_menu.configure(state="disabled")
@@ -667,8 +744,14 @@ class AppWindow(ctk.CTkFrame):
         if self._mini_window is not None:
             self._mini_window.show_recording()
 
-    def _transition_to_processing(self) -> None:
-        """狀態機：recording → processing。停止麥克風並在背景執行緒跑 Whisper。"""
+    def _transition_to_processing(self, audio_duration_s: float = 0.0) -> None:
+        """狀態機：recording → processing。停止麥克風並在背景執行緒跑 Whisper。
+
+        Fix 9 / 2026-05-22（P2-A）：timeout 改成動態（依音訊長度推算）。
+        呼叫端可顯式傳 `audio_duration_s`（測試用）；否則內部 stop 後從
+        `full_audio` 長度自己算（生產路徑）。取兩者大值作為 timeout，
+        保證 BASE 60s 為下限。
+        """
         if self._state != "recording":
             log.debug(f"_transition_to_processing ignored (state={self._state})")
             return
@@ -676,13 +759,29 @@ class AppWindow(ctk.CTkFrame):
         log_state("recording->processing", duration_s=f"{duration:.2f}")
         self._state            = "processing"
         self._state_start_time = time.perf_counter()
-        self._hotkey_held      = False
 
         if self._stream_tick_id is not None:
             self.after_cancel(self._stream_tick_id)
             self._stream_tick_id = None
 
         full_audio = self.recorder.stop()
+
+        # 動態 timeout：取呼叫端傳入值 / 實際錄音長度 / recording 階段 elapsed
+        # 三者最大；至少 BASE 60s 為下限，避免 CPU backend + 長音檔誤殺。
+        measured_audio_s = max(
+            audio_duration_s,
+            len(full_audio) / 16_000.0 if len(full_audio) else 0.0,
+            duration,
+        )
+        dynamic_timeout_ms = max(
+            self.PROCESSING_TIMEOUT_BASE_MS,
+            int(measured_audio_s * self.PROCESSING_TIMEOUT_RTF_BUDGET * 1000),
+        )
+        # 穩定性（Fix 4 / 2026-05-21、Fix 9 / 2026-05-22）：記錄 processing
+        # 進入時間並排程動態自癒檢查
+        self._processing_started_at = time.monotonic()
+        self._processing_timeout_ms = dynamic_timeout_ms
+        self.after(dynamic_timeout_ms, self._processing_timeout_check)
 
         # UI：Chamber 渲染迴圈下一 tick 會自動切換到 WARN 配色 + 粒子旋轉環
         self._timer_label.configure(text="")
@@ -783,26 +882,102 @@ class AppWindow(ctk.CTkFrame):
         """背景執行緒：呼叫 Whisper 做最終轉錄，完成後 marshal 到主執行緒。
 
         若有中段串流結果，將其與最終文字合併後一起回傳。
-        """
-        # 一律用使用者選的模型做最終轉錄，不再因短音檔退化到 transcribe_fast
-        # （那條路徑寫死 small，會嚴重拖垮品質）。
-        result = self.transcriber.transcribe(audio, model_size=model, language=lang)
 
-        prior = list(self._stream_chunks)
-        if prior:
-            tail = result.text if result.text != "（未偵測到語音內容）" else ""
-            combined = "".join(prior) + tail
-            result = result.__class__(
-                text=combined.strip() or "（未偵測到語音內容）",
-                language=result.language,
-                duration_seconds=result.duration_seconds,
-                elapsed_seconds=result.elapsed_seconds,
-                segments=result.segments,
+        穩定性（Fix 3 / 2026-05-21）：整段包 try/except；若 transcribe()
+        throw（模型載入失敗 / OOM / VAD 異常），_on_transcription_done 不會
+        被排程，狀態機會卡在 processing 永不歸位。改在這裡 marshal
+        _on_transcription_failed 回主執行緒把狀態切回 idle。
+        """
+        try:
+            # 一律用使用者選的模型做最終轉錄，不再因短音檔退化到 transcribe_fast
+            # （那條路徑寫死 small，會嚴重拖垮品質）。
+            result = self.transcriber.transcribe(audio, model_size=model, language=lang)
+
+            prior = list(self._stream_chunks)
+            if prior:
+                tail = result.text if result.text != "（未偵測到語音內容）" else ""
+                combined = "".join(prior) + tail
+                result = result.__class__(
+                    text=combined.strip() or "（未偵測到語音內容）",
+                    language=result.language,
+                    duration_seconds=result.duration_seconds,
+                    elapsed_seconds=result.elapsed_seconds,
+                    segments=result.segments,
+                )
+            self.after(0, self._on_transcription_done, result)
+        except Exception as e:
+            log_error("transcription_failed", model=model, error=str(e))
+            self.after(0, self._on_transcription_failed, str(e))
+
+    def _on_transcription_failed(self, err_msg: str) -> None:
+        """主執行緒：轉錄失敗時把狀態從 processing 切回 idle，顯示 toast。
+
+        Fix 3 / 2026-05-21：沿用既有 _transition_to_idle(result) 路徑，
+        不新增狀態；用一個帶失敗訊息的空 TranscriptionResult 觸發回 idle。
+
+        Fix 9 / 2026-05-22（P1-B）：state != processing 時直接 drop。情境：
+        _processing_timeout_check 已先 force-idle，背景 thread 隨後 throw，
+        若不擋第二段錄音的 UI 會被「⚠ 轉錄失敗」toast 干擾。
+        """
+        if self._state != "processing":
+            log.warning(
+                f"_on_transcription_failed dropped: state={self._state} "
+                f"(expected 'processing'); stale callback after force-idle"
             )
-        self.after(0, self._on_transcription_done, result)
+            log_action("transcription_failed_late_dropped", state=self._state)
+            return
+        empty = TranscriptionResult(
+            text="（轉錄失敗，請查看 log）",
+            language="",
+            duration_seconds=0.0,
+            elapsed_seconds=0.0,
+            segments=[],
+        )
+        self._transition_to_idle(empty)
+        self._show_toast("⚠ 轉錄失敗")
+
+    def _processing_timeout_check(self) -> None:
+        """processing 狀態超過動態 timeout 沒結束 → 強制切回 idle（Fix 4 / 2026-05-21、
+        Fix 9 / 2026-05-22）。
+
+        對應 _transition_to_processing 排程的 after。若狀態早已正常切回 idle 則
+        no-op；若超時則 log_warning + log_action + 強制 idle + toast。
+        Fix 9：timeout 上限改成依音訊長度動態算，比較 elapsed 用 instance 上記的
+        `_processing_timeout_ms`，無記則 fallback BASE 60s。
+        """
+        if self._state != "processing":
+            return   # 已正常結束，無事
+        elapsed = time.monotonic() - getattr(self, "_processing_started_at", 0)
+        timeout_s = getattr(self, "_processing_timeout_ms", self.PROCESSING_TIMEOUT_BASE_MS) / 1000
+        if elapsed >= timeout_s:
+            log.warning(f"STATE: processing stuck >{elapsed:.0f}s — force idle")
+            log_action("state_processing_timeout_recovered", elapsed_s=f"{elapsed:.1f}")
+            empty = TranscriptionResult(
+                text="（轉錄超時，請重試）",
+                language="",
+                duration_seconds=0.0,
+                elapsed_seconds=elapsed,
+                segments=[],
+            )
+            self._transition_to_idle(empty)
+            self._show_toast("⏱ 轉錄超時 — 已自動恢復")
 
     def _on_transcription_done(self, result: TranscriptionResult) -> None:
-        """主執行緒：轉錄完成後決定是否走潤飾流程，並觸發剪貼簿 / 自動貼上。"""
+        """主執行緒：轉錄完成後決定是否走潤飾流程，並觸發剪貼簿 / 自動貼上。
+
+        Fix 9 / 2026-05-22（P1-B）：state != processing 時直接 drop。情境：
+        _processing_timeout_check 已先 force-idle 並 toast「轉錄超時」，使用
+        者已開始第二段錄音（state=recording），背景 Whisper thread 慢慢回來
+        若不擋會覆寫 UI / timer 並把 _state 強制改成 idle，與 recorder 失同步。
+        """
+        if self._state != "processing":
+            log.warning(
+                f"_on_transcription_done dropped: state={self._state} "
+                f"(expected 'processing'); likely stale callback from timed-out inference"
+            )
+            log_action("transcription_late_dropped", state=self._state)
+            return
+
         self._transition_to_idle(result)
         self._show_toast(f"轉錄完成 · {result.elapsed_seconds:.1f}s")
 
@@ -875,11 +1050,10 @@ class AppWindow(ctk.CTkFrame):
         if self.cfg.auto_paste and valid and self._paste_target:
             target = self._paste_target
             self._paste_target = None
-            threading.Thread(
-                target=self._do_auto_paste,
-                args=(text, target),
-                daemon=True,
-            ).start()
+            # macOS 26.4+ TSM 強制主執行緒：pynput keyboard.Controller 模擬 ⌘V
+            # 必須在主 thread 呼叫，否則 TSMGetInputSourceProperty 會觸發
+            # dispatch_assert_queue_fail 直接閃退。詳見 CLAUDE.md §9.6。
+            self._do_auto_paste(text, target)
 
     # ── 潤飾管線 ────────────────────────────────────────────────────────────
 
@@ -984,12 +1158,11 @@ class AppWindow(ctk.CTkFrame):
             paste_text = polished
 
         # 自動貼上（策略 B：等潤飾完才貼）
+        # macOS 26.4+ TSM 強制主執行緒：pynput keyboard.Controller 模擬 ⌘V
+        # 必須在主 thread 呼叫，否則 TSMGetInputSourceProperty 會觸發
+        # dispatch_assert_queue_fail 直接閃退。詳見 CLAUDE.md §9.6。
         if target:
-            threading.Thread(
-                target=self._do_auto_paste,
-                args=(paste_text, target),
-                daemon=True,
-            ).start()
+            self._do_auto_paste(paste_text, target)
 
     # ── 原文 / 潤飾 分段切換 ─────────────────────────────────────────────
 
@@ -1092,12 +1265,18 @@ class AppWindow(ctk.CTkFrame):
         self._result_title.configure(text="".join(parts))
 
     def _do_auto_paste(self, text: str, target: str) -> None:
-        """背景執行緒：呼叫 auto_paste，完成後以 toast 通知使用者。"""
+        """主執行緒：呼叫 auto_paste，完成後以 toast 通知使用者。
+
+        必須在主執行緒呼叫——macOS 26.4+ TSM 對 pynput keyboard.Controller
+        強制主執行緒（背景 thread 會觸發 dispatch_assert_queue_fail 閃退）。
+        典型耗時 ~380ms（osascript activate + 180ms 緩衝 + ⌘V），可接受的
+        UI 短暫凍結，遠優於閃退。詳見 CLAUDE.md §9.6。
+        """
         success = _ap.paste_to_app(text, target)
         if success:
-            self.after(0, lambda: self._show_toast(f"⌨  已貼入 {target}"))
+            self._show_toast(f"⌨  已貼入 {target}")
         else:
-            self.after(0, lambda: self._show_toast("⌨  自動貼上失敗（請確認輔助使用權限）"))
+            self._show_toast("⌨  自動貼上失敗（請確認輔助使用權限）")
 
     def _display_result(self, result: TranscriptionResult) -> None:
         """將轉錄結果插入 textbox，並以 tk mark 圈住最新一段供後續精準替換。"""
@@ -1361,26 +1540,53 @@ class AppWindow(ctk.CTkFrame):
             # Tail padding — 多錄 300ms 再停，抓尾音避免漏字
             self.after(self.TAIL_PADDING_MS, self._try_stop)
 
-    def _hotkey_press(self) -> None:
-        """pynput 執行緒 → 安全 marshal 到主執行緒。"""
-        self.after(0, self._on_hotkey_press)
+    def _hotkey_tap(self) -> None:
+        """HotkeyManager callback：tap 觸發（完整按下→放開算 1 次）。
 
-    def _hotkey_release(self) -> None:
-        """pynput 執行緒 → 安全 marshal 到主執行緒。"""
-        self.after(0, self._on_hotkey_release)
+        ⚠️ Fix 10 / 2026-05-23 — **絕對不能在這裡呼叫 self.after() 或任何 Tk 函式**。
 
-    def _on_hotkey_press(self) -> None:
-        """主執行緒：快捷鍵按下時若為 idle 則開始錄音。"""
-        if self._state == "idle" and not self._hotkey_held:
-            log_action("hotkey_triggered_recording", combo=self.cfg.hotkey)
-            self._transition_to_recording()
+        理由（PyObjC + Tk 同執行緒 GIL 衝突）：
+          Fix 7 換成 NSEvent monitor 後，這個 callback 在「主執行緒 +
+          PyObjC PyGILState_Ensure context」下被呼叫。Tk 用的是
+          PyEval_SaveThread/RestoreThread 來管理 GIL，兩套 API 在同執行緒
+          混用會讓 Tk 後續 Tcl_ServiceEvent 拿到 stale thread state →
+          PyEval_RestoreThread 觸發 fatal_error → SIGSEGV at NULL+16。
+          崩潰堆疊：Tcl_ServiceEvent → PythonCmd → PyEval_RestoreThread →
+          fatal_error。100% 重現：每按一次熱鍵都崩。
 
-    def _on_hotkey_release(self) -> None:
-        """主執行緒：快捷鍵放開時若為 recording 則延遲停止（抓尾音）。"""
-        if self._state == "recording":
-            log_action("hotkey_triggered_stop", combo=self.cfg.hotkey)
-            # Tail padding — 多錄 300ms 再停，避免漏最後一兩個字
-            self.after(self.TAIL_PADDING_MS, self._try_stop)
+        修法：純 Python 屬性遞增（GIL 已被 PyGILState_Ensure 拿著、不需要 Tk），
+        實際 toggle 動作由 _poll_pending_tap 在「Tk mainloop iteration」context
+        裡跑（PyEval 系列 GIL 管理乾淨）。20ms 輪詢延遲使用上感受不到。
+
+        Tap toggle 語意：每次 tap 等同於點一下螢幕上的錄音鈕，
+        idle → 開始錄音；recording → 停止；processing → 忽略。
+        實際分支邏輯沿用 `_on_record_btn`，不在這裡重複實作。
+        """
+        # 純 Python int 遞增；不呼叫任何 Tk / PyObjC bridge / threading 同步原語
+        self._pending_tap_count += 1
+
+    def _poll_pending_tap(self) -> None:
+        """Tk-side poller：在 mainloop iteration 中安全地把 NSEvent handler
+        擱置的 tap 觸發實際分派到 _on_hotkey_tap。
+
+        Fix 10 / 2026-05-23 配對：詳見 _hotkey_tap docstring。
+        """
+        try:
+            count = self._pending_tap_count
+            if count > 0:
+                self._pending_tap_count = 0
+                # 同一輪 poll 內最多 fire 1 次，避免使用者連按時把 toggle 跑成
+                # 「start→stop→start」這種非預期狀態（每 20ms 跑一次已經夠快）
+                self._on_hotkey_tap()
+        except Exception:
+            log_error("poll_pending_tap_failed")
+        finally:
+            self.after(self.PENDING_TAP_POLL_MS, self._poll_pending_tap)
+
+    def _on_hotkey_tap(self) -> None:
+        """主執行緒：快捷鍵 tap → 直接重用 chamber 按鈕的 toggle handler。"""
+        log_action("hotkey_triggered_toggle", combo=self.cfg.hotkey, state=self._state)
+        self._on_record_btn()
 
     def _try_stop(self) -> None:
         """延遲後真的停錄音。只在仍為 recording 狀態才執行（防重入）。"""
@@ -1718,7 +1924,7 @@ class AppWindow(ctk.CTkFrame):
         # 的 CFRunLoop teardown 完成，避免 macOS Cocoa native race 造成閃退。
         if cfg.hotkey != old_hotkey:
             self.after(100, self._start_hotkey_listener)
-        self._hotkey_hint.configure(text=f"按住 {cfg.format_hotkey_display()} 即時錄音")
+        self._hotkey_hint.configure(text=f"按下 {cfg.format_hotkey_display()} 即時錄音")
         self._hotkey_status.configure(text=cfg.format_hotkey_display())
         self._model_var.set(cfg.model)
         self._lang_var.set(cfg.language)
@@ -1779,6 +1985,281 @@ class AppWindow(ctk.CTkFrame):
         if not is_pynput_available():
             return
         self.hotkey_mgr.restart(self.cfg.hotkey)
+
+    def _hotkey_watchdog(self) -> None:
+        """週期性檢查 NSEvent monitor 還活著嗎；死了就 restart。
+
+        Fix 7 / 2026-05-22：pynput Listener 已換成 NSEvent
+        addGlobal/LocalMonitorForEventsMatchingMask_handler_。NSEvent 不會自己死、
+        不會被 idle timeout disable、不會被 TCC race 殺掉，watchdog 幾乎不會 fire；
+        但仍保留作為極端情境兜底（系統權限被使用者中途撤銷、PyObjC 內部異常等）。
+
+        Layer 2（CGEventTap re-enable）+ Layer 3（定時 force restart）已隨
+        pynput 一併移除——NSEvent 不需要這兩層補救。
+        """
+        try:
+            mgr = self.hotkey_mgr
+            # NSEvent backend：monitor 物件不為 None 視為活著
+            monitor_alive = (
+                getattr(mgr, "_monitor_global", None) is not None
+                or getattr(mgr, "_monitor_local", None) is not None
+            )
+            if not monitor_alive:
+                log.warning("HOTKEY: watchdog restarting NSEvent monitor (reason=monitor_missing)")
+                log_action("hotkey_listener_auto_restarted", reason="monitor_missing")
+                mgr.restart(self.cfg.hotkey)
+        except Exception:
+            log_error("hotkey_watchdog_failed")
+        finally:
+            self.after(self.HOTKEY_WATCHDOG_INTERVAL_MS, self._hotkey_watchdog)
+
+    # ── 視窗復原 helper（Fix 5d / 2026-05-22）─────────────────────────
+    # 根因：AppWindow 是 CTkFrame，不是 Toplevel。所有 wm_state/deiconify/iconify
+    # 方法必須在 self.winfo_toplevel()（真正的 Tk root）上呼叫，不能在 self 上。
+    # 之前 5 層保險絲全部在 self 呼叫 → 全部 AttributeError silent crash。
+    def _restore_root_if_minimized(self, source: str) -> None:
+        """共用 helper：根視窗若在 iconic/withdrawn 狀態 → 強制 deiconify + lift。
+
+        必須走 winfo_toplevel() 拿到真正的 Tk root，因為 AppWindow 是 CTkFrame
+        本身沒有 wm_state/deiconify 等視窗管理方法。
+        """
+        try:
+            top = self.winfo_toplevel()
+            state = top.wm_state()  # 'normal' / 'iconic' / 'withdrawn'
+            if state in ("iconic", "withdrawn"):
+                top.deiconify()
+                top.lift()
+                log_action("dock_reopen_recovered", source=source, state=state)
+        except Exception as e:
+            log_error("dock_reopen_failed", source=source, error=str(e))
+
+    def _on_dock_reopen(self) -> None:
+        """macOS：點 Dock icon 把最小化的視窗叫回來（Fix 5 / 2026-05-22）。"""
+        try:
+            top = self.winfo_toplevel()
+            state = top.wm_state()
+            if state in ("iconic", "withdrawn"):
+                top.deiconify()
+                top.lift()
+                top.focus_force()  # 只有 ReopenApplication 顯式強制取焦
+                log_action("dock_reopen_recovered", source="ReopenApplication", state=state)
+        except Exception as e:
+            log_error("dock_reopen_failed", source="ReopenApplication", error=str(e))
+
+    def _on_app_activate(self, event=None) -> None:
+        """macOS Fix 5b：App 取得焦點時若視窗是最小化狀態，自動 deiconify。"""
+        self._restore_root_if_minimized("Activate")
+
+    def _install_cocoa_activation_observer(self) -> None:
+        """Fix 5c：用 PyObjC 掛 Cocoa 層通知，繞過 Tk 的 AppleEvent 投遞。
+
+        實測診斷顯示我們 process 的 NSApp.delegate 為 None — kAEReopenApplication
+        沒有人接收。Tk 也沒有把 reopen 事件正確轉成 <<Activate>>。所以從
+        Cocoa NSNotificationCenter 直接訂閱 NSApplicationDidBecomeActive，
+        不依賴 Tk / AppleEvent / delegate。
+
+        當任何方式讓本 App 取得焦點（Dock 圖示／視窗縮圖、Cmd+Tab、Mission
+        Control、Spotlight）→ 通知抵達 → 主執行緒 deiconify。
+        """
+        try:
+            import objc
+            from Foundation import NSObject, NSNotificationCenter, NSBundle
+            from AppKit import (
+                NSApplication,
+                NSApplicationDidBecomeActiveNotification,
+                NSApplicationWillBecomeActiveNotification,
+                NSApplicationWillHideNotification,
+            )
+
+            # === Runtime 診斷（Fix 5c v2 / 2026-05-22）===
+            # 根因確認：bash launcher exec Python 可能讓 LaunchServices 沒
+            # 把 PID 綁到 shim Python.app 的 bundle id → AppleEvent 寄不到。
+            # 印出 runtime bundle id + delegate 狀態確認假設。
+            try:
+                bid = NSBundle.mainBundle().bundleIdentifier()
+                delegate = NSApplication.sharedApplication().delegate()
+                log.info(
+                    f"COCOA DIAG: bundle_id={bid!r} "
+                    f"delegate={type(delegate).__name__ if delegate else 'None'}"
+                )
+            except Exception as e:
+                log.warning(f"COCOA DIAG: failed - {e}")
+
+            # 用 closure 把 self 帶進 Objective-C method（避免 NSObject 子類保
+            # 留 tk 物件參照造成循環引用）
+            tk_root = self
+
+            class _ActivationObserver(NSObject):
+                # Fix 17 / 2026-05-23 — 不在 PyObjC context 裡呼叫 tk_root.after()。
+                # 跟 Fix 10 同款根因：PyObjC PyGILState_Ensure 與 Tk PyEval_SaveThread
+                # 衝突，導致 Tcl_ServiceEvent → PyEval_RestoreThread → SIGSEGV at NULL+16。
+                # 改成純 Python list.append（GIL 已由 PyGILState_Ensure 拿著，安全），
+                # 實際分派由 _poll_cocoa_pending_actions 在 Tk mainloop iteration
+                # 跑（PyEval_SaveThread/RestoreThread context 乾淨）。
+                def appBecameActive_(self, notification):
+                    try:
+                        tk_root._cocoa_pending_actions.append("BecomeActive")
+                    except Exception:
+                        pass
+
+                def appWillBecomeActive_(self, notification):
+                    try:
+                        tk_root._cocoa_pending_actions.append("WillBecomeActive")
+                    except Exception:
+                        pass
+
+                def appWillHide_(self, notification):
+                    # Fix 16：攔截 macOS「點 frontmost app dock icon = hide」標準行為。
+                    # 詳見 _handle_cocoa_will_hide docstring。
+                    try:
+                        tk_root._cocoa_pending_actions.append("WillHide")
+                    except Exception:
+                        pass
+
+            self._cocoa_activation_observer = _ActivationObserver.alloc().init()
+            nc = NSNotificationCenter.defaultCenter()
+            # 雙保險：DidBecomeActive（事後）+ WillBecomeActive（事前）
+            # 後者是 Plan B 重點 — SwiftUI 同類 bug 驗證唯一有效的 workaround
+            nc.addObserver_selector_name_object_(
+                self._cocoa_activation_observer,
+                b"appBecameActive:",
+                NSApplicationDidBecomeActiveNotification,
+                NSApplication.sharedApplication(),
+            )
+            nc.addObserver_selector_name_object_(
+                self._cocoa_activation_observer,
+                b"appWillBecomeActive:",
+                NSApplicationWillBecomeActiveNotification,
+                NSApplication.sharedApplication(),
+            )
+            # Fix 16：觀察 WillHide 攔截「click frontmost app dock icon = hide」
+            nc.addObserver_selector_name_object_(
+                self._cocoa_activation_observer,
+                b"appWillHide:",
+                NSApplicationWillHideNotification,
+                NSApplication.sharedApplication(),
+            )
+            log.info("COCOA: observers installed (Did + Will BecomeActive + WillHide)")
+
+            # ── Layer 6（Fix 13 / 2026-05-23）：kAEReopenApplication AppleEvent ──
+            # 補洞理由：黃色鈕 minimize 後再點 Dock icon，本 App 全程仍是
+            # frontmost（NSApp.isActive 不轉換）→ Layer 3/4 BecomeActive 不 fire、
+            # Layer 5 Poll 沒 transition 也不 fire。但 macOS 一定會送
+            # kAEReopenApplication AppleEvent 給程序——此層直接掛到
+            # NSAppleEventManager 接這個 event，不依賴 NSApp.isActive 轉換、
+            # 不依賴 NSApplicationDelegate（後者可能是 TKApplication 但沒轉發）。
+            # 失敗只 log，不阻擋啟動。
+            try:
+                from Foundation import NSAppleEventManager
+                # FourCharCode: 'aevt' = kCoreEventClass, 'rapp' = kAEReopenApplication
+                #   'a'=0x61 'e'=0x65 'v'=0x76 't'=0x74 → 0x61657674
+                #   'r'=0x72 'a'=0x61 'p'=0x70 'p'=0x70 → 0x72617070
+                _kCoreEventClass     = 0x61657674
+                _kAEReopenApplication = 0x72617070
+
+                class _ReopenHandler(NSObject):
+                    def handleReopenEvent_withReplyEvent_(self, event, reply):
+                        # Fix 17：純 Python append，不呼叫 tk_root.after()（GIL 衝突）
+                        try:
+                            tk_root._cocoa_pending_actions.append("AppleEventReopen")
+                        except Exception:
+                            pass
+
+                self._cocoa_reopen_handler = _ReopenHandler.alloc().init()
+                aem = NSAppleEventManager.sharedAppleEventManager()
+                aem.setEventHandler_andSelector_forEventClass_andEventID_(
+                    self._cocoa_reopen_handler,
+                    b"handleReopenEvent:withReplyEvent:",
+                    _kCoreEventClass,
+                    _kAEReopenApplication,
+                )
+                log.info("COCOA: kAEReopenApplication handler installed (Layer 6)")
+            except Exception as e:
+                log_error("cocoa_reopen_handler_install_failed", error=str(e))
+        except Exception as e:
+            log_error("cocoa_observer_install_failed", error=str(e))
+
+    def _poll_cocoa_pending_actions(self) -> None:
+        """Fix 17 / 2026-05-23 — Cocoa observer / AppleEvent handler 動作 poller。
+
+        在 Tk mainloop iteration 跑（PyEval_SaveThread/RestoreThread context 乾淨），
+        把 PyObjC observer / handler 從 PyGILState context 擱置的動作分派出去。
+        詳見 _cocoa_pending_actions 註解與 Fix 10 模式。
+
+        同一輪 poll 內同類動作只執行一次（dedupe），避免短時間連點 Dock icon
+        把同一個 restore 邏輯跑多次。
+        """
+        try:
+            if self._cocoa_pending_actions:
+                actions = self._cocoa_pending_actions
+                self._cocoa_pending_actions = []
+                seen: set = set()
+                for action in actions:
+                    if action in seen:
+                        continue
+                    seen.add(action)
+                    if action == "BecomeActive":
+                        self._restore_root_if_minimized("CocoaActive")
+                    elif action == "WillBecomeActive":
+                        self._restore_root_if_minimized("CocoaWillActive")
+                    elif action == "AppleEventReopen":
+                        self._restore_root_if_minimized("AppleEventReopen")
+                    elif action == "WillHide":
+                        self._handle_cocoa_will_hide()
+        except Exception as e:
+            log_error("poll_cocoa_pending_failed", error=str(e))
+        finally:
+            self.after(self.COCOA_POLL_MS, self._poll_cocoa_pending_actions)
+
+    def _handle_cocoa_will_hide(self) -> None:
+        """Fix 16 / 17 — 攔截 macOS「點 frontmost app dock icon = hide app」。
+
+        判斷邏輯：WillHide 抵達時若有 iconic 視窗 → 是「minimize 後點 Dock」
+        的標準行為，立刻 unhide + deiconify 把視窗叫回來。state 不是 iconic
+        時跳過，避免影響真正的 ⌘H / Hide Others 行為。
+
+        ⚠️ 此方法只能從 _poll_cocoa_pending_actions 呼叫（Tk mainloop context），
+        絕對不能從 NSNotification observer 直接呼叫（PyObjC + Tk GIL 衝突 → crash）。
+        """
+        try:
+            top = self.winfo_toplevel()
+            state = top.wm_state()
+            if state == "iconic":
+                from AppKit import NSApplication
+                # NSApp.unhide 取消 hide；同時 deiconify 把 iconic 視窗叫回
+                NSApplication.sharedApplication().unhide_(None)
+                top.deiconify()
+                top.lift()
+                log_action(
+                    "dock_reopen_recovered",
+                    source="CancelHide",
+                    state="hide+iconic",
+                )
+        except Exception as e:
+            log_error("cancel_hide_failed", error=str(e))
+
+    def _poll_window_visibility(self) -> None:
+        """Plan C / Fix 5c v3：每 500ms 輪詢，偵測「App 重新 active + 視窗 iconic」。
+
+        終極保險絲：如果上面所有通知層（Tk + Cocoa）都沒觸發，這層用純
+        Python 計時器確保 user 重新 focus 我們時視窗一定能在 500ms 內恢復。
+
+        關鍵：只在 NSApp.isActive 從 False → True 轉換時動作。這避免：
+        - User 主動 minimize 時誤觸發（那時 NSApp 還是 active，不算轉換）
+        - 我們是 active 期間偶發的 iconic 假狀態（極罕見）
+        """
+        try:
+            from AppKit import NSApplication
+            now_active = bool(NSApplication.sharedApplication().isActive())
+            transitioned_to_active = (not self._last_nsapp_active) and now_active
+            self._last_nsapp_active = now_active
+
+            if transitioned_to_active:
+                self._restore_root_if_minimized("Poll")
+        except Exception as e:
+            log_error("poll_visibility_failed", error=str(e))
+        finally:
+            self.after(500, self._poll_window_visibility)
 
     def _warmup_model(self) -> None:
         """背景預熱 Whisper 模型（延遲 1.5s 後執行，避免阻礙 UI 初始化）。"""
@@ -2640,11 +3121,11 @@ class HotkeyBindDialog(ctk.CTkToplevel):
         """建立說明文字、偵測標籤、取消和確認套用按鈕。"""
         ctk.CTkLabel(
             self,
-            text="請按下想要的快捷鍵組合\n（按下後鬆開確認）",
+            text="請按下想要的快捷鍵\n可以是單一鍵（如右 Cmd）或組合鍵\n（按下後鬆開確認）",
             font=ctk.CTkFont("SF Pro Text", 14),
             text_color=TEXT_2,
             justify="center",
-        ).pack(pady=(28, 12))
+        ).pack(pady=(20, 10))
 
         self._detect_label = ctk.CTkLabel(
             self, text="等待按鍵…",
@@ -2687,6 +3168,20 @@ class HotkeyBindDialog(ctk.CTkToplevel):
     #   改用 Tk 的 <KeyPress> / <KeyRelease> binding，事件在主執行緒回調，
     #   完全不觸碰 TSM API。唯一代價是對話框必須持續擁有鍵盤焦點（grab_set 已保證）。
     _MODIFIERS = frozenset({"cmd", "ctrl", "alt", "shift"})
+    # 側別 modifier 名稱集合（用於 lone-modifier 偵測）
+    _SIDED_MODIFIERS = frozenset({
+        "right_cmd",    "left_cmd",
+        "right_option", "left_option",
+        "right_ctrl",   "left_ctrl",
+        "right_shift",  "left_shift",
+    })
+    # 側別 → 通用（用於 combo 模式：right_cmd → cmd）
+    _SIDED_TO_GENERIC = {
+        "right_cmd":    "cmd",  "left_cmd":     "cmd",
+        "right_option": "alt",  "left_option":  "alt",
+        "right_ctrl":   "ctrl", "left_ctrl":    "ctrl",
+        "right_shift":  "shift","left_shift":   "shift",
+    }
 
     def _start_capture(self) -> None:
         self._current_keys: set[str] = set()
@@ -2729,18 +3224,35 @@ class HotkeyBindDialog(ctk.CTkToplevel):
         )
 
     def _on_tk_key_release(self, event) -> None:
-        """放開鍵時：若組合含非修飾鍵則鎖定結果；否則提示需加字母鍵。"""
+        """放開鍵時：判定 lone-modifier 或 combo 兩種情境。
+
+        Lone-modifier：max_combo 恰好 1 個元素且為側別 modifier → 鎖定為 lone。
+        Combo：max_combo 含至少 1 個非修飾鍵 → 鎖定為 combo（normalize 側別）。
+        否則（只按了修飾鍵但不是 lone 條件）→ 提示需加字母鍵。
+        """
         name = self._keysym_to_name(event.keysym)
         if name:
             self._current_keys.discard(name)
-        # 在 max_combo 有「至少一個非修飾鍵」且本輪還沒鎖定時 → 鎖定
         if self._captured:
             return
         if not self._max_combo:
             return
-        has_non_mod = any(k not in self._MODIFIERS for k in self._max_combo)
+
+        # Lone-modifier：恰好 1 個鍵且為側別 modifier
+        if len(self._max_combo) == 1:
+            only = next(iter(self._max_combo))
+            if only in self._SIDED_MODIFIERS:
+                self._captured = only
+                self._on_captured(only)
+                return
+
+        # Combo：至少一個非修飾鍵（字母 / 數字 / 空白）
+        has_non_mod = any(
+            k not in self._MODIFIERS and k not in self._SIDED_MODIFIERS
+            for k in self._max_combo
+        )
         if not has_non_mod:
-            # 使用者目前只按了修飾鍵；提示但不鎖定
+            # 只按了修飾鍵但是多個（例如 cmd+alt）→ 需要再加字母鍵
             self._detect_label.configure(
                 text=format_hotkey(self._combo_str(self._max_combo)) + "   ← 需要加字母/數字/空白"
             )
@@ -2751,32 +3263,48 @@ class HotkeyBindDialog(ctk.CTkToplevel):
 
     @staticmethod
     def _keysym_to_name(keysym: str) -> Optional[str]:
-        """Tk keysym → 我們的 combo 命名（'cmd' / 'alt' / 'r' …）。
+        """Tk keysym → 我們的 combo 命名。
 
+        側別 modifier 保留側別資訊（'right_cmd' / 'left_option' ...）；
+        到了 _combo_str 才依模式決定 normalize 或保留。
         回 None 表示此鍵不納入 combo（避免 F-keys、方向鍵等產生奇怪 combo）。
         """
         ks = keysym.lower()
-        mod_map = {
-            "meta_l": "cmd",   "meta_r": "cmd",
-            "command_l": "cmd","command_r": "cmd",
-            "super_l": "cmd",  "super_r": "cmd",  # 非 Mac 備援
-            "control_l": "ctrl","control_r": "ctrl",
-            "alt_l": "alt",    "alt_r": "alt",
-            "option_l": "alt", "option_r": "alt",
-            "shift_l": "shift","shift_r": "shift",
-            "space": "space",
+        # 側別感知映射：保留 left/right 資訊
+        sided_map = {
+            "meta_l":    "left_cmd",    "meta_r":    "right_cmd",
+            "command_l": "left_cmd",    "command_r": "right_cmd",
+            "super_l":   "left_cmd",    "super_r":   "right_cmd",  # 非 Mac 備援
+            "control_l": "left_ctrl",   "control_r": "right_ctrl",
+            "alt_l":     "left_option", "alt_r":     "right_option",
+            "option_l":  "left_option", "option_r":  "right_option",
+            "shift_l":   "left_shift",  "shift_r":   "right_shift",
         }
-        if ks in mod_map:
-            return mod_map[ks]
+        if ks in sided_map:
+            return sided_map[ks]
+        if ks == "space":
+            return "space"
         if len(ks) == 1 and ks.isalnum():
             return ks
         return None
 
-    @staticmethod
-    def _combo_str(keys: set[str]) -> str:
+    @classmethod
+    def _combo_str(cls, keys: set[str]) -> str:
+        """將 sided / 通用 modifier name 集合組成 combo 字串。
+
+        Combo 模式：sided modifier 收斂為通用名稱（right_cmd → cmd）後排序輸出。
+        Lone-modifier 模式：呼叫端在判定為 lone 時直接用 sided name，不走此函式。
+        """
         order = ["cmd", "ctrl", "alt", "shift"]
-        mods    = [m for m in order if m in keys]
-        letters = sorted(k for k in keys if k not in order)
+        # 把 sided modifier 投影成通用名稱，其餘鍵保留
+        normalized: set[str] = set()
+        for k in keys:
+            if k in cls._SIDED_TO_GENERIC:
+                normalized.add(cls._SIDED_TO_GENERIC[k])
+            else:
+                normalized.add(k)
+        mods    = [m for m in order if m in normalized]
+        letters = sorted(k for k in normalized if k not in order)
         return "+".join(mods + letters)
 
     def _on_captured(self, combo: str) -> None:
@@ -3238,11 +3766,15 @@ def _walk_children(widget):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MiniRecordingWindow(tk.Toplevel):
-    """錄音 / 處理中的浮動 mini HUD。
+    """錄音 / 處理中的浮動 mini HUD（Speakly 風格 always-on-top）。
 
-    螢幕右下角固定 140×38 無邊框視窗，always-on-top，跟隨 AppWindow 狀態
-    自動顯示／隱藏。內容：狀態圓點（依狀態色）+ 計時器（mm:ss）。
-    點擊 → lift 主視窗到前景。
+    140×38 無邊框視窗，跟隨 AppWindow 狀態自動顯示／隱藏。內容：狀態圓點
+    （依狀態色）+ 計時器（mm:ss）。點擊 → lift 主視窗到前景。
+
+    Fix 8（2026-05-22）：透過 PyObjC 把對應 NSWindow 升到 NSStatusWindowLevel
+    並加 collectionBehavior，達成「跨 Space / 全螢幕仍可見 / 不搶 focus」。
+    PyObjC import 或 NSWindow 找不到時 fallback 成普通 Toplevel（仍能用，但
+    only same Space 可見）。
 
     AppWindow 透過 `update(state, elapsed_s, rms)` 推進狀態；不該由 mini
     自己 polling，避免狀態真相分散。
@@ -3250,33 +3782,48 @@ class MiniRecordingWindow(tk.Toplevel):
 
     WIN_W = 140
     WIN_H = 38
-    OFFSET_X = 24    # 距螢幕右邊緣
-    OFFSET_Y = 60    # 距螢幕底邊緣（避開 Dock）
+    # 距螢幕底邊（Speakly 風格：中下方）
+    BOTTOM_MARGIN = 120
+
+    # 用獨特 title 讓 PyObjC 找到對應 NSWindow（Tk 沒有直接拿 handle 的 API）
+    # Fix 9 / 2026-05-22（P2-B）：title 加 id(self) 後綴避免 toggle 快速
+    # destroy/recreate 時 NSApp.windows() 短暫含舊 instance 的同名 NSWindow，
+    # 迴圈第一個取錯。class const 移除，改 instance attribute。
+    _NS_TITLE_PREFIX = "WhisperProMiniHUD"
 
     def __init__(self, master) -> None:
         super().__init__(master)
         self._master = master
         self._closed = False
+        self._ns_window = None   # 升級成功才設
+        # Fix 9 P2-B：每 instance 獨一無二 title，destroy 中的舊 window 不會混淆
+        self._ns_title = f"{self._NS_TITLE_PREFIX}-{id(self):x}"
 
-        # 無邊框 + always-on-top
+        # 無邊框
         self.overrideredirect(True)
-        try:
-            self.attributes("-topmost", True)
-        except Exception:
-            pass
         try:
             self.attributes("-alpha", 0.94)
         except Exception:
             pass
         self.configure(bg=SURF_2)
 
-        # 置於螢幕右下
+        # 給獨特 title 讓 PyObjC 比對找出對應 NSWindow
+        # （overrideredirect=True 後仍會建立 NSWindow，title 不會顯示在 UI 上）
+        try:
+            self.title(self._ns_title)
+        except Exception:
+            pass
+
+        # 初始位置（之後 show() 會重定位到游標所在螢幕中下方）
         self.update_idletasks()
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
-        x = sw - self.WIN_W - self.OFFSET_X
-        y = sh - self.WIN_H - self.OFFSET_Y
+        x = (sw - self.WIN_W) // 2
+        y = sh - self.WIN_H - self.BOTTOM_MARGIN
         self.geometry(f"{self.WIN_W}x{self.WIN_H}+{x}+{y}")
+
+        # 升級成 NSPanel-level（跨 Space / 全螢幕可見 / 不搶 focus）
+        self._upgrade_to_panel_level()
 
         # 1px SURF_4 邊框
         outer = tk.Frame(self, bg=SURF_4, highlightthickness=0)
@@ -3313,17 +3860,120 @@ class MiniRecordingWindow(tk.Toplevel):
         # 預設隱藏；由 AppWindow 透過 .show() 顯示
         self.withdraw()
 
+    # ── 跟游標所在螢幕（Speakly 風格）──────────────────────────────────────
+    def _position_at_cursor_screen_bottom(self) -> None:
+        """把 HUD 移到游標所在螢幕的中下方，距底部 BOTTOM_MARGIN px。
+
+        多螢幕座標換算：NSScreen.frame 用左下原點、Tk geometry 用左上原點，
+        且 origin 不是 (0,0)（副螢幕可能在主螢幕左 / 右 / 上）。
+        Tk 的 y 是相對「主螢幕（screens[0]）」的左上座標。
+        """
+        try:
+            from AppKit import NSScreen, NSEvent  # type: ignore
+
+            mouse_loc = NSEvent.mouseLocation()
+            target_screen = None
+            for screen in NSScreen.screens():
+                f = screen.frame()
+                if (f.origin.x <= mouse_loc.x <= f.origin.x + f.size.width and
+                        f.origin.y <= mouse_loc.y <= f.origin.y + f.size.height):
+                    target_screen = screen
+                    break
+            if target_screen is None:
+                target_screen = NSScreen.mainScreen()
+
+            sf = target_screen.frame()
+            primary_h = NSScreen.screens()[0].frame().size.height
+
+            # x：目標螢幕水平居中
+            ns_x = sf.origin.x + (sf.size.width - self.WIN_W) / 2
+            # y：NS 左下座標 → 目標螢幕底邊 + BOTTOM_MARGIN 為 HUD 下緣
+            ns_y_bottom = sf.origin.y + self.BOTTOM_MARGIN
+            # Tk y（左上原點）= primary_h - HUD 上緣 NS y
+            #                = primary_h - (ns_y_bottom + WIN_H)
+            tk_y = int(primary_h - (ns_y_bottom + self.WIN_H))
+            tk_x = int(ns_x)
+
+            self.geometry(f"{self.WIN_W}x{self.WIN_H}+{tk_x}+{tk_y}")
+        except Exception as e:
+            # 取游標螢幕失敗 → fallback：主螢幕中下方（用 Tk 原生 API）
+            log_error(f"mini_hud_position_failed: {e}")
+            try:
+                self.update_idletasks()
+                sw = self.winfo_screenwidth()
+                sh = self.winfo_screenheight()
+                x = (sw - self.WIN_W) // 2
+                y = sh - self.WIN_H - self.BOTTOM_MARGIN
+                self.geometry(f"{self.WIN_W}x{self.WIN_H}+{x}+{y}")
+            except Exception:
+                pass
+
+    # ── PyObjC NSPanel-level 升級 ──────────────────────────────────────────
+    def _upgrade_to_panel_level(self) -> None:
+        """把對應 NSWindow 升到 NSStatusWindowLevel + collectionBehavior。
+
+        失敗時靜默 fallback；HUD 仍能用，只是缺「跨 Space / 全螢幕可見」。
+        """
+        try:
+            from AppKit import NSApp  # type: ignore
+
+            # 找到對應 NSWindow（用 instance-unique title 比對）
+            ns_window = None
+            for w in NSApp.windows():
+                try:
+                    if w.title() == self._ns_title:
+                        ns_window = w
+                        break
+                except Exception:
+                    continue
+
+            if ns_window is None:
+                log_error("mini_hud_nswindow_not_found")
+                return
+
+            # NSStatusWindowLevel = 25（高於一般視窗、低於螢幕保護程式）
+            NSStatusWindowLevel = 25
+            # CollectionBehavior bitmask
+            NSWindowCollectionBehaviorCanJoinAllSpaces = 1 << 0    # 跨 Space
+            NSWindowCollectionBehaviorStationary = 1 << 4          # 不跟 Mission Control 縮
+            NSWindowCollectionBehaviorFullScreenAuxiliary = 1 << 8 # 別人全螢幕時可見
+
+            ns_window.setLevel_(NSStatusWindowLevel)
+            ns_window.setCollectionBehavior_(
+                NSWindowCollectionBehaviorCanJoinAllSpaces
+                | NSWindowCollectionBehaviorStationary
+                | NSWindowCollectionBehaviorFullScreenAuxiliary
+            )
+            # 失焦時不要自己隱藏
+            try:
+                ns_window.setHidesOnDeactivate_(False)
+            except Exception:
+                pass
+
+            self._ns_window = ns_window
+            log_state("mini_hud_panel_level_upgraded")
+        except Exception as e:
+            # PyObjC import 失敗或其他例外 → fallback 成普通 Toplevel
+            log_error(f"mini_hud_panel_upgrade_failed: {e}")
+
     def show_recording(self) -> None:
-        """進入錄音狀態 → 顯示紅點 + 「錄音中」+ 0:00 計時。"""
+        """進入錄音狀態 → 顯示紅點 + 「錄音中」+ 0:00 計時。
+
+        每次顯示前重新定位到游標所在螢幕中下方（Speakly 風格）。
+        """
         if self._closed:
             return
+        self._position_at_cursor_screen_bottom()
         self._dot.configure(fg=DANGER)
         self._label.configure(text="錄音中")
         self._timer.configure(text="00:00")
         self.deiconify()
 
     def show_processing(self) -> None:
-        """進入處理中狀態 → 琥珀色 + 「轉錄中」。"""
+        """進入處理中狀態 → 琥珀色 + 「轉錄中」。
+
+        錄音剛結束時延續錄音時的位置；不重定位，避免 HUD 跳動。
+        """
         if self._closed:
             return
         self._dot.configure(fg=WARN)
