@@ -31,8 +31,8 @@
 | 語音辨識（CPU 後端）| `faster-whisper 1.1.1` | int8 量化、非 Apple Silicon 的 fallback |
 | VAD 靜音偵測 | `faster-whisper` 內建 Silero VAD | v2.1.0 放寬：threshold 0.3、min_silence 800ms |
 | 剪貼簿 | `pyperclip 1.9.0` | macOS 原生 pbcopy |
-| 全域快捷鍵 | `pynput 1.7.7`（主 listener）+ Tk 原生 binding（綁定對話框）| 需「輔助使用」權限；綁定對話框改 Tk 原生避 macOS 26.4+ TSM crash |
-| 自動貼上 | `pynput` 按鍵模擬 | ⌘V |
+| 全域快捷鍵 | **PyObjC NSEvent monitor**（主 listener，2026-05-22 換掉 pynput）+ Tk 原生 binding（綁定對話框）| 需「輔助使用」權限；NSEvent handler 永遠在主執行緒、根治 pynput 在 macOS 26.4+ 的 TSM / PAC / idle disable crash |
+| 自動貼上 | `pynput.keyboard.Controller` 按鍵模擬 | ⌘V；主執行緒呼叫安全（已驗證），保留不換 |
 | 圖示 | **純 PIL 手繪**（非 SVG） | Lucide 風格 2px 線寬、4 倍超採樣 |
 | AI 潤飾 | Ollama HTTP（預設關閉）| 建議 `qwen2.5:3b-instruct`；timeout 30s；失敗降級回原文 |
 | 日誌系統 | Python `logging`（自訂 rotation）| 寫 `~/.whisper_app/logs/whisper_app.log`，5MB × 5 份 |
@@ -55,7 +55,7 @@ Python 版本：**3.13 arm64**（Apple Silicon）。
 ├── animation.py          # 純函式：easing、breathing、blend、Ripple（Ambient Chamber 用）
 ├── transcriber.py        # Whisper 封裝（MLX + CTranslate2 雙後端）、VAD 放寬、音量正規化、幻覺過濾
 ├── recorder.py           # AudioRecorder：sounddevice 回呼 + RMS 電平
-├── hotkey_manager.py     # pynput 全域快捷鍵監聽 + Tk 原生 binding（綁定對話框）
+├── hotkey_manager.py     # NSEvent 全域快捷鍵監聽（Fix 7 換掉 pynput）+ Tk 原生 binding（綁定對話框）
 ├── auto_paste.py         # ⌘V 模擬自動貼上 + 前景 App 偵測
 ├── config.py             # ~/.whisper_app/config.json 讀寫（原子性儲存）
 ├── logger.py             # ★ 統一日誌系統：rotation 5MB×5、log_action/log_state/log_settings/log_error
@@ -313,14 +313,15 @@ cat ~/.whisper_app/polish_log.jsonl | jq .         # 潤飾紀錄
 3. **圖示不要用 cairosvg／svglib** — Python 3.13 + libcairo 裝不起來，已改用純 PIL 手繪（4 倍超採樣 + LANCZOS 縮放）
 4. **pynput 需要 macOS「輔助使用」權限** — 首次執行會跳權限引導視窗
 5. **git push 被拒絕** → 用 `git pull --rebase origin <branch>`，而非 `--merge`
-6. **macOS 26.4+ TSM 斷言** — HotkeyBindDialog（重綁快捷鍵）**禁止**用 pynput Listener 在背景執行緒 capture，必須用 Tk 原生 `<KeyPress>` binding 在主執行緒收（已在 `hotkey_manager.py` 實作）。**同樣規則適用 `auto_paste`：pynput keyboard.Controller 模擬 ⌘V 必須在主執行緒呼叫，否則 `TSMGetInputSourceProperty` 會觸發 `dispatch_assert_queue_fail` 直接閃退**（v2.3.x 修：`_do_auto_paste` 不再用 `threading.Thread` spawn，直接在主執行緒呼叫；典型耗時 ~380ms 可接受）
+6. **macOS 26.4+ TSM 斷言** — HotkeyBindDialog（重綁快捷鍵）**禁止**用 pynput Listener 在背景執行緒 capture，必須用 Tk 原生 `<KeyPress>` binding 在主執行緒收（已在 `hotkey_manager.py` 實作）。**同樣規則適用 `auto_paste`：pynput keyboard.Controller 模擬 ⌘V 必須在主執行緒呼叫，否則 `TSMGetInputSourceProperty` 會觸發 `dispatch_assert_queue_fail` 直接閃退**（v2.3.x 修：`_do_auto_paste` 不再用 `threading.Thread` spawn，直接在主執行緒呼叫；典型耗時 ~380ms 可接受）。**主 hotkey listener 也受同類問題影響**：Fix 7（2026-05-22）把 pynput Listener 換成 NSEvent monitor 根治，handler 永遠在主執行緒——詳見坑點 #14。
 7. **Cocoa CFRunLoop race** — `SettingsWindow` destroy 與 pynput Listener restart 不能在同一個 tick；`_on_settings_saved` 用 `self.after(100, ...)` 延遲重啟
 8. **Ollama 沒在跑時不要 block UI** — `health_check_async()` 才是正確路徑，`health_check_sync()` 只給測試用
 9. **VAD 參數修過** — `threshold=0.3 / min_silence=800ms / min_speech=50ms`。再改小心「小聲說話被吃」vs「環境噪音被吃進去」的 tradeoff
 10. **logger 的 console handler 用 `sys.__stderr__`** — 不是 `sys.stderr`；避免跟任何 stdout 重導機制循環
 11. **macOS TCC 權限按 responsible process 歸帳** — 從不同終端機 / Claude Preview / 不同 shell 啟動 `python3 main.py` 會被歸到不同的 responsible process，每個都要重新授權麥克風 / 輔助使用 / AppleScript。**解法：永遠透過 `~/Applications/WhisperPro.app` 啟動**（雙擊、Spotlight 都行），所有路徑都歸到同一個 bundle ID，授權一次永遠有效。重建 .app：`bash build_app.sh`。
 12. **背景執行緒安靜死亡** — pynput Listener / Whisper 推論執行緒若 throw 例外或被 macOS 內部停掉，**不會有 log 也不會 crash**。對應穩定性層：listener watchdog（gui.py `_hotkey_watchdog`，5s 心跳）、processing 狀態 60s 超時自癒（`_processing_timeout_check`）、callback 全包 try/except。詳見 `docs/superpowers/plans/2026-05-21-stability-watchdog-and-recovery.md`。
-13. **pynput Listener 閒置後 hotkey 死亡** — pynput 1.7.7 source 沒處理 `kCGEventTapDisabledByTimeout`（macOS App Nap / sleep-wake / CPU pressure 會 disable tap），thread 不死、`listener.running` 仍 True、watchdog 偵測不到。三層保險絲：(1) `_hotkey_watchdog` 每 5s 既有旗標檢查 +（新）每 10 分鐘無條件 force restart、(2)（新）`Quartz.CGEventTapIsEnabled` 體檢 + `CGEventTapEnable` 輕量 re-enable、(3) `main.py` `_disable_app_nap()` 用 `NSProcessInfo.beginActivityWithOptions_` 抑制 App Nap（token 必須 module-level）。詳見 `docs/superpowers/plans/2026-05-22-hotkey-idle-resilience.md`。
+13. **pynput Listener 閒置後 hotkey 死亡** — pynput 1.7.7 source 沒處理 `kCGEventTapDisabledByTimeout`（macOS App Nap / sleep-wake / CPU pressure 會 disable tap），thread 不死、`listener.running` 仍 True、watchdog 偵測不到。三層保險絲：(1) `_hotkey_watchdog` 每 5s 既有旗標檢查 +（新）每 10 分鐘無條件 force restart、(2)（新）`Quartz.CGEventTapIsEnabled` 體檢 + `CGEventTapEnable` 輕量 re-enable、(3) `main.py` `_disable_app_nap()` 用 `NSProcessInfo.beginActivityWithOptions_` 抑制 App Nap（token 必須 module-level）。詳見 `docs/superpowers/plans/2026-05-22-hotkey-idle-resilience.md`。**Fix 7（2026-05-22）後過時**：pynput Listener 已換成 NSEvent，前兩層保險絲已砍除；App Nap 抑制（第三層）仍保留——NSEvent handler 在主執行緒跑，App Nap 凍 mainloop 仍會影響回應速度。
+14. **pynput Listener 在 macOS 26.4+ 不可用** — pynput 1.7.7 底層用 CGEventTap + ctypes 觸發 8+ 種 crash：`SLEventTapIsEnabled` PAC violation、`TSMGetInputSourceProperty` 主執行緒斷言、`dispatch_assert_queue_fail`、idle timeout disable。**根治：改用 PyObjC `NSEvent.addGlobal/LocalMonitorForEventsMatchingMask_handler_`**（Karabiner / BetterTouchTool / Raycast 都用這個）。handler 永遠在 Cocoa main runloop 主執行緒跑，無 thread、無 ctypes、無 TSM 同步問題。global monitor 收其他 App 焦點時的事件，local monitor 收本 App 焦點時的事件（local handler 必須 `return event` 不要 suppress）。NSEvent 不會被 idle disable、不會被 TCC race 殺掉，watchdog Layer 2（CGEventTap re-enable）與 Layer 3（定時 force restart）一併移除，只保留 Layer 1（monitor 缺席兜底）。`pynput.keyboard.Controller`（auto_paste 送 ⌘V）仍保留——已驗證主執行緒呼叫安全。實作於 `hotkey_manager.py` 的 `_start_nsevent_monitors` / `_handle_ns_event`，事件型別 10/11/12 對應 KeyDown/KeyUp/FlagsChanged，keycode → 既有 lone-modifier / combo 邏輯橋接（透過 `_sided_name_to_pynput_key`）。
 
 ---
 
@@ -437,7 +438,7 @@ cat ~/.whisper_app/polish_log.jsonl | jq .         # 潤飾紀錄
 | 尾音 padding | `gui.py` `TAIL_PADDING_MS` + `_try_stop()` | 300ms 延遲停錄音 |
 | Whisper 參數 | `transcriber.py` | `beam_size=5, vad_filter=True`，VAD `threshold=0.3` |
 | VAD / 音量 / 幻覺過濾 | `transcriber.py` | `_normalize_volume`、`_is_hallucination`、segment-level 過濾 |
-| 快捷鍵邏輯（主）| `hotkey_manager.py` | pynput 監聽器、`_pressed` 集合 |
+| 快捷鍵邏輯（主）| `hotkey_manager.py` | NSEvent monitor（global + local）、`_pressed` 集合；`_handle_ns_event` 是事件入口 |
 | 快捷鍵重綁對話框 | `gui.py` `HotkeyBindDialog` | Tk 原生 binding（避 macOS 26.4+ TSM crash）|
 | 自動貼上 | `auto_paste.py` | ⌘V 模擬，限 macOS |
 | 前景 App 偵測 | `auto_paste.py` `get_frontmost_app()` | osascript，錄音開始就抓（供 preset 路由 + ⌘V 目標） |

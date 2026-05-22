@@ -1,10 +1,13 @@
-"""穩定性層 unit tests（Fix 1-4 / 2026-05-21）。
+"""穩定性層 unit tests（Fix 1-4 / 2026-05-21、Fix 7 / 2026-05-22）。
 
 每個 fix 對應一組 test。不啟動真正的 Tk root / AppWindow（過於重量）；
 改用 ``AppWindow.__new__`` 繞過 __init__ 注入最小依賴。
 HotkeyManager 因為構造輕量，直接 instantiate。
 
 對應 plan：docs/superpowers/plans/2026-05-21-stability-watchdog-and-recovery.md §5.1
+Fix 7 / 2026-05-22：pynput Listener 換成 NSEvent monitor。watchdog Layer 2/3
+（CGEventTap re-enable + 定時 force restart）對應 tests 已砍除——NSEvent 不
+需要這兩層。新增 NSEvent handler 邏輯的 unit tests。
 """
 
 import time
@@ -18,10 +21,10 @@ from transcriber import TranscriptionResult
 
 
 def _make_manager_no_listener(combo: str) -> HotkeyManager:
-    """建立 HotkeyManager 但**不**啟動真正的 pynput Listener。
+    """建立 HotkeyManager 但**不**安裝真正的 NSEvent monitor。
 
-    跑 mgr.restart() 會 spawn pynput Listener thread；在 pytest 無頭環境下
-    macOS TCC 拒絕 + CGEventTap 取不到，會直接 segfault。
+    跑 mgr.restart() 會註冊 NSEvent global/local monitor；在 pytest 無頭環境
+    雖然不會 crash（NSEvent 安全），但仍會影響整個 process 的事件流。
     這裡手動填上 restart() 會設的狀態，足以測試 callback 邏輯。
     """
     mgr = HotkeyManager(on_tap_cb=lambda: None)
@@ -173,131 +176,50 @@ def _make_stub_appwindow_for_watchdog():
     win = AppWindow.__new__(AppWindow)
     # 偽造 cfg.hotkey
     win.cfg = types.SimpleNamespace(hotkey="cmd+alt+r")
-    # 偽造 hotkey_mgr
+    # 偽造 hotkey_mgr，預設「monitor 活著」（_monitor_global 非 None）
     win.hotkey_mgr = MagicMock()
-    win.hotkey_mgr._listener = MagicMock()
-    # Fix 6 Step 3：get_event_tap 預設回 None，避免 watchdog Layer 2
-    # 把 MagicMock 丟給 CGEventTapIsEnabled（會 hang）
-    win.hotkey_mgr.get_event_tap = MagicMock(return_value=None)
-    # Fix 6 Step 1：_last_listener_restart 預設「剛剛」，避免 Layer 3
-    # 在既有測試裡意外觸發
-    win._last_listener_restart = time.monotonic()
+    win.hotkey_mgr._monitor_global = object()
+    win.hotkey_mgr._monitor_local  = object()
     # after 攔成 no-op（不然會卡到真正的 Tk 排程）
     win.after = MagicMock()
     return win
 
 
-@pytest.mark.skipif(not is_pynput_available(), reason="pynput 未安裝；watchdog 早返")
-def test_hotkey_watchdog_restarts_dead_listener():
-    """listener.running=False → 應呼叫 hotkey_mgr.restart 並重新排程下一次。"""
+def test_hotkey_watchdog_restarts_when_monitor_missing():
+    """Fix 7：NSEvent monitor 雙雙缺席 → 應呼叫 hotkey_mgr.restart 並重排程。"""
     win = _make_stub_appwindow_for_watchdog()
-    win.hotkey_mgr._listener.running = False
+    win.hotkey_mgr._monitor_global = None
+    win.hotkey_mgr._monitor_local  = None
     win._hotkey_watchdog()
     win.hotkey_mgr.restart.assert_called_once_with("cmd+alt+r")
-    # 應重新排程
     win.after.assert_called_once()
 
 
-@pytest.mark.skipif(not is_pynput_available(), reason="pynput 未安裝；watchdog 早返")
-def test_hotkey_watchdog_noop_when_listener_alive():
-    """listener.running=True → 不該 restart，但要排下一次檢查。"""
+def test_hotkey_watchdog_noop_when_monitor_alive():
+    """Fix 7：NSEvent monitor 至少一個非 None → 不該 restart，但要排下一次。"""
     win = _make_stub_appwindow_for_watchdog()
-    win.hotkey_mgr._listener.running = True
+    # 只有 global 在線也算活
+    win.hotkey_mgr._monitor_local = None
     win._hotkey_watchdog()
     win.hotkey_mgr.restart.assert_not_called()
     win.after.assert_called_once()
 
 
-@pytest.mark.skipif(not is_pynput_available(), reason="pynput 未安裝；watchdog 早返")
 def test_hotkey_watchdog_swallows_exception_and_reschedules():
     """watchdog 自己 throw → 也要被吞掉並排下一次（finally 保證）。"""
     win = _make_stub_appwindow_for_watchdog()
-    # 模擬 mgr._listener 存取就 throw
+    # 模擬 mgr 屬性存取就 throw
     type(win.hotkey_mgr).__getattribute__ = MagicMock(side_effect=RuntimeError("boom"))
-    # 不應拋出；finally 仍要排程
     try:
         win._hotkey_watchdog()
     except Exception:
         pytest.fail("watchdog 不該拋例外")
-    # after 仍應被呼叫（finally 排程）
     win.after.assert_called_once()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  Fix 6 — 閒置後 hotkey 死亡修補（2026-05-22）
+#  Fix 6 Step 2 — App Nap 抑制（NSEvent backend 仍保留，主執行緒 responsive）
 # ═════════════════════════════════════════════════════════════════════════════
-
-@pytest.mark.skipif(not is_pynput_available(), reason="pynput 未安裝；watchdog 早返")
-def test_watchdog_force_restart_fires_after_interval():
-    """Fix 6 Step 1：10 分鐘 force restart 該被觸發。"""
-    from gui import AppWindow
-    win = _make_stub_appwindow_for_watchdog()
-    win.hotkey_mgr._listener.running = True    # 旗標看起來活
-    # 偽造 11 分鐘前最後一次 restart
-    win._last_listener_restart = time.monotonic() - (AppWindow.HOTKEY_FORCE_RESTART_INTERVAL_S + 100)
-    # 確保 Layer 2 不會搶先處理（get_event_tap 回 None → 跳過）
-    win.hotkey_mgr.get_event_tap = MagicMock(return_value=None)
-    win._hotkey_watchdog()
-    win.hotkey_mgr.restart.assert_called_once_with("cmd+alt+r")
-
-
-@pytest.mark.skipif(not is_pynput_available(), reason="pynput 未安裝；watchdog 早返")
-def test_watchdog_force_restart_noop_within_interval():
-    """Fix 6 Step 1：上次 restart 才剛發生，10 分鐘內不該再 restart。"""
-    win = _make_stub_appwindow_for_watchdog()
-    win.hotkey_mgr._listener.running = True
-    win._last_listener_restart = time.monotonic() - 60   # 1 分鐘前
-    win.hotkey_mgr.get_event_tap = MagicMock(return_value=None)
-    win._hotkey_watchdog()
-    win.hotkey_mgr.restart.assert_not_called()
-
-
-@pytest.mark.skipif(not is_pynput_available(), reason="pynput 未安裝；watchdog 早返")
-def test_watchdog_tap_reenable_in_place(monkeypatch):
-    """Fix 6 Step 3：tap disable 但 re-enable 成功 → 不該 restart listener。"""
-    win = _make_stub_appwindow_for_watchdog()
-    win.hotkey_mgr._listener.running = True
-    win._last_listener_restart = time.monotonic()   # 不會被 Layer 3 觸發
-
-    # 偽造 tap handle（任意非 None 物件）
-    fake_tap = object()
-    win.hotkey_mgr.get_event_tap = MagicMock(return_value=fake_tap)
-
-    # CGEventTapIsEnabled：第一次 False（tap 死），re-enable 後 True
-    is_enabled_calls = {"n": 0}
-    def fake_is_enabled(_tap):
-        is_enabled_calls["n"] += 1
-        return is_enabled_calls["n"] >= 2   # 第 1 次 False，之後 True
-
-    fake_enable = MagicMock()
-    import Quartz
-    monkeypatch.setattr(Quartz, "CGEventTapIsEnabled", fake_is_enabled)
-    monkeypatch.setattr(Quartz, "CGEventTapEnable", fake_enable)
-
-    win._hotkey_watchdog()
-
-    # 應呼叫 enable(tap, True)，但**不**該 restart listener
-    fake_enable.assert_called_once_with(fake_tap, True)
-    win.hotkey_mgr.restart.assert_not_called()
-
-
-@pytest.mark.skipif(not is_pynput_available(), reason="pynput 未安裝；watchdog 早返")
-def test_watchdog_tap_reenable_failed_triggers_restart(monkeypatch):
-    """Fix 6 Step 3：tap disable 且 re-enable 失敗 → fallback restart。"""
-    win = _make_stub_appwindow_for_watchdog()
-    win.hotkey_mgr._listener.running = True
-    win._last_listener_restart = time.monotonic()
-
-    fake_tap = object()
-    win.hotkey_mgr.get_event_tap = MagicMock(return_value=fake_tap)
-
-    import Quartz
-    monkeypatch.setattr(Quartz, "CGEventTapIsEnabled", lambda _t: False)   # 永遠死
-    monkeypatch.setattr(Quartz, "CGEventTapEnable", MagicMock())
-
-    win._hotkey_watchdog()
-    win.hotkey_mgr.restart.assert_called_once_with("cmd+alt+r")
-
 
 def test_app_nap_token_is_held_module_level():
     """Fix 6 Step 2：_APP_NAP_TOKEN 必須 module-level 強參照（不能被 GC）。"""
@@ -309,3 +231,109 @@ def test_app_nap_token_is_held_module_level():
         assert main._APP_NAP_TOKEN is not None
     # 必須是 module attribute（不能只是 local）
     assert "_APP_NAP_TOKEN" in vars(main)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Fix 7 — NSEvent backend：handler 邏輯 unit tests（2026-05-22）
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _make_fake_ns_event(evt_type: int, keycode: int, modifier_flags: int = 0, chars: str = ""):
+    """偽造 NSEvent，只實作 _handle_ns_event 用到的 3 個 method。"""
+    ev = MagicMock()
+    ev.type.return_value = evt_type
+    ev.keyCode.return_value = keycode
+    ev.modifierFlags.return_value = modifier_flags
+    ev.charactersIgnoringModifiers.return_value = chars
+    return ev
+
+
+@pytest.mark.skipif(not is_pynput_available(), reason="pynput 未安裝；Key 物件需要")
+def test_nsevent_lone_modifier_tap_fires():
+    """Fix 7：FlagsChanged 中 right_cmd 按下→放開，無其他鍵介入 → fire tap。"""
+    from AppKit import NSEventModifierFlagCommand
+    fired = []
+    mgr = HotkeyManager(on_tap_cb=lambda: fired.append(True))
+    mgr._hotkeys = parse_hotkey("right_cmd")
+    mgr._combo_str = "right_cmd"
+    mgr._is_lone_mode = True
+    from pynput.keyboard import Key
+    mgr._lone_target_key = Key.cmd_r
+
+    # 按下 right cmd（keycode 54）：modifierFlags 含 Command bit
+    mgr._handle_ns_event(_make_fake_ns_event(12, 54, NSEventModifierFlagCommand))
+    # 放開 right cmd：modifierFlags 不再含 Command bit
+    mgr._handle_ns_event(_make_fake_ns_event(12, 54, 0))
+
+    assert fired == [True]
+
+
+@pytest.mark.skipif(not is_pynput_available(), reason="pynput 未安裝；Key 物件需要")
+def test_nsevent_lone_modifier_with_other_key_no_fire():
+    """Fix 7：right_option + e（dead-key 打 é）→ 不該 fire tap。"""
+    from AppKit import NSEventModifierFlagOption
+    fired = []
+    mgr = HotkeyManager(on_tap_cb=lambda: fired.append(True))
+    mgr._hotkeys = parse_hotkey("right_option")
+    mgr._combo_str = "right_option"
+    mgr._is_lone_mode = True
+    from pynput.keyboard import Key
+    mgr._lone_target_key = Key.alt_r
+
+    # 按下 right option（keycode 61）
+    mgr._handle_ns_event(_make_fake_ns_event(12, 61, NSEventModifierFlagOption))
+    # 同時按下 e（keycode 14）
+    mgr._handle_ns_event(_make_fake_ns_event(10, 14, NSEventModifierFlagOption, "e"))
+    # 放開 e
+    mgr._handle_ns_event(_make_fake_ns_event(11, 14, NSEventModifierFlagOption, "e"))
+    # 放開 right option
+    mgr._handle_ns_event(_make_fake_ns_event(12, 61, 0))
+
+    assert fired == []   # 不該觸發
+
+
+@pytest.mark.skipif(not is_pynput_available(), reason="pynput 未安裝；Key 物件需要")
+def test_nsevent_combo_fires_on_release():
+    """Fix 7：cmd+alt+r 三鍵全按 → 任一鍵 release 時 fire。"""
+    from AppKit import NSEventModifierFlagCommand, NSEventModifierFlagOption
+    fired = []
+    mgr = HotkeyManager(on_tap_cb=lambda: fired.append(True))
+    mgr._hotkeys = parse_hotkey("cmd+alt+r")
+    mgr._combo_str = "cmd+alt+r"
+
+    cmd_bit  = NSEventModifierFlagCommand
+    opt_bit  = NSEventModifierFlagOption
+
+    # cmd_l 按下（keycode 55）
+    mgr._handle_ns_event(_make_fake_ns_event(12, 55, cmd_bit))
+    # alt_l 按下（keycode 58）
+    mgr._handle_ns_event(_make_fake_ns_event(12, 58, cmd_bit | opt_bit))
+    # r 按下（keycode 15）
+    mgr._handle_ns_event(_make_fake_ns_event(10, 15, cmd_bit | opt_bit, "r"))
+    # r 放開 → armed combo release → fire
+    mgr._handle_ns_event(_make_fake_ns_event(11, 15, cmd_bit | opt_bit, "r"))
+
+    assert fired == [True]
+
+
+def test_nsevent_unknown_keycode_ignored():
+    """Fix 7：FlagsChanged 收到不在 _KEYCODE_TO_SIDED_MOD 的 keycode 應靜默忽略。"""
+    mgr = HotkeyManager(on_tap_cb=lambda: None)
+    mgr._hotkeys = parse_hotkey("right_cmd") if is_pynput_available() else set()
+    mgr._combo_str = "right_cmd"
+    # 不該拋例外
+    mgr._handle_ns_event(_make_fake_ns_event(12, 999, 0))
+
+
+def test_nsevent_handler_swallows_exception():
+    """Fix 7：handler 內部 raise → 不可外洩到 Cocoa runtime（會 abort 進程）。"""
+    mgr = HotkeyManager(on_tap_cb=lambda: None)
+    mgr._hotkeys = parse_hotkey("cmd+alt+r") if is_pynput_available() else set()
+    mgr._combo_str = "cmd+alt+r"
+    # 偽造一個會 raise 的 event
+    bad_event = MagicMock()
+    bad_event.type.side_effect = RuntimeError("boom")
+    # global handler 應吃掉
+    mgr._on_ns_event_global(bad_event)
+    # local handler 應吃掉並回傳 event 不 suppress
+    ret = mgr._on_ns_event_local(bad_event)
+    assert ret is bad_event
