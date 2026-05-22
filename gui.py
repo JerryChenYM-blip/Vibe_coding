@@ -151,6 +151,13 @@ class AppWindow(ctk.CTkFrame):
     # 5 秒是權衡：> 10s 使用者感知太慢，< 1s 過密無意義（running 檢查 ~µs）。
     HOTKEY_WATCHDOG_INTERVAL_MS = 5000
 
+    # 穩定性（Fix 6 Step 1 / 2026-05-22）：watchdog Layer 3 — 定時無條件
+    # 強制 restart listener。對抗 pynput 1.7.7 沒處理 kCGEventTapDisabledByTimeout
+    # 的情境：tap 已死但 listener thread / running 旗標仍 True，Layer 1 看不出來。
+    # 10 分鐘 = sweet spot：< 5 分鐘會在使用中打斷；> 30 分鐘體感太差。
+    # 代價：restart 期間 ~50-200ms gap，剛好那刻按熱鍵會錯過，可接受。
+    HOTKEY_FORCE_RESTART_INTERVAL_S = 600
+
     # 穩定性（Fix 4 / 2026-05-21）：processing 狀態超時自癒上限。
     # MLX 對 large-v3-turbo：RTF ≈ 0.1，60s 音訊 → 6s 推論；cold start +5-10s；
     # 60s 有 ~40s 緩衝，避免誤殺正常推論。若使用者誤殺再放大或設計可設定。
@@ -219,6 +226,8 @@ class AppWindow(ctk.CTkFrame):
         ))
         # 穩定性（Fix 1 / 2026-05-21）：每 5 秒檢查 pynput Listener 是否還活著，
         # 死掉就自動 restart（macOS CGEventTap 偶爾會被系統內部停掉，零 log）
+        # Fix 6 Step 1 / 2026-05-22：新增 Layer 3 定時 force restart 時間戳
+        self._last_listener_restart: float = time.monotonic()
         self.after(self.HOTKEY_WATCHDOG_INTERVAL_MS, self._hotkey_watchdog)
         # 穩定性（Fix 5 / 2026-05-22）：macOS Dock icon 點擊把最小化的視窗叫回來。
         # 兩條保險絲（Apple Event 處理在 shim Python.app 上可能不完整）：
@@ -1876,14 +1885,33 @@ class AppWindow(ctk.CTkFrame):
         Fix 1 / 2026-05-21：macOS CGEventTap 在 focus 切換、TCC state change、
         sleep/wake 後偶爾會失效。pynput 內部不會自動恢復、listener thread
         安靜結束，沒有任何 log（這是最坑的地方）。watchdog 是補救網。
+
+        Fix 6 Step 1 / 2026-05-22：加 Layer 3 — 每 10 分鐘無條件 force restart。
+        對抗 pynput 1.7.7 沒處理 kCGEventTapDisabledByTimeout 的情境：tap
+        已死但 listener thread / running 旗標仍 True，Layer 1 看不出來。
         """
         try:
             mgr = self.hotkey_mgr
             if is_pynput_available() and mgr._listener is not None:
-                if not mgr._listener.running:
-                    log.warning("HOTKEY: listener died unexpectedly — restarting")
-                    log_action("hotkey_listener_auto_restarted")
+                now = time.monotonic()
+                flag_dead = not mgr._listener.running
+
+                # Layer 1（既有）：listener.running 旗標檢查
+                should_restart = flag_dead
+                reason = "flag_dead" if flag_dead else None
+
+                # Layer 3（新）：定時 force restart 保險絲
+                if not should_restart:
+                    last = getattr(self, "_last_listener_restart", 0.0)
+                    if (now - last) > self.HOTKEY_FORCE_RESTART_INTERVAL_S:
+                        should_restart = True
+                        reason = "scheduled_force_restart"
+
+                if should_restart:
+                    log.warning(f"HOTKEY: watchdog restarting listener (reason={reason})")
+                    log_action("hotkey_listener_auto_restarted", reason=reason)
                     mgr.restart(self.cfg.hotkey)
+                    self._last_listener_restart = now
         except Exception:
             log_error("hotkey_watchdog_failed")
         finally:
