@@ -422,6 +422,13 @@ class HotkeyManager:
         self._monitor_local  = None                    # NSEvent 後端：本 App focus 時收事件
         self._backend:       str = "none"              # "nsevent" / "none"
         self._lock = threading.Lock()
+        # Fix 9 / 2026-05-22（P1-A）：FlagsChanged 專用「sided keycode hold」集合。
+        # 用來判定每個 modifier keycode 是 press 還是 release，**不**依賴
+        # event.modifierFlags()——因為左右 Cmd 共用 NSEventModifierFlagCommand
+        # device-independent bit，放開一顆時另一顆仍按著，bit 依然 True，
+        # 舊邏輯會誤判為 press。改用 set 自己做 state machine：keycode 在
+        # 集合中 = release，否則 = press。
+        self._ns_held_modifiers: set[int] = set()
         # Lone-modifier 模式狀態
         # 啟用條件：len(_hotkeys) == 1 且該鍵為側別 modifier
         # _is_lone_mode      —— 啟用 lone-modifier 邏輯
@@ -541,13 +548,22 @@ class HotkeyManager:
             sided_name = _KEYCODE_TO_SIDED_MOD.get(keycode)
             if sided_name is None:
                 return   # 不認識的 modifier keycode，忽略
-            bit = _modifier_bit_for(sided_name)
-            is_pressed = bool(event.modifierFlags() & bit)
             key_obj = _sided_name_to_pynput_key(sided_name)
-            if is_pressed:
-                self._on_p(key_obj)
-            else:
+            # Fix 9 / 2026-05-22（P1-A）：用 _ns_held_modifiers 做 state machine
+            # 而非 event.modifierFlags() & bit。理由：左右 Cmd 共用同一個
+            # device-independent modifier bit；左 Cmd 放開時 cmd_r 仍按著 →
+            # bit 仍 True，舊邏輯誤判 release 為 press，累積 stale _pressed。
+            # 改用「同 keycode 在集合中 = release」自己做 toggle。
+            with self._lock:
+                already_held = keycode in self._ns_held_modifiers
+                if already_held:
+                    self._ns_held_modifiers.discard(keycode)
+                else:
+                    self._ns_held_modifiers.add(keycode)
+            if already_held:
                 self._on_r(key_obj)
+            else:
+                self._on_p(key_obj)
             return
 
         if evt_type == 10:   # NSEventTypeKeyDown
@@ -593,6 +609,7 @@ class HotkeyManager:
             self._monitor_global  = None
             self._monitor_local   = None
             self._pressed.clear()
+            self._ns_held_modifiers.clear()
             self._combo_active = False
             self._other_key_during_press = False
 
