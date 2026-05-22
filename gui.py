@@ -3552,11 +3552,15 @@ def _walk_children(widget):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MiniRecordingWindow(tk.Toplevel):
-    """錄音 / 處理中的浮動 mini HUD。
+    """錄音 / 處理中的浮動 mini HUD（Speakly 風格 always-on-top）。
 
-    螢幕右下角固定 140×38 無邊框視窗，always-on-top，跟隨 AppWindow 狀態
-    自動顯示／隱藏。內容：狀態圓點（依狀態色）+ 計時器（mm:ss）。
-    點擊 → lift 主視窗到前景。
+    140×38 無邊框視窗，跟隨 AppWindow 狀態自動顯示／隱藏。內容：狀態圓點
+    （依狀態色）+ 計時器（mm:ss）。點擊 → lift 主視窗到前景。
+
+    Fix 8（2026-05-22）：透過 PyObjC 把對應 NSWindow 升到 NSStatusWindowLevel
+    並加 collectionBehavior，達成「跨 Space / 全螢幕仍可見 / 不搶 focus」。
+    PyObjC import 或 NSWindow 找不到時 fallback 成普通 Toplevel（仍能用，但
+    only same Space 可見）。
 
     AppWindow 透過 `update(state, elapsed_s, rms)` 推進狀態；不該由 mini
     自己 polling，避免狀態真相分散。
@@ -3564,33 +3568,43 @@ class MiniRecordingWindow(tk.Toplevel):
 
     WIN_W = 140
     WIN_H = 38
-    OFFSET_X = 24    # 距螢幕右邊緣
-    OFFSET_Y = 60    # 距螢幕底邊緣（避開 Dock）
+    # 距螢幕底邊（Speakly 風格：中下方）
+    BOTTOM_MARGIN = 120
+
+    # 用獨特 title 讓 PyObjC 找到對應 NSWindow（Tk 沒有直接拿 handle 的 API）
+    _NS_TITLE = "WhisperProMiniHUD"
 
     def __init__(self, master) -> None:
         super().__init__(master)
         self._master = master
         self._closed = False
+        self._ns_window = None   # 升級成功才設
 
-        # 無邊框 + always-on-top
+        # 無邊框
         self.overrideredirect(True)
-        try:
-            self.attributes("-topmost", True)
-        except Exception:
-            pass
         try:
             self.attributes("-alpha", 0.94)
         except Exception:
             pass
         self.configure(bg=SURF_2)
 
-        # 置於螢幕右下
+        # 給獨特 title 讓 PyObjC 比對找出對應 NSWindow
+        # （overrideredirect=True 後仍會建立 NSWindow，title 不會顯示在 UI 上）
+        try:
+            self.title(self._NS_TITLE)
+        except Exception:
+            pass
+
+        # 初始位置（之後 show() 會重定位到游標所在螢幕中下方）
         self.update_idletasks()
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
-        x = sw - self.WIN_W - self.OFFSET_X
-        y = sh - self.WIN_H - self.OFFSET_Y
+        x = (sw - self.WIN_W) // 2
+        y = sh - self.WIN_H - self.BOTTOM_MARGIN
         self.geometry(f"{self.WIN_W}x{self.WIN_H}+{x}+{y}")
+
+        # 升級成 NSPanel-level（跨 Space / 全螢幕可見 / 不搶 focus）
+        self._upgrade_to_panel_level()
 
         # 1px SURF_4 邊框
         outer = tk.Frame(self, bg=SURF_4, highlightthickness=0)
@@ -3626,6 +3640,54 @@ class MiniRecordingWindow(tk.Toplevel):
 
         # 預設隱藏；由 AppWindow 透過 .show() 顯示
         self.withdraw()
+
+    # ── PyObjC NSPanel-level 升級 ──────────────────────────────────────────
+    def _upgrade_to_panel_level(self) -> None:
+        """把對應 NSWindow 升到 NSStatusWindowLevel + collectionBehavior。
+
+        失敗時靜默 fallback；HUD 仍能用，只是缺「跨 Space / 全螢幕可見」。
+        """
+        try:
+            from AppKit import NSApp  # type: ignore
+
+            # 找到對應 NSWindow（用獨特 title 比對）
+            ns_window = None
+            for w in NSApp.windows():
+                try:
+                    if w.title() == self._NS_TITLE:
+                        ns_window = w
+                        break
+                except Exception:
+                    continue
+
+            if ns_window is None:
+                log_error("mini_hud_nswindow_not_found")
+                return
+
+            # NSStatusWindowLevel = 25（高於一般視窗、低於螢幕保護程式）
+            NSStatusWindowLevel = 25
+            # CollectionBehavior bitmask
+            NSWindowCollectionBehaviorCanJoinAllSpaces = 1 << 0    # 跨 Space
+            NSWindowCollectionBehaviorStationary = 1 << 4          # 不跟 Mission Control 縮
+            NSWindowCollectionBehaviorFullScreenAuxiliary = 1 << 8 # 別人全螢幕時可見
+
+            ns_window.setLevel_(NSStatusWindowLevel)
+            ns_window.setCollectionBehavior_(
+                NSWindowCollectionBehaviorCanJoinAllSpaces
+                | NSWindowCollectionBehaviorStationary
+                | NSWindowCollectionBehaviorFullScreenAuxiliary
+            )
+            # 失焦時不要自己隱藏
+            try:
+                ns_window.setHidesOnDeactivate_(False)
+            except Exception:
+                pass
+
+            self._ns_window = ns_window
+            log_state("mini_hud_panel_level_upgraded")
+        except Exception as e:
+            # PyObjC import 失敗或其他例外 → fallback 成普通 Toplevel
+            log_error(f"mini_hud_panel_upgrade_failed: {e}")
 
     def show_recording(self) -> None:
         """進入錄音狀態 → 顯示紅點 + 「錄音中」+ 0:00 計時。"""
