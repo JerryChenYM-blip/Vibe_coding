@@ -1900,6 +1900,25 @@ class AppWindow(ctk.CTkFrame):
                 should_restart = flag_dead
                 reason = "flag_dead" if flag_dead else None
 
+                # Layer 2（Fix 6 Step 3 / 2026-05-22）：CGEventTap 健康度體檢
+                # pynput 沒處理 kCGEventTapDisabledByTimeout；tap 死了但 listener
+                # 旗標還是 True。先試 CGEventTapEnable 輕量 re-enable（µs 級），
+                # 比整個 restart 快 1000 倍。失敗才 fallback Layer 3 restart。
+                if not should_restart:
+                    try:
+                        from Quartz import CGEventTapIsEnabled, CGEventTapEnable
+                        tap = mgr.get_event_tap()
+                        if tap is not None and not CGEventTapIsEnabled(tap):
+                            CGEventTapEnable(tap, True)
+                            if CGEventTapIsEnabled(tap):
+                                log.warning("HOTKEY: tap re-enabled in place (no restart needed)")
+                                log_action("hotkey_tap_reenabled")
+                            else:
+                                should_restart = True
+                                reason = "tap_dead_reenable_failed"
+                    except Exception:
+                        log_error("hotkey_tap_health_check_failed")
+
                 # Layer 3（新）：定時 force restart 保險絲
                 if not should_restart:
                     last = getattr(self, "_last_listener_restart", 0.0)

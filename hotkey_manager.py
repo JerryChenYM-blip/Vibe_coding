@@ -427,6 +427,17 @@ class HotkeyManager:
             except Exception:
                 log_error("hotkey_stop_failed")
 
+    def get_event_tap(self):
+        """暴露底層 CGEventTap handle 給 watchdog 做健康度檢查（Fix 6 Step 3）。
+
+        pynput 1.7.7 在 darwin 把 tap 存在 `_listener._tap`（private API）；
+        用 getattr defensive 取，若未來改名退化為 None、watchdog 自動降級。
+        """
+        listener = self._listener
+        if listener is None:
+            return None
+        return getattr(listener, "_tap", None)
+
     def _normalize(self, key) -> object:
         """正規化左右修飾鍵（委派給模組層函式）。"""
         return _normalize_key(key)
