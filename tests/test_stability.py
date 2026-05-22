@@ -121,13 +121,18 @@ def test_on_transcription_failed_recovers_from_processing():
 
 
 def test_on_transcription_failed_noop_when_not_processing():
-    """非 processing 狀態下呼叫不會誤觸發 transition；但 toast 仍會顯示。"""
+    """非 processing 狀態下呼叫直接 drop（Fix 9 / P1-B）。
+
+    舊行為（Fix 3）：即使 state=idle 也會 show 「⚠ 轉錄失敗」toast。
+    新行為（Fix 9 / 2026-05-22）：state != processing 直接 return，
+    避免使用者已開始第二段錄音時被 stale failure toast 干擾。
+    """
     win = _make_stub_appwindow()
     win._state = "idle"
     win._on_transcription_failed("late callback")
     assert win._state == "idle"   # 維持原狀
     assert win._last_result is None
-    win._show_toast.assert_called_once()
+    win._show_toast.assert_not_called()   # 不再 show toast
 
 
 # ═════════════════════════════════════════════════════════════════════════════

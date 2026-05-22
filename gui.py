@@ -862,16 +862,26 @@ class AppWindow(ctk.CTkFrame):
 
         Fix 3 / 2026-05-21：沿用既有 _transition_to_idle(result) 路徑，
         不新增狀態；用一個帶失敗訊息的空 TranscriptionResult 觸發回 idle。
+
+        Fix 9 / 2026-05-22（P1-B）：state != processing 時直接 drop。情境：
+        _processing_timeout_check 已先 force-idle，背景 thread 隨後 throw，
+        若不擋第二段錄音的 UI 會被「⚠ 轉錄失敗」toast 干擾。
         """
-        if self._state == "processing":
-            empty = TranscriptionResult(
-                text="（轉錄失敗，請查看 log）",
-                language="",
-                duration_seconds=0.0,
-                elapsed_seconds=0.0,
-                segments=[],
+        if self._state != "processing":
+            log.warning(
+                f"_on_transcription_failed dropped: state={self._state} "
+                f"(expected 'processing'); stale callback after force-idle"
             )
-            self._transition_to_idle(empty)
+            log_action("transcription_failed_late_dropped", state=self._state)
+            return
+        empty = TranscriptionResult(
+            text="（轉錄失敗，請查看 log）",
+            language="",
+            duration_seconds=0.0,
+            elapsed_seconds=0.0,
+            segments=[],
+        )
+        self._transition_to_idle(empty)
         self._show_toast("⚠ 轉錄失敗")
 
     def _processing_timeout_check(self) -> None:
@@ -897,7 +907,21 @@ class AppWindow(ctk.CTkFrame):
             self._show_toast("⏱ 轉錄超時 — 已自動恢復")
 
     def _on_transcription_done(self, result: TranscriptionResult) -> None:
-        """主執行緒：轉錄完成後決定是否走潤飾流程，並觸發剪貼簿 / 自動貼上。"""
+        """主執行緒：轉錄完成後決定是否走潤飾流程，並觸發剪貼簿 / 自動貼上。
+
+        Fix 9 / 2026-05-22（P1-B）：state != processing 時直接 drop。情境：
+        _processing_timeout_check 已先 force-idle 並 toast「轉錄超時」，使用
+        者已開始第二段錄音（state=recording），背景 Whisper thread 慢慢回來
+        若不擋會覆寫 UI / timer 並把 _state 強制改成 idle，與 recorder 失同步。
+        """
+        if self._state != "processing":
+            log.warning(
+                f"_on_transcription_done dropped: state={self._state} "
+                f"(expected 'processing'); likely stale callback from timed-out inference"
+            )
+            log_action("transcription_late_dropped", state=self._state)
+            return
+
         self._transition_to_idle(result)
         self._show_toast(f"轉錄完成 · {result.elapsed_seconds:.1f}s")
 
