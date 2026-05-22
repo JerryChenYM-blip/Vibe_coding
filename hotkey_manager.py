@@ -375,50 +375,14 @@ def _keys_to_combo(keys: set) -> str:
 # ── 互動式按鍵擷取 ────────────────────────────────────────────────────────────
 
 def capture_hotkey(timeout: float = 15.0) -> Optional[str]:
-    """阻塞直到使用者按下（並開始放開）一個組合鍵，回傳組合字串。
+    """DEPRECATED：請改用 HotkeyBindDialog 的 Tk 原生 binding。
 
-    用於 HotkeyBindDialog 讓使用者重新設定快捷鍵。
-    注意：macOS 26.4+ 上此函式在主執行緒可能崩潰（TSM 斷言），
-    請改用 HotkeyBindDialog 的 Tk 原生事件擷取方案。
-
-    Args:
-        timeout: 等待超時秒數，超過後回傳 None。
-
-    Returns:
-        組合字串（例如 "cmd+alt+r"），超時或 pynput 不可用時回傳 None。
+    舊版用 pynput Listener 在背景執行緒擷取按鍵，但 macOS 26.4+ 主執行緒
+    會觸發 TSM 斷言崩潰；2026-05-22 之後改為由 gui.py HotkeyBindDialog 直接
+    用 Tk 原生 `<KeyPress>` binding 在主執行緒收，本函式不再使用。
+    保留簽章供舊呼叫端不爆 import，但永遠回傳 None。
     """
-    if not _PYNPUT_AVAILABLE:
-        return None
-
-    done        = threading.Event()
-    current:    set = set()
-    max_combo:  list[set] = [set()]
-    result:     list[Optional[str]] = [None]
-
-    def _on_press(key):
-        """pynput press callback：追蹤目前按住的鍵組合。"""
-        nk = _normalize_key(key)
-        current.add(nk)
-        if len(current) > len(max_combo[0]):
-            max_combo[0] = set(current)   # 記錄歷史最大組合
-
-    def _on_release(key):
-        """pynput release callback：第一個鍵放開時鎖定結果。"""
-        if max_combo[0] and not done.is_set():
-            result[0] = _keys_to_combo(max_combo[0])
-            done.set()
-            return False   # 回傳 False 讓 pynput 停止監聽
-        nk = _normalize_key(key)
-        current.discard(nk)
-
-    listener = _kb.Listener(on_press=_on_press, on_release=_on_release)
-    listener.daemon = True
-    listener.start()
-    done.wait(timeout=timeout)
-    if listener.running:
-        listener.stop()
-
-    return result[0]
+    return None
 
 
 # ── HotkeyManager ─────────────────────────────────────────────────────────────
@@ -454,10 +418,12 @@ class HotkeyManager:
         self._combo_active:  bool = False            # 組合鍵是否已完整按下（pending release 觸發 tap）
         self._combo_active_at: float = 0.0           # 最後一次完整按下的時間戳
         self._last_event_at:   float = 0.0           # 最後一次事件的時間戳
-        self._listener: Optional[_kb.Listener] = None   # pynput fallback 後端
         self._monitor_global = None                    # NSEvent 後端：其他 App focus 時收事件
         self._monitor_local  = None                    # NSEvent 後端：本 App focus 時收事件
-        self._backend:       str = "none"              # "nsevent" / "pynput" / "none"
+        self._backend:       str = "none"              # "nsevent" / "none"
+        # 相容性殼：watchdog 仍會檢查 `_listener is not None`（commit 3 才砍）。
+        # 啟用 NSEvent 後此屬性永遠為 None；不再 spawn pynput Listener。
+        self._listener = None
         self._lock = threading.Lock()
         # Lone-modifier 模式狀態
         # 啟用條件：len(_hotkeys) == 1 且該鍵為側別 modifier
@@ -498,7 +464,9 @@ class HotkeyManager:
         self._first_press_logged = False
         mode = "lone-modifier" if self._is_lone_mode else "combo"
 
-        # ── 後端選擇 ─────────────────────────────────────────────────
+        # ── 後端：NSEvent only ─────────────────────────────────────
+        # 2026-05-22 起 pynput Listener 完全砍除（macOS 26.4+ 連環 crash）。
+        # PyObjC 不可用時靜默降級，App 不崩潰但快捷鍵不工作。
         if _NSEVENT_AVAILABLE:
             self._backend = "nsevent"
             log.info(
@@ -509,25 +477,8 @@ class HotkeyManager:
             log.info(f"HOTKEY: listener fully started at t={time.monotonic():.3f}")
             return
 
-        if _PYNPUT_AVAILABLE:
-            self._backend = "pynput"
-            log.info(
-                f"HOTKEY: Starting pynput Listener (fallback) for combo='{combo}' "
-                f"keys={self._hotkeys} mode={mode}"
-            )
-            self._listener = _kb.Listener(
-                on_press=self._on_p,
-                on_release=self._on_r,
-                suppress=False,
-            )
-            self._listener.daemon = True
-            self._listener.start()
-            log.info(f"HOTKEY: listener fully started at t={time.monotonic():.3f}")
-            return
-
-        # 兩個後端都不可用：靜默降級（App 不崩潰）
         self._backend = "none"
-        log.warning("HOTKEY: no backend available (NSEvent & pynput both missing)")
+        log.warning("HOTKEY: NSEvent backend unavailable; global hotkey disabled")
 
     # ── NSEvent 後端 ────────────────────────────────────────────────────────
 
@@ -634,17 +585,14 @@ class HotkeyManager:
     def stop(self) -> None:
         """停止監聽器並清空所有狀態。
 
-        設計重點：先在鎖內取出 monitor / listener 參照、清空狀態，
-        再在鎖外呼叫 removeMonitor: / stop()，避免持鎖時死鎖。
+        設計重點：先在鎖內取出 monitor 參照、清空狀態，
+        再在鎖外呼叫 removeMonitor:，避免持鎖時死鎖。
         """
-        listener_to_stop = None
         mon_global = None
         mon_local  = None
         with self._lock:
-            listener_to_stop = self._listener
             mon_global       = self._monitor_global
             mon_local        = self._monitor_local
-            self._listener        = None
             self._monitor_global  = None
             self._monitor_local   = None
             self._pressed.clear()
@@ -662,24 +610,14 @@ class HotkeyManager:
             except Exception:
                 log_error("hotkey_ns_remove_failed")
 
-        # pynput Listener fallback：在鎖外停止
-        if listener_to_stop is not None:
-            log.info("HOTKEY: Stopping pynput listener...")
-            try:
-                listener_to_stop.stop()
-            except Exception:
-                log_error("hotkey_stop_failed")
-
     def get_event_tap(self):
-        """暴露底層 CGEventTap handle 給 watchdog 做健康度檢查（Fix 6 Step 3）。
+        """DEPRECATED：NSEvent backend 沒有 CGEventTap 的概念。
 
-        pynput 1.7.7 在 darwin 把 tap 存在 `_listener._tap`（private API）；
-        用 getattr defensive 取，若未來改名退化為 None、watchdog 自動降級。
+        舊 watchdog Layer 2（Fix 6 Step 3）用此函式拿 pynput 的 _tap handle
+        做 CGEventTapIsEnabled 體檢；NSEvent 後端不會被 timeout disable，
+        永遠回 None 讓 watchdog Layer 2 跳過（commit 3 會把整段砍掉）。
         """
-        listener = self._listener
-        if listener is None:
-            return None
-        return getattr(listener, "_tap", None)
+        return None
 
     def _normalize(self, key) -> object:
         """正規化左右修飾鍵（委派給模組層函式）。"""
