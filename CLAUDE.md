@@ -320,6 +320,7 @@ cat ~/.whisper_app/polish_log.jsonl | jq .         # 潤飾紀錄
 10. **logger 的 console handler 用 `sys.__stderr__`** — 不是 `sys.stderr`；避免跟任何 stdout 重導機制循環
 11. **macOS TCC 權限按 responsible process 歸帳** — 從不同終端機 / Claude Preview / 不同 shell 啟動 `python3 main.py` 會被歸到不同的 responsible process，每個都要重新授權麥克風 / 輔助使用 / AppleScript。**解法：永遠透過 `~/Applications/WhisperPro.app` 啟動**（雙擊、Spotlight 都行），所有路徑都歸到同一個 bundle ID，授權一次永遠有效。重建 .app：`bash build_app.sh`。
 12. **背景執行緒安靜死亡** — pynput Listener / Whisper 推論執行緒若 throw 例外或被 macOS 內部停掉，**不會有 log 也不會 crash**。對應穩定性層：listener watchdog（gui.py `_hotkey_watchdog`，5s 心跳）、processing 狀態 60s 超時自癒（`_processing_timeout_check`）、callback 全包 try/except。詳見 `docs/superpowers/plans/2026-05-21-stability-watchdog-and-recovery.md`。
+13. **pynput Listener 閒置後 hotkey 死亡** — pynput 1.7.7 source 沒處理 `kCGEventTapDisabledByTimeout`（macOS App Nap / sleep-wake / CPU pressure 會 disable tap），thread 不死、`listener.running` 仍 True、watchdog 偵測不到。三層保險絲：(1) `_hotkey_watchdog` 每 5s 既有旗標檢查 +（新）每 10 分鐘無條件 force restart、(2)（新）`Quartz.CGEventTapIsEnabled` 體檢 + `CGEventTapEnable` 輕量 re-enable、(3) `main.py` `_disable_app_nap()` 用 `NSProcessInfo.beginActivityWithOptions_` 抑制 App Nap（token 必須 module-level）。詳見 `docs/superpowers/plans/2026-05-22-hotkey-idle-resilience.md`。
 
 ---
 

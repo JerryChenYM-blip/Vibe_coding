@@ -176,6 +176,12 @@ def _make_stub_appwindow_for_watchdog():
     # 偽造 hotkey_mgr
     win.hotkey_mgr = MagicMock()
     win.hotkey_mgr._listener = MagicMock()
+    # Fix 6 Step 3：get_event_tap 預設回 None，避免 watchdog Layer 2
+    # 把 MagicMock 丟給 CGEventTapIsEnabled（會 hang）
+    win.hotkey_mgr.get_event_tap = MagicMock(return_value=None)
+    # Fix 6 Step 1：_last_listener_restart 預設「剛剛」，避免 Layer 3
+    # 在既有測試裡意外觸發
+    win._last_listener_restart = time.monotonic()
     # after 攔成 no-op（不然會卡到真正的 Tk 排程）
     win.after = MagicMock()
     return win
@@ -215,3 +221,91 @@ def test_hotkey_watchdog_swallows_exception_and_reschedules():
         pytest.fail("watchdog 不該拋例外")
     # after 仍應被呼叫（finally 排程）
     win.after.assert_called_once()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Fix 6 — 閒置後 hotkey 死亡修補（2026-05-22）
+# ═════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.skipif(not is_pynput_available(), reason="pynput 未安裝；watchdog 早返")
+def test_watchdog_force_restart_fires_after_interval():
+    """Fix 6 Step 1：10 分鐘 force restart 該被觸發。"""
+    from gui import AppWindow
+    win = _make_stub_appwindow_for_watchdog()
+    win.hotkey_mgr._listener.running = True    # 旗標看起來活
+    # 偽造 11 分鐘前最後一次 restart
+    win._last_listener_restart = time.monotonic() - (AppWindow.HOTKEY_FORCE_RESTART_INTERVAL_S + 100)
+    # 確保 Layer 2 不會搶先處理（get_event_tap 回 None → 跳過）
+    win.hotkey_mgr.get_event_tap = MagicMock(return_value=None)
+    win._hotkey_watchdog()
+    win.hotkey_mgr.restart.assert_called_once_with("cmd+alt+r")
+
+
+@pytest.mark.skipif(not is_pynput_available(), reason="pynput 未安裝；watchdog 早返")
+def test_watchdog_force_restart_noop_within_interval():
+    """Fix 6 Step 1：上次 restart 才剛發生，10 分鐘內不該再 restart。"""
+    win = _make_stub_appwindow_for_watchdog()
+    win.hotkey_mgr._listener.running = True
+    win._last_listener_restart = time.monotonic() - 60   # 1 分鐘前
+    win.hotkey_mgr.get_event_tap = MagicMock(return_value=None)
+    win._hotkey_watchdog()
+    win.hotkey_mgr.restart.assert_not_called()
+
+
+@pytest.mark.skipif(not is_pynput_available(), reason="pynput 未安裝；watchdog 早返")
+def test_watchdog_tap_reenable_in_place(monkeypatch):
+    """Fix 6 Step 3：tap disable 但 re-enable 成功 → 不該 restart listener。"""
+    win = _make_stub_appwindow_for_watchdog()
+    win.hotkey_mgr._listener.running = True
+    win._last_listener_restart = time.monotonic()   # 不會被 Layer 3 觸發
+
+    # 偽造 tap handle（任意非 None 物件）
+    fake_tap = object()
+    win.hotkey_mgr.get_event_tap = MagicMock(return_value=fake_tap)
+
+    # CGEventTapIsEnabled：第一次 False（tap 死），re-enable 後 True
+    is_enabled_calls = {"n": 0}
+    def fake_is_enabled(_tap):
+        is_enabled_calls["n"] += 1
+        return is_enabled_calls["n"] >= 2   # 第 1 次 False，之後 True
+
+    fake_enable = MagicMock()
+    import Quartz
+    monkeypatch.setattr(Quartz, "CGEventTapIsEnabled", fake_is_enabled)
+    monkeypatch.setattr(Quartz, "CGEventTapEnable", fake_enable)
+
+    win._hotkey_watchdog()
+
+    # 應呼叫 enable(tap, True)，但**不**該 restart listener
+    fake_enable.assert_called_once_with(fake_tap, True)
+    win.hotkey_mgr.restart.assert_not_called()
+
+
+@pytest.mark.skipif(not is_pynput_available(), reason="pynput 未安裝；watchdog 早返")
+def test_watchdog_tap_reenable_failed_triggers_restart(monkeypatch):
+    """Fix 6 Step 3：tap disable 且 re-enable 失敗 → fallback restart。"""
+    win = _make_stub_appwindow_for_watchdog()
+    win.hotkey_mgr._listener.running = True
+    win._last_listener_restart = time.monotonic()
+
+    fake_tap = object()
+    win.hotkey_mgr.get_event_tap = MagicMock(return_value=fake_tap)
+
+    import Quartz
+    monkeypatch.setattr(Quartz, "CGEventTapIsEnabled", lambda _t: False)   # 永遠死
+    monkeypatch.setattr(Quartz, "CGEventTapEnable", MagicMock())
+
+    win._hotkey_watchdog()
+    win.hotkey_mgr.restart.assert_called_once_with("cmd+alt+r")
+
+
+def test_app_nap_token_is_held_module_level():
+    """Fix 6 Step 2：_APP_NAP_TOKEN 必須 module-level 強參照（不能被 GC）。"""
+    import main
+    main._disable_app_nap()
+    # macOS 上應拿到 NSObject token；其他平台早返、token 維持 None 也算通過
+    import sys
+    if sys.platform == "darwin":
+        assert main._APP_NAP_TOKEN is not None
+    # 必須是 module attribute（不能只是 local）
+    assert "_APP_NAP_TOKEN" in vars(main)
