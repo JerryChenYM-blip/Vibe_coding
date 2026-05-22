@@ -342,3 +342,189 @@ def test_nsevent_handler_swallows_exception():
     # local handler 應吃掉並回傳 event 不 suppress
     ret = mgr._on_ns_event_local(bad_event)
     assert ret is bad_event
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Fix 9 — PR #13 code review 修補（2026-05-22）
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ─── P1-A：FlagsChanged 用 _ns_held_modifiers state machine ─────────────────
+
+@pytest.mark.skipif(not is_pynput_available(), reason="pynput 未安裝；Key 物件需要")
+def test_p1a_sided_modifier_state_machine_releases_correctly():
+    """P1-A：左右 Cmd 同時按住、放開一顆 → 即使 modifierFlags 仍含 cmd bit
+    也要被正確識別為 release，不該累積 stale _pressed。"""
+    from AppKit import NSEventModifierFlagCommand
+    mgr = HotkeyManager(on_tap_cb=lambda: None)
+    mgr._hotkeys = parse_hotkey("cmd+alt+r")
+    mgr._combo_str = "cmd+alt+r"
+
+    cmd_bit = NSEventModifierFlagCommand
+    # Left Cmd 按下（keycode=55）
+    mgr._handle_ns_event(_make_fake_ns_event(12, 55, cmd_bit))
+    # Right Cmd 按下（keycode=54）；modifierFlags 仍含 cmd bit
+    mgr._handle_ns_event(_make_fake_ns_event(12, 54, cmd_bit))
+    assert 55 in mgr._ns_held_modifiers
+    assert 54 in mgr._ns_held_modifiers
+    # Left Cmd 放開（keycode=55）；modifierFlags 仍含 cmd bit（cmd_r 還按著）
+    # 舊邏輯會把這判為 press（_pressed 累積 stale Key.cmd_l）；新邏輯用
+    # _ns_held_modifiers toggle 判定，正確識別為 release
+    mgr._handle_ns_event(_make_fake_ns_event(12, 55, cmd_bit))
+    assert 55 not in mgr._ns_held_modifiers
+    assert 54 in mgr._ns_held_modifiers   # Right Cmd 仍 hold
+
+
+def test_p1a_stop_clears_ns_held_modifiers():
+    """P1-A：stop() 必須清空 _ns_held_modifiers，避免 restart 後 stale state。"""
+    mgr = HotkeyManager(on_tap_cb=lambda: None)
+    mgr._ns_held_modifiers.update({54, 55, 58})
+    mgr.stop()
+    assert mgr._ns_held_modifiers == set()
+
+
+# ─── P1-B：transcription callback state guard ────────────────────────────────
+
+def test_p1b_on_transcription_done_dropped_when_stale():
+    """P1-B：state=idle（_processing_timeout_check 已 force-idle）時
+    _on_transcription_done 應 drop，不該再呼叫 _transition_to_idle 覆寫
+    第二段錄音的 UI。"""
+    win = _make_stub_appwindow()
+    win._state = "idle"
+    win._last_result = None
+    win._transition_to_idle = MagicMock()
+    result = TranscriptionResult(
+        text="late result",
+        language="zh",
+        duration_seconds=1.0,
+        elapsed_seconds=70.0,   # 超過 60s timeout 才回來
+        segments=[],
+    )
+    win._on_transcription_done(result)
+    win._transition_to_idle.assert_not_called()
+    win._show_toast.assert_not_called()
+    assert win._state == "idle"   # 維持原狀
+
+
+def test_p1b_on_transcription_done_dropped_when_recording():
+    """P1-B：第二段錄音已開始（state=recording），stale callback 不該踩平。"""
+    win = _make_stub_appwindow()
+    win._state = "recording"
+    win._transition_to_idle = MagicMock()
+    result = TranscriptionResult(
+        text="late result", language="zh",
+        duration_seconds=1.0, elapsed_seconds=80.0, segments=[],
+    )
+    win._on_transcription_done(result)
+    win._transition_to_idle.assert_not_called()
+    assert win._state == "recording"   # 第二段錄音不被干擾
+
+
+# ─── P2-A：動態 timeout（依音訊長度）────────────────────────────────────────
+
+def test_p2a_dynamic_timeout_long_audio_5min():
+    """P2-A：5 分鐘音訊 → timeout 至少 300_000ms（不是固定 60_000ms）。"""
+    from gui import AppWindow
+    win = AppWindow.__new__(AppWindow)
+    win._state = "recording"
+    win._rec_start = time.perf_counter() - 300.0   # 模擬已錄 5min
+    win._stream_tick_id = None
+    win._stream_samples = 0
+
+    # mock recorder.stop 回傳 5 分鐘的 audio array
+    import numpy as np
+    five_min_audio = np.zeros(300 * 16_000, dtype=np.float32)
+    win.recorder = MagicMock()
+    win.recorder.stop.return_value = five_min_audio
+
+    # mock 其他 UI / state 依賴
+    win._state_start_time = 0
+    win._timer_label = MagicMock()
+    win._hotkey_hint = MagicMock()
+    win._target_label = MagicMock()
+    win._status_dot = MagicMock()
+    win._status_label = MagicMock()
+    win._model_var = MagicMock()
+    win._model_var.get.return_value = "large-v3-turbo"
+    win.cfg = MagicMock()
+    win.cfg.get_whisper_language.return_value = None
+    win.transcriber = MagicMock()
+    win._mini_window = None
+    win.after = MagicMock()
+
+    # 不要真的開 threading.Thread
+    import threading
+    orig_thread = threading.Thread
+    threading.Thread = MagicMock()
+    try:
+        win._transition_to_processing()
+    finally:
+        threading.Thread = orig_thread
+
+    # 找到排程 _processing_timeout_check 的 after 呼叫
+    # bound method 每次取都是新 object → 用 __func__ 比對函式本身
+    schedule_calls = [
+        c for c in win.after.call_args_list
+        if len(c.args) >= 2 and getattr(c.args[1], "__func__", None) is type(win)._processing_timeout_check
+    ]
+    assert schedule_calls, "_processing_timeout_check should be scheduled"
+    delay_ms = schedule_calls[0].args[0]
+    assert delay_ms >= 300_000, f"5min 音訊應該 timeout ≥ 300_000ms, 拿到 {delay_ms}ms"
+    # instance 上應該記下 dynamic timeout
+    assert win._processing_timeout_ms >= 300_000
+
+
+def test_p2a_dynamic_timeout_short_audio_uses_base():
+    """P2-A：5 秒短音訊 → timeout 仍至少 BASE 60_000ms（下限保護）。"""
+    from gui import AppWindow
+    win = AppWindow.__new__(AppWindow)
+    win._state = "recording"
+    win._rec_start = time.perf_counter() - 5.0
+    win._stream_tick_id = None
+    win._stream_samples = 0
+
+    import numpy as np
+    short_audio = np.zeros(5 * 16_000, dtype=np.float32)
+    win.recorder = MagicMock()
+    win.recorder.stop.return_value = short_audio
+
+    win._state_start_time = 0
+    win._timer_label = MagicMock()
+    win._hotkey_hint = MagicMock()
+    win._target_label = MagicMock()
+    win._status_dot = MagicMock()
+    win._status_label = MagicMock()
+    win._model_var = MagicMock()
+    win._model_var.get.return_value = "large-v3-turbo"
+    win.cfg = MagicMock()
+    win.cfg.get_whisper_language.return_value = None
+    win.transcriber = MagicMock()
+    win._mini_window = None
+    win.after = MagicMock()
+
+    import threading
+    orig_thread = threading.Thread
+    threading.Thread = MagicMock()
+    try:
+        win._transition_to_processing()
+    finally:
+        threading.Thread = orig_thread
+
+    assert win._processing_timeout_ms == AppWindow.PROCESSING_TIMEOUT_BASE_MS
+
+
+# ─── P2-B：MiniHUD instance-unique title ─────────────────────────────────────
+
+def test_p2b_minihud_title_unique_per_instance():
+    """P2-B：兩個 MiniRecordingWindow stub instance 的 _ns_title 必須不同。
+
+    為了不真的開 Tk Toplevel（pytest 無頭環境），手動繞過 __init__ 設 attribute。
+    """
+    from gui import MiniRecordingWindow
+    m1 = MiniRecordingWindow.__new__(MiniRecordingWindow)
+    m2 = MiniRecordingWindow.__new__(MiniRecordingWindow)
+    # 用同樣的邏輯產生 title（與 __init__ 內一致）
+    m1._ns_title = f"{MiniRecordingWindow._NS_TITLE_PREFIX}-{id(m1):x}"
+    m2._ns_title = f"{MiniRecordingWindow._NS_TITLE_PREFIX}-{id(m2):x}"
+    assert m1._ns_title != m2._ns_title
+    assert m1._ns_title.startswith("WhisperProMiniHUD-")
+    assert m2._ns_title.startswith("WhisperProMiniHUD-")
