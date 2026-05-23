@@ -45,7 +45,7 @@ Python 版本：**3.13 arm64**（Apple Silicon）。
 
 ## 3. 檔案結構與職責
 
-**Python 模組（20 檔、約 6,700 行）**
+**Python 模組（21 檔、約 7,200 行）**
 
 ```
 /Users/jerrychen/project/Claude_code/
@@ -70,10 +70,7 @@ Python 版本：**3.13 arm64**（Apple Silicon）。
 ├── app_icon.py           # ★ Phase 4.1：純 PIL 手繪 App Icon 生成器（CLI）
 ├── splash.py             # ★ Phase 4.1：啟動畫面 SplashScreen
 ├── onboarding.py         # ★ Phase 4.5：Ollama 環境診斷（純函式，給設定 UI 用）
-├── assets/               # ★ Phase 4.1：icon.png / icon.iconset/ / WhisperPro.icns
-├── vad.py                # VAD 靜音偵測（輔助模組）
-├── test_hotkey.py        # 快捷鍵互動測試（legacy）
-└── test_full_app.py      # 整合測試（legacy）
+└── assets/               # ★ Phase 4.1：icon.png / icon.iconset/ / WhisperPro.icns
 ```
 
 **文件**

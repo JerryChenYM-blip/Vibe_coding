@@ -3,7 +3,6 @@ macOS 全域快捷鍵管理器。
 
 功能：
   • HotkeyManager：監聽可設定的組合鍵，觸發時呼叫 callback
-  • capture_hotkey()：DEPRECATED（HotkeyBindDialog 改用 Tk 原生 binding）
   • parse_hotkey() / format_hotkey()：字串解析與格式化工具函式
 
 行為：tap toggle（點按切換）
@@ -370,19 +369,6 @@ def _keys_to_combo(keys: set) -> str:
             parts.append(str(k).replace("Key.", ""))
 
     return "+".join(parts) if parts else ""
-
-
-# ── 互動式按鍵擷取 ────────────────────────────────────────────────────────────
-
-def capture_hotkey(timeout: float = 15.0) -> Optional[str]:
-    """DEPRECATED：請改用 HotkeyBindDialog 的 Tk 原生 binding。
-
-    舊版用 pynput Listener 在背景執行緒擷取按鍵，但 macOS 26.4+ 主執行緒
-    會觸發 TSM 斷言崩潰；2026-05-22 之後改為由 gui.py HotkeyBindDialog 直接
-    用 Tk 原生 `<KeyPress>` binding 在主執行緒收，本函式不再使用。
-    保留簽章供舊呼叫端不爆 import，但永遠回傳 None。
-    """
-    return None
 
 
 # ── HotkeyManager ─────────────────────────────────────────────────────────────

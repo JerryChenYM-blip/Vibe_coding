@@ -61,9 +61,13 @@ _APP_BUNDLE = _pathlib.Path.home() / "Applications" / "WhisperPro.app"
 
 
 def check_dependencies() -> list[str]:
-    """嘗試 import 所有關鍵套件，回傳缺少的套件名稱清單。"""
+    """嘗試 import 所有關鍵套件，回傳缺少的套件名稱清單。
+
+    v2.11.0：移除 webrtcvad（前置 VAD 已改用 faster-whisper 內建 silero
+    + numpy RMS，vad.py 模組已刪）。
+    """
     missing = []
-    for pkg in ("sounddevice", "faster_whisper", "customtkinter", "pyperclip", "webrtcvad"):
+    for pkg in ("sounddevice", "faster_whisper", "customtkinter", "pyperclip"):
         try:
             __import__(pkg)
         except ImportError:
