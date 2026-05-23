@@ -76,7 +76,7 @@ from tokens import (
     INDIGO, INDIGO_HV,
     # Typography + spacing
     FONT_FAMILY_UI, FONT_FAMILY_TEXT, FONT_FAMILY_MONO,
-    SPACE_XS, SPACE_SM, SPACE_MD, SPACE_LG,
+    SPACE_XS, SPACE_SM, SPACE_MD, SPACE_LG, SPACE_XL, SPACE_2XL,
     # Motion
     BREATHE_IDLE_MS, BREATHE_RECORDING_MS, BREATHE_PROCESSING_MS,
     ROTATE_PROCESSING_MS, RENDER_TICK_MS,
@@ -131,6 +131,23 @@ def system_reduce_motion() -> bool:
         return r.stdout.strip() == "1"
     except Exception:
         return False
+
+
+def resolve_reduce_motion(pref: str) -> bool:
+    """A3（v2.7.0）：依使用者偏好決定最終 reduce_motion 旗標。
+
+    Args:
+        pref: "auto" / "always" / "never"（未知值視為 "auto"）
+
+    Returns:
+        True → 渲染迴圈關閉呼吸光圈 / 漣漪 / 粒子環旋轉
+    """
+    if pref == "always":
+        return True
+    if pref == "never":
+        return False
+    # "auto" 與其他未知值都 fallback 到系統偏好
+    return system_reduce_motion()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -229,6 +246,11 @@ class AppWindow(ctk.CTkFrame):
         self._stream_samples: int       = 0
         self._stream_chunks:  list[str] = []
         self._stream_tick_id            = None
+
+        # B2（v2.7.0）：processing timeout self-heal 的 after id；快速連續錄音
+        # 避免 N 個 pending callback 並存（之前每次 _transition_to_processing
+        # 都 schedule 一個新的卻不 cancel 舊的）。
+        self._processing_timeout_id     = None
 
         # Polish（AI 潤飾）狀態追蹤
         # _polish_generation：每次新轉錄 +1，讓遲到的潤飾結果可以被識別丟棄
@@ -350,7 +372,7 @@ class AppWindow(ctk.CTkFrame):
 
         # Left: title
         left = ctk.CTkFrame(bar, fg_color="transparent")
-        left.pack(side="left", padx=24, fill="y")
+        left.pack(side="left", padx=SPACE_XL, fill="y")
 
         ctk.CTkLabel(
             left,
@@ -468,7 +490,12 @@ class AppWindow(ctk.CTkFrame):
         self._prev_rms         = 0.0
         self._pressed          = False
         self._hovering         = False
-        self._reduce_motion    = system_reduce_motion()
+        # A3（v2.7.0）：reduce_motion 解析改成 config-aware（"auto" / "always" /
+        # "never"）。SettingsWindow 改 pref 後呼叫 _refresh_reduce_motion() 立即
+        # 套用、不需重啟。getattr fallback 為了向前相容沒升級的舊 config。
+        self._reduce_motion    = resolve_reduce_motion(
+            getattr(self.cfg, "reduce_motion_pref", "auto")
+        )
 
         # 啟動渲染迴圈（在視窗存活期間持續執行，每 50ms 更新一次 Canvas）
         self._render_tick()
@@ -481,7 +508,7 @@ class AppWindow(ctk.CTkFrame):
             self, corner_radius=16,
             fg_color=SURF_1,
         )
-        card.pack(fill="both", expand=True, padx=16, pady=(0, 6))
+        card.pack(fill="both", expand=True, padx=SPACE_LG, pady=(0, 6))
 
         # Header
         hdr = ctk.CTkFrame(card, fg_color="transparent", height=46)
@@ -559,7 +586,7 @@ class AppWindow(ctk.CTkFrame):
             scrollbar_button_color=SURF_3,
             scrollbar_button_hover_color=SURF_4,
         )
-        self._blocks_container.pack(fill="both", expand=True, padx=8, pady=(4, 10))
+        self._blocks_container.pack(fill="both", expand=True, padx=SPACE_SM, pady=(4, 10))
         # 區塊列表（最舊在 [0]、最新在 [-1]）
         self._utterance_blocks: list[UtteranceBlock] = []
         # 佔位文字（沒有任何 block 時顯示）
@@ -598,14 +625,14 @@ class AppWindow(ctk.CTkFrame):
             image=get_icon("copy", icon_size, TEXT_2),
             compound="left",
             command=self._on_copy, **ghost,
-        ).pack(side="left", padx=4)
+        ).pack(side="left", padx=SPACE_XS)
 
         ctk.CTkButton(
             row, text="存檔", width=96,
             image=get_icon("download", icon_size, TEXT_2),
             compound="left",
             command=self._on_save, **ghost,
-        ).pack(side="left", padx=4)
+        ).pack(side="left", padx=SPACE_XS)
 
         # Auto-paste chip — icon colour tracks active state
         ap_on = self.cfg.auto_paste
@@ -624,7 +651,7 @@ class AppWindow(ctk.CTkFrame):
             hover_color=INDIGO_HV if ap_on else SURF_2,
             command=self._toggle_auto_paste,
         )
-        self._ap_btn.pack(side="left", padx=4)
+        self._ap_btn.pack(side="left", padx=SPACE_XS)
 
         # AI 潤飾按鈕初始外觀依 cfg 設定，不在此時做網路探測（會阻塞 UI 建構）。
         # 實際 Ollama 連線狀態由 _refresh_ollama_health() 在啟動 2 秒後非同步更新。
@@ -642,7 +669,7 @@ class AppWindow(ctk.CTkFrame):
             font=ctk.CTkFont("SF Pro Text", 13),
             command=self._on_ollama,
         )
-        self._ollama_btn.pack(side="left", padx=4)
+        self._ollama_btn.pack(side="left", padx=SPACE_XS)
         # 依目前 cfg 立即套一次外觀（啟動時僅是視覺狀態）
         self._apply_polish_button_style(enabled=self.cfg.ollama_enabled, healthy=False)
 
@@ -651,14 +678,14 @@ class AppWindow(ctk.CTkFrame):
             image=get_icon("history", icon_size, TEXT_2),
             compound="left",
             command=self._open_history, **ghost,
-        ).pack(side="left", padx=4)
+        ).pack(side="left", padx=SPACE_XS)
 
         ctk.CTkButton(
             row, text="設定", width=96,
             image=get_icon("settings", icon_size, TEXT_2),
             compound="left",
             command=self._open_settings, **ghost,
-        ).pack(side="left", padx=4)
+        ).pack(side="left", padx=SPACE_XS)
 
     # ── Status bar ───────────────────────────────────────────────────────────
 
@@ -693,7 +720,7 @@ class AppWindow(ctk.CTkFrame):
             font=ctk.CTkFont("SF Pro Text", 12),
             text_color=TEXT_3,
         )
-        self._hotkey_status.pack(side="right", padx=16)
+        self._hotkey_status.pack(side="right", padx=SPACE_LG)
 
     # ═══════════════════════════════════════════════════════════════════════
     #  STATE MACHINE
@@ -811,10 +838,19 @@ class AppWindow(ctk.CTkFrame):
             int(measured_audio_s * self.PROCESSING_TIMEOUT_RTF_BUDGET * 1000),
         )
         # 穩定性（Fix 4 / 2026-05-21、Fix 9 / 2026-05-22）：記錄 processing
-        # 進入時間並排程動態自癒檢查
+        # 進入時間並排程動態自癒檢查。
+        # B2（v2.7.0）：cancel 上一輪 pending 的 timeout callback，避免快速
+        # 連續錄音累積 N 個 alive 直到各自 timeout 觸發。
         self._processing_started_at = time.monotonic()
         self._processing_timeout_ms = dynamic_timeout_ms
-        self.after(dynamic_timeout_ms, self._processing_timeout_check)
+        if self._processing_timeout_id is not None:
+            try:
+                self.after_cancel(self._processing_timeout_id)
+            except Exception:
+                pass  # Tk 已不認得這個 id，無害
+        self._processing_timeout_id = self.after(
+            dynamic_timeout_ms, self._processing_timeout_check
+        )
 
         # UI：Chamber 渲染迴圈下一 tick 會自動切換到 WARN 配色 + 粒子旋轉環
         self._timer_label.configure(text="")
@@ -853,6 +889,16 @@ class AppWindow(ctk.CTkFrame):
         self._state            = "idle"
         self._state_start_time = time.perf_counter()
         self._ripples.clear()
+
+        # B2（v2.7.0）：processing 正常結束 → cancel 對應 timeout self-heal
+        # callback，避免 pending after 一直留到 timeout_ms 才 fire（no-op，
+        # 但會 hold reference 在 Tk command table 裡）。
+        if self._processing_timeout_id is not None:
+            try:
+                self.after_cancel(self._processing_timeout_id)
+            except Exception:
+                pass
+            self._processing_timeout_id = None
 
         # Phase 4.3 mini 視窗：閒置時隱藏（不 destroy，下次錄音再 show）
         if self._mini_window is not None:
@@ -978,6 +1024,8 @@ class AppWindow(ctk.CTkFrame):
         Fix 9：timeout 上限改成依音訊長度動態算，比較 elapsed 用 instance 上記的
         `_processing_timeout_ms`，無記則 fallback BASE 60s。
         """
+        # B2（v2.7.0）：callback fire 後 id 已自動 consume，清掉以利下次判斷
+        self._processing_timeout_id = None
         if self._state != "processing":
             return   # 已正常結束，無事
         elapsed = time.monotonic() - getattr(self, "_processing_started_at", 0)
@@ -1359,7 +1407,7 @@ class AppWindow(ctk.CTkFrame):
             on_copy=self._on_block_copy,
             on_delete=self._on_block_delete,
         )
-        block.pack(fill="x", padx=4, pady=(0, 8))
+        block.pack(fill="x", padx=SPACE_XS, pady=(0, 8))
         block.highlight_as_latest(True)
         self._utterance_blocks.append(block)
 
@@ -2095,7 +2143,7 @@ class AppWindow(ctk.CTkFrame):
             on_copy=self._on_block_copy,
             on_delete=self._on_block_delete,
         )
-        block.pack(fill="x", padx=4, pady=(0, 8))
+        block.pack(fill="x", padx=SPACE_XS, pady=(0, 8))
         block.highlight_as_latest(True)
         self._utterance_blocks.append(block)
         self.after(50, lambda: self._blocks_container._parent_canvas.yview_moveto(1.0))
@@ -2215,6 +2263,11 @@ class AppWindow(ctk.CTkFrame):
         elif not cfg.mini_recording_window and self._mini_window is not None:
             self._destroy_mini_window()
 
+        # A3（v2.7.0）：reduce_motion 偏好變更立即套用（下一個 render tick 生效）
+        self._reduce_motion = resolve_reduce_motion(
+            getattr(cfg, "reduce_motion_pref", "auto")
+        )
+
     # ═══════════════════════════════════════════════════════════════════════
     #  HELPERS
     # ═══════════════════════════════════════════════════════════════════════
@@ -2312,15 +2365,18 @@ class AppWindow(ctk.CTkFrame):
     # 方法必須在 self.winfo_toplevel()（真正的 Tk root）上呼叫，不能在 self 上。
     # 之前 5 層保險絲全部在 self 呼叫 → 全部 AttributeError silent crash。
     def _restore_root_if_minimized(self, source: str) -> None:
-        """共用 helper：根視窗若在 iconic/withdrawn 狀態 → 強制 deiconify + lift。
+        """共用 helper：根視窗若在 iconic/icon/withdrawn 狀態 → 強制 deiconify + lift。
 
         必須走 winfo_toplevel() 拿到真正的 Tk root，因為 AppWindow 是 CTkFrame
         本身沒有 wm_state/deiconify 等視窗管理方法。
+
+        B3（v2.7.0）：含 'icon' legacy（Tk 文件列出，雖 macOS 26.4 實測都是
+        'iconic'，零成本防禦避免未來 Tk 版本變更時漏判）。
         """
         try:
             top = self.winfo_toplevel()
-            state = top.wm_state()  # 'normal' / 'iconic' / 'withdrawn'
-            if state in ("iconic", "withdrawn"):
+            state = top.wm_state()  # 'normal' / 'iconic' / 'icon' / 'withdrawn'
+            if state in ("iconic", "icon", "withdrawn"):
                 top.deiconify()
                 top.lift()
                 log_action("dock_reopen_recovered", source=source, state=state)
@@ -2328,17 +2384,16 @@ class AppWindow(ctk.CTkFrame):
             log_error("dock_reopen_failed", source=source, error=str(e))
 
     def _on_dock_reopen(self) -> None:
-        """macOS：點 Dock icon 把最小化的視窗叫回來（Fix 5 / 2026-05-22）。"""
+        """macOS：點 Dock icon 把最小化的視窗叫回來（Fix 5 / 2026-05-22）。
+
+        B1（v2.7.0）：DRY 重構，delegate 到 _restore_root_if_minimized；
+        ReopenApplication 路徑額外 focus_force 才能搶回 keyboard focus。
+        """
+        self._restore_root_if_minimized("ReopenApplication")
         try:
-            top = self.winfo_toplevel()
-            state = top.wm_state()
-            if state in ("iconic", "withdrawn"):
-                top.deiconify()
-                top.lift()
-                top.focus_force()  # 只有 ReopenApplication 顯式強制取焦
-                log_action("dock_reopen_recovered", source="ReopenApplication", state=state)
+            self.winfo_toplevel().focus_force()
         except Exception as e:
-            log_error("dock_reopen_failed", source="ReopenApplication", error=str(e))
+            log_error("dock_reopen_focus_failed", error=str(e))
 
     def _on_app_activate(self, event=None) -> None:
         """macOS Fix 5b：App 取得焦點時若視窗是最小化狀態，自動 deiconify。"""
@@ -2713,12 +2768,12 @@ class SettingsWindow(ctk.CTkToplevel):
                 scroll, corner_radius=12,
                 fg_color=SURF_1,
             )
-            f.pack(fill="x", padx=16, pady=(0, 4))
+            f.pack(fill="x", padx=SPACE_LG, pady=(0, 4))
             return f
 
         def row(parent, label: str, widget_fn) -> None:
             r = ctk.CTkFrame(parent, fg_color="transparent", height=50)
-            r.pack(fill="x", padx=16, pady=2)
+            r.pack(fill="x", padx=SPACE_LG, pady=2)
             r.pack_propagate(False)
             ctk.CTkLabel(
                 r, text=label, anchor="w",
@@ -2729,7 +2784,7 @@ class SettingsWindow(ctk.CTkToplevel):
 
         def sep_line(parent) -> None:
             ctk.CTkFrame(parent, height=1, fg_color=SURF_3).pack(
-                fill="x", padx=16, pady=0
+                fill="x", padx=SPACE_LG, pady=0
             )
 
         # ── 外觀（v2.6.0）── 放第一個 section 最顯眼位置 ─────────────────
@@ -2766,7 +2821,45 @@ class SettingsWindow(ctk.CTkToplevel):
             font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
             text_color=TEXT_3,
             justify="left", anchor="w",
-        ).pack(anchor="w", padx=16, pady=(0, 10))
+        ).pack(anchor="w", padx=SPACE_LG, pady=(0, 10))
+
+        # A3（v2.7.0）：動態效果 3-way segmented（auto / always / never）
+        self._reduce_motion_var = ctk.StringVar(
+            value=getattr(self.cfg, "reduce_motion_pref", "auto")
+        )
+
+        def reduce_motion_row(r):
+            wrap = ctk.CTkFrame(r, fg_color="transparent")
+            wrap.pack(side="right")
+            self._reduce_motion_btns: dict[str, ctk.CTkButton] = {}
+            for value, label in (
+                ("auto", "跟系統"),
+                ("always", "減少動態"),
+                ("never", "完整動畫"),
+            ):
+                btn = ctk.CTkButton(
+                    wrap, text=label,
+                    width=78, height=30, corner_radius=8,
+                    font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
+                    border_width=1,
+                    command=lambda v=value: self._on_reduce_motion_clicked(v),
+                )
+                btn.pack(side="left", padx=(0, 4))
+                self._reduce_motion_btns[value] = btn
+            self._apply_reduce_motion_chip_style()
+
+        row(ap, "動態效果", reduce_motion_row)
+        ctk.CTkLabel(
+            ap,
+            text=(
+                "跟系統：依 macOS「減少動態效果」偏好（推薦）\n"
+                "減少動態：強制關閉呼吸光圈／粒子環旋轉／漣漪\n"
+                "完整動畫：永遠跑完整動畫（即使系統開了 reduce motion）"
+            ),
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
+            text_color=TEXT_3,
+            justify="left", anchor="w",
+        ).pack(anchor="w", padx=SPACE_LG, pady=(0, 10))
 
         # ── 語音辨識 ──────────────────────────────────────────────────────
         stt = section("語音辨識")
@@ -2792,7 +2885,7 @@ class SettingsWindow(ctk.CTkToplevel):
             text_color=TEXT_3,
             wraplength=380, anchor="w",
         )
-        self._model_desc.pack(fill="x", padx=16, pady=(0, 10))
+        self._model_desc.pack(fill="x", padx=SPACE_LG, pady=(0, 10))
         sep_line(stt)
 
         self._lang_var = ctk.StringVar(value=self.cfg.language)
@@ -2814,7 +2907,7 @@ class SettingsWindow(ctk.CTkToplevel):
         # ── 快捷鍵 ────────────────────────────────────────────────────────
         hk = section("快捷鍵")
         hk_row = ctk.CTkFrame(hk, fg_color="transparent", height=52)
-        hk_row.pack(fill="x", padx=16, pady=4)
+        hk_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
         hk_row.pack_propagate(False)
 
         ctk.CTkLabel(
@@ -2829,7 +2922,7 @@ class SettingsWindow(ctk.CTkToplevel):
             hk_r, text=format_hotkey(self.cfg.hotkey),
             font=ctk.CTkFont("SF Pro Text", 13, "bold"),
             fg_color=SURF_2, text_color=TEXT_1,
-            corner_radius=8, padx=12, pady=4,
+            corner_radius=8, padx=SPACE_MD, pady=SPACE_XS,
         )
         self._hk_label.pack(side="left", padx=(0, 8))
 
@@ -2880,7 +2973,7 @@ class SettingsWindow(ctk.CTkToplevel):
 
         # 模型名稱（文字輸入；未來可改為動態 dropdown）
         model_row = ctk.CTkFrame(ai, fg_color="transparent", height=52)
-        model_row.pack(fill="x", padx=16, pady=4)
+        model_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
         model_row.pack_propagate(False)
         ctk.CTkLabel(
             model_row, text="模型名稱", anchor="w",
@@ -2898,7 +2991,7 @@ class SettingsWindow(ctk.CTkToplevel):
 
         # Base URL（進階；一般使用者不需要改）
         url_row = ctk.CTkFrame(ai, fg_color="transparent", height=52)
-        url_row.pack(fill="x", padx=16, pady=4)
+        url_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
         url_row.pack_propagate(False)
         ctk.CTkLabel(
             url_row, text="服務位址", anchor="w",
@@ -2917,21 +3010,21 @@ class SettingsWindow(ctk.CTkToplevel):
         # ── 環境診斷（Phase 4.5）─────────────────────────────────────────
         # 給首次安裝、Ollama 缺東少西的使用者一行明確指引（含建議命令）。
         diag_row = ctk.CTkFrame(ai, fg_color=SURF_2, corner_radius=8)
-        diag_row.pack(fill="x", padx=16, pady=(8, 4))
+        diag_row.pack(fill="x", padx=SPACE_LG, pady=(8, 4))
         self._ollama_diag_title = ctk.CTkLabel(
             diag_row, text="正在診斷…", anchor="w",
             font=ctk.CTkFont("SF Pro Text", 13, "bold"), text_color=TEXT_1,
         )
-        self._ollama_diag_title.pack(fill="x", padx=12, pady=(10, 2))
+        self._ollama_diag_title.pack(fill="x", padx=SPACE_MD, pady=(10, 2))
         self._ollama_diag_detail = ctk.CTkLabel(
             diag_row, text="", anchor="w", justify="left",
             font=ctk.CTkFont("SF Pro Text", 11), text_color=TEXT_3,
             wraplength=520,
         )
-        self._ollama_diag_detail.pack(fill="x", padx=12, pady=(0, 4))
+        self._ollama_diag_detail.pack(fill="x", padx=SPACE_MD, pady=(0, 4))
         # 建議命令以等寬字 + 一鍵複製
         self._ollama_diag_cmd_frame = ctk.CTkFrame(diag_row, fg_color="transparent")
-        self._ollama_diag_cmd_frame.pack(fill="x", padx=12, pady=(0, 10))
+        self._ollama_diag_cmd_frame.pack(fill="x", padx=SPACE_MD, pady=(0, 10))
         self._ollama_diag_cmd = ctk.CTkLabel(
             self._ollama_diag_cmd_frame, text="", anchor="w",
             font=ctk.CTkFont(FONT_FAMILY_MONO, 11), text_color=ACCENT,
@@ -2952,7 +3045,7 @@ class SettingsWindow(ctk.CTkToplevel):
 
         # 測試連線 + 狀態標籤
         test_row = ctk.CTkFrame(ai, fg_color="transparent", height=52)
-        test_row.pack(fill="x", padx=16, pady=(4, 8))
+        test_row.pack(fill="x", padx=SPACE_LG, pady=(4, 8))
         test_row.pack_propagate(False)
         self._ollama_test_status = ctk.CTkLabel(
             test_row, text="（尚未測試）",
@@ -2990,7 +3083,7 @@ class SettingsWindow(ctk.CTkToplevel):
 
         # 手動 reload prompt 按鈕 + 熱重載 switch
         hot_row = ctk.CTkFrame(rout, fg_color="transparent", height=52)
-        hot_row.pack(fill="x", padx=16, pady=4)
+        hot_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
         hot_row.pack_propagate(False)
         ctk.CTkLabel(
             hot_row, text="Prompt 熱重載", anchor="w",
@@ -3016,7 +3109,7 @@ class SettingsWindow(ctk.CTkToplevel):
         sep_line(dsec)
 
         dict_path_row = ctk.CTkFrame(dsec, fg_color="transparent", height=52)
-        dict_path_row.pack(fill="x", padx=16, pady=4)
+        dict_path_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
         dict_path_row.pack_propagate(False)
         ctk.CTkLabel(
             dict_path_row, text="字典檔路徑", anchor="w",
@@ -3034,7 +3127,7 @@ class SettingsWindow(ctk.CTkToplevel):
         sep_line(dsec)
 
         dict_btn_row = ctk.CTkFrame(dsec, fg_color="transparent", height=52)
-        dict_btn_row.pack(fill="x", padx=16, pady=(4, 8))
+        dict_btn_row.pack(fill="x", padx=SPACE_LG, pady=(4, 8))
         dict_btn_row.pack_propagate(False)
         self._dict_status_label = ctk.CTkLabel(
             dict_btn_row, text="", anchor="w",
@@ -3063,7 +3156,7 @@ class SettingsWindow(ctk.CTkToplevel):
         sep_line(hist)
 
         retention_row = ctk.CTkFrame(hist, fg_color="transparent", height=52)
-        retention_row.pack(fill="x", padx=16, pady=4)
+        retention_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
         retention_row.pack_propagate(False)
         ctk.CTkLabel(
             retention_row, text="保留天數（0 = 永久）", anchor="w",
@@ -3087,7 +3180,7 @@ class SettingsWindow(ctk.CTkToplevel):
             ("設定檔", "~/.whisper_app/config.json"),
         ]:
             pr = ctk.CTkFrame(about, fg_color="transparent", height=38)
-            pr.pack(fill="x", padx=16, pady=2)
+            pr.pack(fill="x", padx=SPACE_LG, pady=2)
             pr.pack_propagate(False)
             ctk.CTkLabel(pr, text=label, anchor="w",
                          font=ctk.CTkFont("SF Pro Text", 13),
@@ -3109,12 +3202,12 @@ class SettingsWindow(ctk.CTkToplevel):
             command=lambda: subprocess.run(
                 ["open", os.path.expanduser("~/.whisper_app")]
             ),
-        ).pack(anchor="w", padx=16, pady=(0, 8))
+        ).pack(anchor="w", padx=SPACE_LG, pady=(0, 8))
 
         # 匯入 / 匯出（Phase 4.4）—— 設定 + 字典 + preset 覆寫 → zip
         # 不含 history.db（隱私）與 polish_log.jsonl（debug 用、可能很大）
         ie_row = ctk.CTkFrame(about, fg_color="transparent")
-        ie_row.pack(anchor="w", padx=16, pady=(0, 14))
+        ie_row.pack(anchor="w", padx=SPACE_LG, pady=(0, 14))
         ctk.CTkButton(
             ie_row, text="匯出設定…", width=120, height=28,
             image=get_icon("download", 14, ACCENT_HV),
@@ -3145,7 +3238,7 @@ class SettingsWindow(ctk.CTkToplevel):
         btn_bar.pack_propagate(False)
 
         inner = ctk.CTkFrame(btn_bar, fg_color="transparent")
-        inner.pack(side="right", padx=20, pady=12)
+        inner.pack(side="right", padx=20, pady=SPACE_MD)
 
         ctk.CTkButton(
             inner, text="取消", width=88, height=36, corner_radius=8,
@@ -3201,6 +3294,37 @@ class SettingsWindow(ctk.CTkToplevel):
                     text_color=TEXT_3,
                     hover_color=SURF_2,
                 )
+
+    # A3（v2.7.0）：動態效果 chip 樣式 / click handler ───────────────────────
+
+    def _apply_reduce_motion_chip_style(self) -> None:
+        """根據 _reduce_motion_var 重繪 3 顆 chip。"""
+        active = self._reduce_motion_var.get()
+        for value, btn in self._reduce_motion_btns.items():
+            if value == active:
+                btn.configure(
+                    fg_color=SURF_2, border_color=ACCENT,
+                    text_color=TEXT_1, hover_color=SURF_3,
+                )
+            else:
+                btn.configure(
+                    fg_color="transparent", border_color=SURF_3,
+                    text_color=TEXT_3, hover_color=SURF_2,
+                )
+
+    def _on_reduce_motion_clicked(self, value: str) -> None:
+        """點 chip 立即套用（不需 Save 按鈕）；同樣會在 _collect_and_save 寫回。"""
+        if value == self._reduce_motion_var.get():
+            return
+        self._reduce_motion_var.set(value)
+        self._apply_reduce_motion_chip_style()
+        # live-apply：直接套用到 parent AppWindow（下一個 render tick 生效）
+        try:
+            parent = self._parent
+            if hasattr(parent, "_reduce_motion"):
+                parent._reduce_motion = resolve_reduce_motion(value)
+        except Exception:
+            log_error("reduce_motion_live_apply_failed")
 
     def _on_theme_clicked(self, new_theme: str) -> None:
         """使用者點主題 chip。跟現在不同就彈 confirm dialog。"""
@@ -3381,6 +3505,8 @@ class SettingsWindow(ctk.CTkToplevel):
                       value=self._history_retention_var.get())
         # ── Phase 4.3 mini 視窗 ─────────────────────────────────────────
         self.cfg.mini_recording_window = self._mini_window_var.get()
+        # ── A3（v2.7.0）動態效果偏好 ────────────────────────────────────
+        self.cfg.reduce_motion_pref = self._reduce_motion_var.get()
         self.cfg.save()
         self._on_save_cb(self.cfg)   # 通知主視窗（destroy 由 _save 的 finally 負責）
 
@@ -3678,12 +3804,12 @@ class HotkeyBindDialog(ctk.CTkToplevel):
             self, text="等待按鍵…",
             font=ctk.CTkFont("SF Pro Display", 20, "bold"),
             fg_color=SURF_2, text_color=TEXT_1,
-            corner_radius=10, padx=24, pady=12,
+            corner_radius=10, padx=SPACE_XL, pady=SPACE_MD,
         )
-        self._detect_label.pack(pady=4)
+        self._detect_label.pack(pady=SPACE_XS)
 
         bar = ctk.CTkFrame(self, fg_color="transparent")
-        bar.pack(pady=16)
+        bar.pack(pady=SPACE_LG)
 
         ctk.CTkButton(
             bar, text="取消", width=90, height=32, corner_radius=8,
@@ -3930,7 +4056,7 @@ class AccessibilityDialog(ctk.CTkToplevel):
             font=ctk.CTkFont("SF Pro Text", 13),
             text_color=TEXT_2,
             justify="left",
-        ).pack(padx=32, pady=4)
+        ).pack(padx=SPACE_2XL, pady=SPACE_XS)
 
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.pack(pady=20)
@@ -4013,7 +4139,7 @@ class HistoryWindow(ctk.CTkToplevel):
         top.pack_propagate(False)
 
         row = ctk.CTkFrame(top, fg_color="transparent")
-        row.pack(fill="x", padx=16, pady=12)
+        row.pack(fill="x", padx=SPACE_LG, pady=SPACE_MD)
 
         ctk.CTkLabel(
             row, text="搜尋",
@@ -4030,7 +4156,7 @@ class HistoryWindow(ctk.CTkToplevel):
             fg_color=SURF_2, border_color=SURF_3, text_color=TEXT_1,
             placeholder_text="輸入關鍵字（中文 ≥ 2 字、英文 ≥ 3 字）",
         )
-        entry.pack(side="left", padx=4)
+        entry.pack(side="left", padx=SPACE_XS)
         self._search_var.trace_add("write", lambda *_: self._on_search_changed())
 
         self._count_label = ctk.CTkLabel(
@@ -4038,7 +4164,7 @@ class HistoryWindow(ctk.CTkToplevel):
             font=ctk.CTkFont(FONT_FAMILY_MONO, 12),
             text_color=TEXT_3,
         )
-        self._count_label.pack(side="right", padx=8)
+        self._count_label.pack(side="right", padx=SPACE_SM)
 
         # 主區：左清單 + 右詳細
         body = ctk.CTkFrame(self, fg_color=BG)
@@ -4124,7 +4250,7 @@ class HistoryWindow(ctk.CTkToplevel):
             border_width=1,
             border_color=ACCENT if selected else SURF_3,
         )
-        card.pack(fill="x", padx=8, pady=4)
+        card.pack(fill="x", padx=SPACE_SM, pady=SPACE_XS)
 
         time_str = _dt.datetime.fromtimestamp(entry.timestamp).strftime("%m/%d %H:%M")
         preset = entry.preset_used
@@ -4207,7 +4333,7 @@ class HistoryWindow(ctk.CTkToplevel):
             header, text="  ·  ".join(meta_parts),
             font=ctk.CTkFont("SF Pro Text", 12),
             text_color=TEXT_3,
-        ).pack(side="left", padx=12)
+        ).pack(side="left", padx=SPACE_MD)
 
         # 原文 / 潤飾 並排（潤飾在上，原文在下；有潤飾就顯示兩段）
         if entry.polished_text:
@@ -4236,7 +4362,7 @@ class HistoryWindow(ctk.CTkToplevel):
             font=ctk.CTkFont("SF Pro Text", 13),
             fg_color=ACCENT, hover_color=ACCENT_HV, text_color=TEXT_1,
             command=lambda: _copy_text(entry.polished_text or entry.raw_text),
-        ).pack(side="left", padx=4)
+        ).pack(side="left", padx=SPACE_XS)
 
         if entry.polished_text:
             ctk.CTkButton(
@@ -4247,7 +4373,7 @@ class HistoryWindow(ctk.CTkToplevel):
                 border_width=1, border_color=SURF_3,
                 text_color=TEXT_2,
                 command=lambda: _copy_text(entry.raw_text),
-            ).pack(side="left", padx=4)
+            ).pack(side="left", padx=SPACE_XS)
 
         ctk.CTkButton(
             bar, text="重新潤飾",
@@ -4259,7 +4385,7 @@ class HistoryWindow(ctk.CTkToplevel):
             border_width=1, border_color=SURF_3,
             text_color=TEXT_2,
             command=lambda: (self._on_repolish(entry), self.destroy()),
-        ).pack(side="left", padx=4)
+        ).pack(side="left", padx=SPACE_XS)
 
         ctk.CTkButton(
             bar, text="刪除",
@@ -4271,7 +4397,7 @@ class HistoryWindow(ctk.CTkToplevel):
             border_width=1, border_color=SURF_3,
             text_color=TEXT_3,
             command=lambda: self._delete_selected(entry.id),
-        ).pack(side="right", padx=4)
+        ).pack(side="right", padx=SPACE_XS)
 
     def _build_text_block(self, parent, label: str, text: str, label_color: str) -> None:
         """渲染一段標籤 + 文字區塊。"""
@@ -4515,6 +4641,15 @@ class MiniRecordingWindow(tk.Toplevel):
         y = sh - self.WIN_H - self.BOTTOM_MARGIN
         self.geometry(f"{self.WIN_W}x{self.WIN_H}+{x}+{y}")
 
+        # B5（v2.7.0）：升級前先 withdraw + 強制處理 idle event，逼 Tk 把
+        # overrideredirect/alpha/title/geometry 所有 deferred commit 跑完，
+        # 否則 Tk-on-Aqua 某些版本會在 setLevel_ 後反向蓋掉 styleMask/level。
+        try:
+            self.withdraw()
+            self.update_idletasks()
+        except Exception:
+            pass
+
         # 升級成 NSPanel-level（跨 Space / 全螢幕可見 / 不搶 focus）
         self._upgrade_to_panel_level()
 
@@ -4544,7 +4679,7 @@ class MiniRecordingWindow(tk.Toplevel):
             font=(FONT_FAMILY_MONO, 12),
             fg=TEXT_3, bg=SURF_2,
         )
-        self._timer.pack(side="right", padx=12)
+        self._timer.pack(side="right", padx=SPACE_MD)
 
         # 點擊任何處 → 把主視窗拉前
         for w in (self, outer, inner, self._dot, self._label, self._timer):
@@ -4566,10 +4701,13 @@ class MiniRecordingWindow(tk.Toplevel):
 
             mouse_loc = NSEvent.mouseLocation()
             target_screen = None
+            # B6（v2.7.0）：右/上邊用 < 開區間，避免游標剛好在兩螢幕共用邊
+            # 上時被前一個螢幕搶走。游標真在邊界外（右/上）就會落到下一個
+            # 螢幕的左/下開區間，最後 fallback 走 mainScreen。
             for screen in NSScreen.screens():
                 f = screen.frame()
-                if (f.origin.x <= mouse_loc.x <= f.origin.x + f.size.width and
-                        f.origin.y <= mouse_loc.y <= f.origin.y + f.size.height):
+                if (f.origin.x <= mouse_loc.x < f.origin.x + f.size.width and
+                        f.origin.y <= mouse_loc.y < f.origin.y + f.size.height):
                     target_screen = screen
                     break
             if target_screen is None:
@@ -4602,6 +4740,28 @@ class MiniRecordingWindow(tk.Toplevel):
                 pass
 
     # ── PyObjC NSPanel-level 升級 ──────────────────────────────────────────
+    # NSStatusWindowLevel = 25（高於一般視窗、低於螢幕保護程式）
+    _NS_STATUS_WINDOW_LEVEL = 25
+    # CollectionBehavior bitmask
+    _NS_COLLECTION_BEHAVIOR = (
+        (1 << 0)   # CanJoinAllSpaces — 跨 Space
+        | (1 << 4) # Stationary — 不跟 Mission Control 縮
+        | (1 << 8) # FullScreenAuxiliary — 別人全螢幕時可見
+    )
+
+    def _apply_panel_level(self, ns_window) -> None:
+        """對指定 NSWindow 套用 NSStatusWindowLevel + collectionBehavior。
+
+        Helper：被 _upgrade_to_panel_level（初始升級）與 _reapply_panel_level
+        （show_* 時的 re-apply）共用，確保兩條路徑保持一致。
+        """
+        ns_window.setLevel_(self._NS_STATUS_WINDOW_LEVEL)
+        ns_window.setCollectionBehavior_(self._NS_COLLECTION_BEHAVIOR)
+        try:
+            ns_window.setHidesOnDeactivate_(False)  # 失焦時不要自己隱藏
+        except Exception:
+            pass
+
     def _upgrade_to_panel_level(self) -> None:
         """把對應 NSWindow 升到 NSStatusWindowLevel + collectionBehavior。
 
@@ -4624,35 +4784,33 @@ class MiniRecordingWindow(tk.Toplevel):
                 log_error("mini_hud_nswindow_not_found")
                 return
 
-            # NSStatusWindowLevel = 25（高於一般視窗、低於螢幕保護程式）
-            NSStatusWindowLevel = 25
-            # CollectionBehavior bitmask
-            NSWindowCollectionBehaviorCanJoinAllSpaces = 1 << 0    # 跨 Space
-            NSWindowCollectionBehaviorStationary = 1 << 4          # 不跟 Mission Control 縮
-            NSWindowCollectionBehaviorFullScreenAuxiliary = 1 << 8 # 別人全螢幕時可見
-
-            ns_window.setLevel_(NSStatusWindowLevel)
-            ns_window.setCollectionBehavior_(
-                NSWindowCollectionBehaviorCanJoinAllSpaces
-                | NSWindowCollectionBehaviorStationary
-                | NSWindowCollectionBehaviorFullScreenAuxiliary
-            )
-            # 失焦時不要自己隱藏
-            try:
-                ns_window.setHidesOnDeactivate_(False)
-            except Exception:
-                pass
-
+            self._apply_panel_level(ns_window)
             self._ns_window = ns_window
             log_state("mini_hud_panel_level_upgraded")
         except Exception as e:
             # PyObjC import 失敗或其他例外 → fallback 成普通 Toplevel
             log_error(f"mini_hud_panel_upgrade_failed: {e}")
 
+    def _reapply_panel_level(self) -> None:
+        """B4（v2.7.0）：每次 show_* 前 re-apply NSWindow level。
+
+        Tk-on-Aqua 某些版本 deiconify 後 NSWindow styleMask/level 會被靜默
+        重設，跨 Space 能力悄悄丟失。re-apply 是 cheap（兩個 setter call），
+        值得每次 show 都跑一次保險。`self._ns_window` 為 None（升級失敗）
+        則直接 no-op，不嘗試重新搜尋 NSApp.windows()（避免 toggle 拿錯）。
+        """
+        if self._ns_window is None:
+            return
+        try:
+            self._apply_panel_level(self._ns_window)
+        except Exception as e:
+            log_error(f"mini_hud_panel_level_reapply_failed: {e}")
+
     def show_recording(self) -> None:
         """進入錄音狀態 → 顯示紅點 + 「錄音中」+ 0:00 計時。
 
         每次顯示前重新定位到游標所在螢幕中下方（Speakly 風格）。
+        B4（v2.7.0）：deiconify 後 re-apply panel level（cheap 保險）。
         """
         if self._closed:
             return
@@ -4661,17 +4819,20 @@ class MiniRecordingWindow(tk.Toplevel):
         self._label.configure(text="錄音中")
         self._timer.configure(text="00:00")
         self.deiconify()
+        self._reapply_panel_level()
 
     def show_processing(self) -> None:
         """進入處理中狀態 → 琥珀色 + 「轉錄中」。
 
         錄音剛結束時延續錄音時的位置；不重定位，避免 HUD 跳動。
+        B4（v2.7.0）：deiconify 後 re-apply panel level。
         """
         if self._closed:
             return
         self._dot.configure(fg=WARN)
         self._label.configure(text="轉錄中")
         self.deiconify()
+        self._reapply_panel_level()
 
     def update_timer(self, seconds: float) -> None:
         """錄音中每秒呼叫一次更新計時器。"""

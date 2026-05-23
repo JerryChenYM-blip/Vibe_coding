@@ -128,6 +128,13 @@ class Config:
     # （目前不支援 live switch、詳見 docs/superpowers/plans/2026-05-23-light-theme-...md）
     theme: str = "dark"
 
+    # ── v2.7.0 動態效果偏好（A3 / 2026-05-23）──────────────────────────────
+    # "auto"   = 跟 macOS「減少動態效果」系統偏好（預設、推薦）
+    # "always" = 一律 reduce（無視系統偏好強制關閉呼吸光圈 / 漣漪 / 粒子環旋轉）
+    # "never"  = 一律完整動畫（即使系統開了 reduce motion 也跑完整動畫）
+    # 改變後立即套用（不需重啟），下一個 render tick 生效
+    reduce_motion_pref: str = "auto"
+
     # ── 讀寫介面 ──────────────────────────────────────────────────────────────
 
     @classmethod

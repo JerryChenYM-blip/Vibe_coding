@@ -437,6 +437,7 @@ def test_p2a_dynamic_timeout_long_audio_5min():
     win._rec_start = time.perf_counter() - 300.0   # 模擬已錄 5min
     win._stream_tick_id = None
     win._stream_samples = 0
+    win._processing_timeout_id = None  # B2（v2.7.0）
 
     # mock recorder.stop 回傳 5 分鐘的 audio array
     import numpy as np
@@ -489,6 +490,7 @@ def test_p2a_dynamic_timeout_short_audio_uses_base():
     win._rec_start = time.perf_counter() - 5.0
     win._stream_tick_id = None
     win._stream_samples = 0
+    win._processing_timeout_id = None  # B2（v2.7.0）
 
     import numpy as np
     short_audio = np.zeros(5 * 16_000, dtype=np.float32)
@@ -674,3 +676,145 @@ def test_fix19_on_copy_noop_when_no_blocks():
 
     fake_pyperclip.copy.assert_not_called()
     win._show_toast.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# B2 (v2.7.0): processing timeout self-heal — 連續 2 次 _transition_to_processing
+# 應該 cancel 前一個 pending callback，避免 N 個 timeout id 累積（timer leak）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_b2_processing_timeout_cancels_previous_pending():
+    """B2：連續兩次 _transition_to_processing → 第二次 schedule 之前
+    應該 after_cancel 第一次的 id，並把 _processing_timeout_id 換成新的。"""
+    from gui import AppWindow
+    import numpy as np
+
+    win = AppWindow.__new__(AppWindow)
+    win._state_start_time = 0
+    win._timer_label = MagicMock()
+    win._hotkey_hint = MagicMock()
+    win._target_label = MagicMock()
+    win._status_dot = MagicMock()
+    win._status_label = MagicMock()
+    win._model_var = MagicMock()
+    win._model_var.get.return_value = "large-v3-turbo"
+    win.cfg = MagicMock()
+    win.cfg.get_whisper_language.return_value = None
+    win.transcriber = MagicMock()
+    win._mini_window = None
+
+    short_audio = np.zeros(5 * 16_000, dtype=np.float32)
+    win.recorder = MagicMock()
+    win.recorder.stop.return_value = short_audio
+
+    # 模擬 after 回傳遞增的 id；after_cancel 收集被 cancel 的 id
+    after_ids = iter(["timeout_id_1", "timeout_id_2"])
+    cancelled_ids: list[str] = []
+    win.after = MagicMock(side_effect=lambda ms, fn: next(after_ids))
+    win.after_cancel = MagicMock(side_effect=cancelled_ids.append)
+
+    # 不要真的開 thread
+    import threading
+    orig_thread = threading.Thread
+    threading.Thread = MagicMock()
+    try:
+        # 第 1 次
+        win._state = "recording"
+        win._rec_start = time.perf_counter() - 5.0
+        win._stream_tick_id = None
+        win._stream_samples = 0
+        win._processing_timeout_id = None
+        win._transition_to_processing()
+        assert win._processing_timeout_id == "timeout_id_1"
+        assert cancelled_ids == [], "第 1 次不應 cancel 任何 id"
+
+        # 第 2 次（模擬背景 Whisper 還沒 finish 就再進入 processing）
+        win._state = "recording"
+        win._rec_start = time.perf_counter() - 5.0
+        win._stream_tick_id = None
+        win._transition_to_processing()
+        assert win._processing_timeout_id == "timeout_id_2"
+        # 第 2 次必須 cancel 上一個
+        assert cancelled_ids == ["timeout_id_1"], (
+            f"第 2 次應該 cancel timeout_id_1, 實際拿到 {cancelled_ids}"
+        )
+    finally:
+        threading.Thread = orig_thread
+
+
+def test_b2_processing_timeout_check_clears_id_after_fire():
+    """B2：_processing_timeout_check 一旦 fire（callback 被 Tk 呼叫），
+    `_processing_timeout_id` 應被清成 None，下次判斷不留 stale 值。"""
+    from gui import AppWindow
+    win = AppWindow.__new__(AppWindow)
+    win._state = "idle"  # 已正常結束情境（callback 仍會 fire，但 no-op）
+    win._processing_timeout_id = "timeout_id_xyz"
+    win._processing_started_at = time.monotonic()
+    win._processing_timeout_ms = 60_000
+
+    win._processing_timeout_check()
+    assert win._processing_timeout_id is None, (
+        "callback fire 後應該清 id（避免下次 _transition_to_processing 誤 cancel 已 consume 的 id）"
+    )
+
+
+def test_b2_transition_to_idle_cancels_pending_timeout():
+    """B2：processing → idle 正常結束時應該 cancel 對應 timeout self-heal callback。"""
+    from gui import AppWindow
+    win = AppWindow.__new__(AppWindow)
+    win._state = "processing"
+    win._state_start_time = 0
+    win._processing_timeout_id = "timeout_id_to_cancel"
+    win._ripples = []
+    win._mini_window = None
+    win._timer_label = MagicMock()
+    win._hotkey_hint = MagicMock()
+    win._model_menu = MagicMock()
+    win._lang_menu = MagicMock()
+    win._target_label = MagicMock()
+    win._model_var = MagicMock()
+    win._model_var.get.return_value = "large-v3-turbo"
+    win._status_dot = MagicMock()
+    win._status_label = MagicMock()
+    win.cfg = MagicMock()
+    win.cfg.format_hotkey_display.return_value = "Right Cmd"
+
+    cancelled: list[str] = []
+    win.after_cancel = MagicMock(side_effect=cancelled.append)
+
+    win._transition_to_idle(None)
+    assert cancelled == ["timeout_id_to_cancel"]
+    assert win._processing_timeout_id is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A3 (v2.7.0): reduce_motion pref resolution
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_a3_resolve_reduce_motion_always():
+    """A3：pref="always" → 永遠 True，不問系統。"""
+    from gui import resolve_reduce_motion
+    assert resolve_reduce_motion("always") is True
+
+
+def test_a3_resolve_reduce_motion_never():
+    """A3：pref="never" → 永遠 False，即使系統開了 reduce motion。"""
+    from gui import resolve_reduce_motion
+    assert resolve_reduce_motion("never") is False
+
+
+def test_a3_resolve_reduce_motion_auto_follows_system(monkeypatch):
+    """A3：pref="auto" → 跟 system_reduce_motion() 回傳值。"""
+    import gui
+    monkeypatch.setattr(gui, "system_reduce_motion", lambda: True)
+    assert gui.resolve_reduce_motion("auto") is True
+    monkeypatch.setattr(gui, "system_reduce_motion", lambda: False)
+    assert gui.resolve_reduce_motion("auto") is False
+
+
+def test_a3_resolve_reduce_motion_unknown_falls_back_to_auto(monkeypatch):
+    """A3：未知 pref（壞掉 config）→ 安全 fallback 到系統偏好。"""
+    import gui
+    monkeypatch.setattr(gui, "system_reduce_motion", lambda: False)
+    assert gui.resolve_reduce_motion("bogus_value") is False
+    assert gui.resolve_reduce_motion("") is False
