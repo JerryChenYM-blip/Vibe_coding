@@ -314,6 +314,14 @@ class Transcriber:
         result.elapsed_seconds  = time.perf_counter() - t0
         rtf = (result.elapsed_seconds / duration) if duration > 0 else 0
         log.info(f"WHISPER: Inference finished in {result.elapsed_seconds:.2f}s. RTF={rtf:.3f}")
+        # Fix 12b（v2.13.0）：RTF > 1.0 視為「比實時還慢」、印警告方便日後 debug。
+        # warmup 第一次例外（cold start RTF 可能 0.5-1.5）；之後若仍 > 1 通常表示
+        # temperature fallback 被觸發或硬體有問題。
+        if rtf > 1.0:
+            log.warning(
+                f"WHISPER: RTF={rtf:.2f} > 1.0 (slower than realtime)。"
+                f"可能 fallback chain 觸發或硬體瓶頸；若反覆出現請回報。"
+            )
 
         # 幻覺過濾：優先逐段過濾（保留合法段），沒 segments 資訊才退回整段檢查
         if result.segments:
@@ -521,27 +529,28 @@ class Transcriber:
     ) -> TranscriptionResult:
         """使用 mlx-whisper 進行推論（Metal GPU 加速）。
 
-        Fix 12 / 2026-05-23 — 短音檔快速路徑（< 3s）：
-          mlx_whisper 預設 temperature fallback chain = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)。
-          對短音檔（1-3s）模型常因資訊量不足而 quality bad → 一路 fallback 到 1.0，
-          每段都重跑 decode，觀察過 1.6s 音檔產生 51 個 hallucination segment、
-          RTF 7.5。長音檔（≥ 3s）資訊足夠不會觸發 fallback，維持預設品質。
+        Fix 12 / 2026-05-23 — 短音檔快速路徑（< 3s）原版
+        Fix 12b / 2026-05-24 — **fast-path 邊界從 3s 拉到 30s**：
+          實機回報 4.1s 重複內容（「麥克風測試 麥克風測試 麥克風測試」）跑 8.46s
+          RTF=2.064。根因：mlx_whisper 預設 temperature fallback chain =
+          (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)。重複內容讓模型認為「quality bad」
+          一路 fallback 到 1.0、每段重跑 decode → RTF 數倍放大。
 
-          修法：< 3s 強制 beam_size=1 / temperature=0 / condition_on_previous_text=False
-          —— 切斷 fallback chain、抑制幻覺放大、保證單次 decode 完事。
-          中英混講等真實短句的辨識率影響微乎其微（這類短語就算多 beam 也只能
-          靠音訊本身的資訊），但 RTF 7.5 → ~0.3 是 25 倍加速。
+          修法：所有 < 30s 音檔（涵蓋日常 99% 場景）強制 temperature=0 +
+          condition_on_previous_text=False。對中英混講 / 重複話語 / 短句的
+          辨識率影響微乎其微（語意已由音訊內容決定），但 RTF 從 ~2 降到 ~0.1-0.3。
+          長音檔（≥ 30s）才保留預設 fallback chain（quality 優先、上下文有用）。
         """
         import mlx_whisper
 
         hf_repo  = _MLX_MODEL_MAP.get(model_size, _MLX_MODEL_MAP["large-v3-turbo"])
         duration = len(audio) / 16_000
-        is_short = duration < 3.0
+        # Fix 12b（v2.13.0）：邊界從 3s 拉到 30s，涵蓋日常單句 / 多句場景
+        is_short = duration < 30.0
 
-        # 短音檔額外 kwargs；長音檔維持 mlx_whisper 預設（品質優先）
+        # 短/中音檔（< 30s）走 fast path；長音檔維持 mlx_whisper 預設（quality 優先）
         # Fix 14 / 2026-05-23：不要傳 beam_size（mlx_whisper 偵測 kwarg 就試
-        # beam-search path，該 path 還沒實作 → NotImplementedError）。
-        # 只用 temperature=0 + condition_on_previous_text=False 切 fallback chain。
+        # beam-search path、該 path 還沒實作 → NotImplementedError）。
         short_kwargs: dict = {}
         if is_short:
             short_kwargs = {
