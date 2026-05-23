@@ -75,7 +75,7 @@ from tokens import (
     WARN,
     INDIGO, INDIGO_HV,
     # Typography + spacing
-    FONT_FAMILY_TEXT, FONT_FAMILY_MONO,
+    FONT_FAMILY_UI, FONT_FAMILY_TEXT, FONT_FAMILY_MONO,
     SPACE_XS, SPACE_SM, SPACE_MD, SPACE_LG,
     # Motion
     BREATHE_IDLE_MS, BREATHE_RECORDING_MS, BREATHE_PROCESSING_MS,
@@ -1922,6 +1922,53 @@ class AppWindow(ctk.CTkFrame):
         log_action("settings_opened")
         SettingsWindow(self, self.cfg, self._on_settings_saved)
 
+    def _do_theme_relaunch(self) -> None:
+        """v2.6.0 主題切換後執行：toast → 800ms → cleanup → spawn → exit。
+
+        Eng Review Issue 1 / 2026-05-23：cleanup-first 順序避免新舊 process 共存
+        race window（雙 NSEvent monitor / mic 衝突 / config.json race）。
+
+        SettingsWindow 已 save config + destroy 自己；本函式由 AppWindow 跑收尾。
+        """
+        log_action("theme_relaunch_started")
+        # Step 0：toast 通知（fire-and-forget）
+        try:
+            self._show_toast("主題切換中、~2 秒…")
+        except Exception:
+            pass
+
+        def _do_relaunch_sequence():
+            # Step A：cleanup 完整跑完（on_close 內含 hotkey_mgr.stop / recorder.stop /
+            # mini HUD destroy / history.db close 等所有資源釋放）
+            try:
+                self.on_close()
+            except Exception:
+                log_error("theme_relaunch_cleanup_failed")
+
+            # Step B：spawn 新 process
+            try:
+                import main as _main
+                spawned = _main._relaunch_app()
+            except Exception:
+                log_error("theme_relaunch_spawn_failed")
+                spawned = False
+
+            # Step C：舊 process 終止（.app 路徑用 sys.exit；execv 路徑不會走到這）
+            if spawned:
+                import sys
+                log.info("THEME: cleanup done, new instance spawned, exiting")
+                sys.exit(0)
+            else:
+                # 全部失敗 → 不 exit、讓使用者手動處理；toast 提示
+                try:
+                    self._show_toast("重啟失敗、請手動關閉並重啟 App")
+                except Exception:
+                    pass
+                log_error("theme_relaunch_all_paths_failed")
+
+        # 800ms 後執行 relaunch sequence（給 toast 時間顯示）
+        self.after(800, _do_relaunch_sequence)
+
     def _open_history(self) -> None:
         """開啟歷史紀錄視窗（Phase 3.2）。"""
         log_action("history_opened")
@@ -2569,6 +2616,42 @@ class SettingsWindow(ctk.CTkToplevel):
                 fill="x", padx=16, pady=0
             )
 
+        # ── 外觀（v2.6.0）── 放第一個 section 最顯眼位置 ─────────────────
+        # 點 chip → 跟現在不同就彈 confirm dialog → 確認 → 立刻 save + 重啟。
+        # 不跟其他設定一起等 Save 按鈕，因為重啟需要立即動作（plan §「Restart UX 流程」）。
+        ap = section("外觀")
+        self._theme_var = ctk.StringVar(value=self.cfg.theme)
+
+        def theme_row(r):
+            wrap = ctk.CTkFrame(r, fg_color="transparent")
+            wrap.pack(side="right")
+            # 兩顆 segmented chip：深色 / 淺色
+            self._theme_btns: dict[str, ctk.CTkButton] = {}
+            for value, label in (("dark", "深色"), ("light", "淺色")):
+                btn = ctk.CTkButton(
+                    wrap, text=label,
+                    width=72, height=30, corner_radius=8,
+                    font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
+                    border_width=1,
+                    command=lambda v=value: self._on_theme_clicked(v),
+                )
+                btn.pack(side="left", padx=(0, 4))
+                self._theme_btns[value] = btn
+            self._apply_theme_chip_style()
+
+        row(ap, "主題", theme_row)
+        ctk.CTkLabel(
+            ap,
+            text=(
+                "深色：zinc + cyan（目前預設）\n"
+                "淺色：暖白 + Claude 珊瑚（v2.6.0 新增）\n"
+                "切換需重新啟動 App（~2 秒、自動完成）"
+            ),
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
+            text_color=TEXT_3,
+            justify="left", anchor="w",
+        ).pack(anchor="w", padx=16, pady=(0, 10))
+
         # ── 語音辨識 ──────────────────────────────────────────────────────
         stt = section("語音辨識")
         self._model_var = ctk.StringVar(value=self.cfg.model)
@@ -2981,6 +3064,138 @@ class SettingsWindow(ctk.CTkToplevel):
         self._hk_label.configure(text=format_hotkey(combo))
         log_settings("pending", field="hotkey", old=old, new=combo,
                      note="pending_save_button")
+
+    # ── v2.6.0 主題切換（外觀 section）─────────────────────────────────────
+
+    def _apply_theme_chip_style(self) -> None:
+        """根據目前 _theme_var 重繪 2 顆 chip：active 帶 ACCENT 邊框 + SURF_2 底色。"""
+        active = self._theme_var.get()
+        for value, btn in self._theme_btns.items():
+            if value == active:
+                btn.configure(
+                    fg_color=SURF_2,
+                    border_color=ACCENT,
+                    text_color=TEXT_1,
+                    hover_color=SURF_3,
+                )
+            else:
+                btn.configure(
+                    fg_color="transparent",
+                    border_color=SURF_3,
+                    text_color=TEXT_3,
+                    hover_color=SURF_2,
+                )
+
+    def _on_theme_clicked(self, new_theme: str) -> None:
+        """使用者點主題 chip。跟現在不同就彈 confirm dialog。"""
+        if new_theme == self.cfg.theme:
+            return   # 點現在主題的 chip → noop
+        # 視覺先 preview（chip 跳到使用者選的；若取消會還原）
+        self._theme_var.set(new_theme)
+        self._apply_theme_chip_style()
+        self._confirm_theme_switch(new_theme)
+
+    def _confirm_theme_switch(self, new_theme: str) -> None:
+        """彈 modal confirm dialog：警告錄音 / 潤飾進行中的狀態。
+
+        確認 → save + relaunch。取消 → 視覺還原 + chip 變回原本主題。
+        """
+        # 偵測進行中狀態，警告文字加在 confirm body
+        warnings: list[str] = []
+        try:
+            if getattr(self._parent, "_state", None) == "recording":
+                warnings.append("• 進行中的錄音會被中斷")
+            if getattr(self._parent, "_polish_busy", False):
+                warnings.append("• AI 潤飾進行中、結果會遺失")
+        except Exception:
+            pass
+
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("切換主題")
+        dlg.geometry("360x220")
+        dlg.resizable(False, False)
+        dlg.configure(fg_color=BG)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        ctk.CTkLabel(
+            dlg,
+            text=f"切換到「{('淺色' if new_theme == 'light' else '深色')}」需要重新啟動 App",
+            font=ctk.CTkFont(FONT_FAMILY_UI, 14, "bold"),
+            text_color=TEXT_1,
+            wraplength=320, justify="left",
+        ).pack(padx=20, pady=(20, 8), anchor="w")
+
+        body_text = "• 所有設定 / 歷史紀錄都會保留\n• Splash 過場後落地新主題"
+        if warnings:
+            body_text = "\n".join(warnings) + "\n" + body_text
+        ctk.CTkLabel(
+            dlg, text=body_text,
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 12),
+            text_color=TEXT_2,
+            wraplength=320, justify="left", anchor="w",
+        ).pack(padx=20, pady=(0, 14), anchor="w")
+
+        btns = ctk.CTkFrame(dlg, fg_color="transparent")
+        btns.pack(side="bottom", fill="x", padx=20, pady=14)
+
+        def on_cancel():
+            # 還原視覺
+            self._theme_var.set(self.cfg.theme)
+            self._apply_theme_chip_style()
+            log_action("theme_switch_cancelled", attempted=new_theme)
+            dlg.destroy()
+
+        def on_confirm():
+            dlg.destroy()
+            self._trigger_theme_relaunch(new_theme)
+
+        ctk.CTkButton(
+            btns, text="取消", width=90, height=32, corner_radius=8,
+            fg_color="transparent", border_width=1, border_color=SURF_3,
+            text_color=TEXT_2, hover_color=SURF_2,
+            command=on_cancel,
+        ).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(
+            btns, text="確認、重啟", width=120, height=32, corner_radius=8,
+            fg_color=ACCENT, hover_color=ACCENT_HV,
+            text_color=TEXT_1,
+            command=on_confirm,
+        ).pack(side="right")
+
+        # ESC 鍵 = 取消
+        dlg.bind("<Escape>", lambda e: on_cancel())
+
+    def _trigger_theme_relaunch(self, new_theme: str) -> None:
+        """確認後：save config → 觸發 AppWindow 的 relaunch 流程 → destroy SettingsWindow。
+
+        Eng Review Issue 1 順序：confirm 立刻 save、AppWindow 在 toast 後依
+        cleanup → spawn → exit 順序執行，避免雙 instance 共存。
+        """
+        old_theme = self.cfg.theme
+        self.cfg.theme = new_theme
+        try:
+            self.cfg.save()
+        except Exception:
+            log_error("theme_save_failed")
+            self._theme_var.set(old_theme)
+            self._apply_theme_chip_style()
+            return
+
+        log_action("theme_switched", **{"from": old_theme, "to": new_theme})
+
+        # 委派 AppWindow 跑 cleanup → spawn → exit
+        try:
+            self._parent._do_theme_relaunch()
+        except Exception:
+            log_error("theme_trigger_relaunch_failed")
+            return
+
+        # 關閉 SettingsWindow，AppWindow 會在 800ms 後正式進入 relaunch 流程
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
     def _save(self) -> None:
         """收集所有 UI 欄位值，寫入暫存 cfg、呼叫 on_save_cb，然後關閉視窗。

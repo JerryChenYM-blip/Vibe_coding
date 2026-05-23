@@ -121,6 +121,13 @@ class Config:
     # Fix 8（2026-05-22）：預設翻 True
     mini_recording_window: bool = True
 
+    # ── v2.6.0 主題（2026-05-23）────────────────────────────────────────────
+    # "dark" = zinc + cyan（v2.5.0 起的預設）
+    # "light" = 暖白 + Claude 珊瑚（v2.6.0 新增、Apple 結構 + Claude 溫度）
+    # tokens.py 在 import 時讀此值決定 active palette；切換需 App 重啟
+    # （目前不支援 live switch、詳見 docs/superpowers/plans/2026-05-23-light-theme-...md）
+    theme: str = "dark"
+
     # ── 讀寫介面 ──────────────────────────────────────────────────────────────
 
     @classmethod
