@@ -344,6 +344,23 @@ class Transcriber:
             log.warning(f"WHISPER: Guard - Detected hallucination: '{result.text[:50]}...'")
             result.text = "（未偵測到語音內容）"
 
+        # v2.13.0：規則式校正（< 1ms）— Whisper 系統性誤辨識（Cloud Code → Claude Code 等）
+        # 走純字串替換，不需 LLM 推理。讀 ~/.whisper_app/dictionary.json 的 corrections 段。
+        # 在 polish 之前套用 → 即使 polish 關閉、原文也已校正；polish 開啟也少做事。
+        try:
+            from dictionary import load_corrections, apply_corrections
+            corrections = load_corrections()
+            if corrections and result.text and not result.text.startswith("（"):
+                before = result.text
+                result.text = apply_corrections(result.text, corrections)
+                if before != result.text:
+                    log.info(
+                        f"WHISPER: applied {len(corrections)} corrections"
+                        f" (len {len(before)}→{len(result.text)})"
+                    )
+        except Exception:
+            log_error("apply_corrections_failed")
+
         # 記錄轉錄結果（前 100 字，方便未來 debug hallucination / 準確度）
         preview = result.text[:100].replace("\n", " ")
         log.info(f"WHISPER: Result (lang={result.language}) text='{preview}'")

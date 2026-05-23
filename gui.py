@@ -3844,7 +3844,7 @@ class SettingsWindow(ctk.CTkToplevel):
             )
 
     def _compute_dict_status(self) -> str:
-        """讀字典檔回傳「目前 N 個 term」狀態字串。"""
+        """讀字典檔回傳「目前 N 個 term + M 條 corrections」狀態字串。"""
         try:
             path_str = (self.cfg.dictionary_path or "").strip() or str(_dictionary.DEFAULT_PATH)
             from pathlib import Path as _P
@@ -3853,8 +3853,11 @@ class SettingsWindow(ctk.CTkToplevel):
                 return "字典檔不存在（點按鈕建立）"
             import json as _json
             data = _json.loads(path.read_text(encoding="utf-8"))
-            n = len(data.get("terms", []))
-            return f"目前 {n} 個 term"
+            n_terms = len(data.get("terms", []))
+            n_corr = len(data.get("corrections", []))
+            if n_corr:
+                return f"目前 {n_terms} 個 term、{n_corr} 條校正規則"
+            return f"目前 {n_terms} 個 term"
         except Exception:
             return "讀取字典失敗"
 
