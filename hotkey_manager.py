@@ -457,6 +457,11 @@ class HotkeyManager:
         Args:
             combo: 組合鍵字串，例如 "cmd+alt+r" 或 lone modifier "right_cmd"。
         """
+        # D4-S6（v2.10.0 / 2026-05-23）：log 舊／新 combo 切換，方便 debug
+        # 重綁路徑（user 從設定切熱鍵後是否真的生效）
+        prev_combo = getattr(self, "_combo_str", None)
+        prev_lone  = getattr(self, "_lone_target_key", None)
+
         self.stop()
         self._hotkeys = parse_hotkey(combo)
         self._combo_str = combo
@@ -475,6 +480,13 @@ class HotkeyManager:
         self._other_key_during_press = False
         self._first_press_logged = False
         mode = "lone-modifier" if self._is_lone_mode else "combo"
+
+        # D4-S6：log 變化，讓重綁時看得到 lone target 真的換了
+        if prev_combo and prev_combo != combo:
+            log.info(
+                f"HOTKEY: restart() combo {prev_combo!r} → {combo!r} "
+                f"(lone {prev_lone!r} → {self._lone_target_key!r})"
+            )
 
         # ── 後端：NSEvent only ─────────────────────────────────────
         # 2026-05-22 起 pynput Listener 完全砍除（macOS 26.4+ 連環 crash）。

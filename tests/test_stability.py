@@ -971,3 +971,116 @@ def test_d4s4_splash_fade_tick_winfo_exists_exception_also_safe():
     assert splash._closed is True
     splash.attributes.assert_not_called()
     splash.after.assert_not_called()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# v2.10.0 — D3-S5/S6/S7 + D4-S6 + D5-S7/S10 regression tests
+# ═════════════════════════════════════════════════════════════════════════════
+
+# D5-S7: Ollama health cache TTL
+
+def test_d5s7_health_cache_returns_none_after_ttl():
+    """D5-S7（v2.10.0）：cache 寫入後 TTL 過期 → health_ok 回 None。"""
+    from ollama_client import OllamaClient, OllamaConfig
+    import time as _t
+    client = OllamaClient(OllamaConfig(enabled=True))
+    # 手動戳 cache 為 True
+    client._health_ok = True
+    client._health_cached_at = _t.monotonic() - (client.HEALTH_TTL_SEC + 1)
+    assert client.health_ok is None, "TTL 過期應該回 None"
+
+
+def test_d5s7_health_cache_fresh_returns_value():
+    """D5-S7：TTL 未過期 → 回 cached 值。"""
+    from ollama_client import OllamaClient, OllamaConfig
+    import time as _t
+    client = OllamaClient(OllamaConfig(enabled=True))
+    client._health_ok = True
+    client._health_cached_at = _t.monotonic()  # 剛剛
+    assert client.health_ok is True
+
+
+def test_d5s7_health_check_sync_stamps_cache_time():
+    """D5-S7：health_check_sync 寫入 cache 同時戳時間。"""
+    from ollama_client import OllamaClient, OllamaConfig
+    client = OllamaClient(OllamaConfig(enabled=False))
+    client._health_cached_at = 0.0
+    client.health_check_sync()  # enabled=False 走 fast path 也要戳時間
+    assert client._health_cached_at > 0.0
+
+
+# D5-S10: get_frontmost_app 容錯
+
+def test_d5s10_get_frontmost_app_multiline_takes_first():
+    """D5-S10：osascript 偶發多行輸出 → 只取第一行非空字串。"""
+    import auto_paste
+    from unittest.mock import patch
+    # 模擬 osascript 多行輸出
+    fake_result = types.SimpleNamespace(
+        returncode=0,
+        stdout="Notion\nstray line 2\n",
+        stderr="",
+    )
+    with patch("subprocess.run", return_value=fake_result):
+        name = auto_paste.get_frontmost_app()
+    assert name == "Notion"
+
+
+def test_d5s10_get_frontmost_app_timeout_returns_none():
+    """D5-S10：osascript timeout → 回 None（不 raise）。"""
+    import auto_paste
+    import subprocess as _sp
+    from unittest.mock import patch
+    with patch("subprocess.run", side_effect=_sp.TimeoutExpired(cmd="osascript", timeout=1.2)):
+        name = auto_paste.get_frontmost_app()
+    assert name is None
+
+
+def test_d5s10_get_frontmost_app_nonzero_returns_none():
+    """D5-S10：returncode != 0 → 回 None 並 log_error。"""
+    import auto_paste
+    from unittest.mock import patch
+    fake_result = types.SimpleNamespace(returncode=1, stdout="", stderr="permission denied")
+    with patch("subprocess.run", return_value=fake_result):
+        name = auto_paste.get_frontmost_app()
+    assert name is None
+
+
+def test_d5s10_get_frontmost_app_empty_returns_none():
+    """D5-S10：returncode=0 但 stdout 空白 → 回 None。"""
+    import auto_paste
+    from unittest.mock import patch
+    fake_result = types.SimpleNamespace(returncode=0, stdout="   \n  \n", stderr="")
+    with patch("subprocess.run", return_value=fake_result):
+        name = auto_paste.get_frontmost_app()
+    assert name is None
+
+
+# D4-S6: hotkey restart() 重綁日誌
+
+def test_d4s6_restart_logs_combo_and_lone_change():
+    """D4-S6（v2.10.0）：restart() combo / lone target 變化要 log，讓重綁可 debug。"""
+    from hotkey_manager import HotkeyManager
+    import hotkey_manager as _hm
+    from unittest.mock import patch
+    mgr = HotkeyManager(on_tap_cb=lambda: None)
+
+    # mock module-level `log.info` 收集 log 訊息（caplog 對非 root logger
+    # 有時不抓得到，改成 patch 更穩）
+    captured: list[str] = []
+    original_info = _hm.log.info
+    with patch.object(_hm.log, "info", side_effect=lambda m: captured.append(m)):
+        try:
+            mgr.restart("cmd+alt+r")
+        except Exception:
+            pass  # NSEvent 在 headless 環境可能噴例外
+        try:
+            mgr.restart("right_cmd")
+        except Exception:
+            pass
+
+    found = any(
+        "restart() combo" in msg and "right_cmd" in msg and "cmd+alt+r" in msg
+        for msg in captured
+    )
+    assert found, f"應該 log combo 切換；實際 captured: {captured}"
