@@ -128,30 +128,44 @@ def _relaunch_app() -> bool:
     錯誤處理：所有 exception 都包到 try、寫進 log_error；不 raise。
     """
     import subprocess
-    # 偵測是否從 .app bundle 啟動：sys.executable 含 "WhisperPro.app" 是 shim Python
-    is_bundled = "WhisperPro.app" in sys.executable
 
-    if is_bundled and _APP_BUNDLE.exists():
+    # Bug 1（v2.8.0 / 2026-05-23）：優先試 .app bundle 路徑（不論 sys.executable）。
+    # 舊版（v2.6.0/v2.7.0）以 `"WhisperPro.app" in sys.executable` 偵測 bundled，
+    # 結果 user 用 `venv/bin/python3 main.py` 跑 dev 模式時 sys.executable 是
+    # venv python（不含 WhisperPro.app）→ 直接走 execv → GUI App 已啟動
+    # NSApplication mainloop 時 execv 在 macOS 上極易失敗（Cocoa 進程 image 被
+    # 替換但 NSApp / Tk 仍 hold 各種 native 資源、TSM 主執行緒斷言等）。
+    # 新版改成「.app 存在就用」，dev 模式只要先跑過 build_app.sh 就 OK。
+    if _APP_BUNDLE.exists():
         try:
             subprocess.Popen(
                 ["open", "-n", str(_APP_BUNDLE)],
                 start_new_session=True,
             )
-            log.info(f"RELAUNCH: spawned new instance via 'open -n {_APP_BUNDLE}'")
+            log.info(
+                f"RELAUNCH: spawned new instance via 'open -n {_APP_BUNDLE}' "
+                f"(sys.executable={sys.executable})"
+            )
             return True
-        except Exception:
-            log_error("relaunch_app_bundle_failed")
-            # 不直接 return False、繼續試 execv 兜底（雖然 dev 路徑用 venv python 不是
-            # shim python、launcher 邏輯不同；但「失敗時試試看」比直接放棄好）
-    # Dev 模式 / .app 失敗 fallback：re-exec 同個 python + main.py
+        except Exception as e:
+            log_error("relaunch_app_bundle_failed", error=str(e))
+            # 不直接 return False、繼續試 execv 兜底
+    else:
+        log.warning(
+            f"RELAUNCH: {_APP_BUNDLE} 不存在；fallback execv（GUI 模式下幾乎一定會失敗、"
+            f"建議跑 bash build_app.sh 重建 .app bundle）"
+        )
+
+    # Fallback：re-exec 同個 python + main.py
+    # 警告：GUI App 已啟動 NSApplication mainloop 時，execv 在 macOS 上極易失敗。
     try:
         main_py = str(_pathlib.Path(__file__).resolve())
         log.info(f"RELAUNCH: os.execv({sys.executable}, [..., {main_py}])")
         os.execv(sys.executable, [sys.executable, main_py])
         # execv 不會 return；走到這行表示真的失敗
         return False
-    except Exception:
-        log_error("relaunch_execv_failed")
+    except Exception as e:
+        log_error("relaunch_execv_failed", error=str(e))
         return False
 
 

@@ -640,13 +640,15 @@ def _make_block(text: str):
 
 
 def test_fix19_on_copy_uses_latest_block():
-    """Fix 19 Path B：_on_copy 取 _utterance_blocks[-1] 的目前顯示文字，不取整段。"""
+    """Fix 19 Path B：_on_copy 取 _utterance_blocks[0] 的目前顯示文字，不取整段。
+
+    v2.8.0 Bug 3：list 反轉為 [0]=最新、[-1]=最舊。"""
     win = _make_stub_appwindow_for_copy()
-    # 三個 block，最新是第 3 個（最後一個）
+    # 三個 block，最新在 [0]
     win._utterance_blocks = [
-        _make_block("第一段。"),
+        _make_block("我當然就好奇了。  "),   # 最新（含尾隨空白，要被 strip）
         _make_block("第二段。"),
-        _make_block("我當然就好奇了。  "),   # 含尾隨空白，要被 strip
+        _make_block("第一段。"),
     ]
 
     import sys
