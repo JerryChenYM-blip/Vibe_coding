@@ -1149,6 +1149,15 @@ class AppWindow(ctk.CTkFrame):
 
             target = self._paste_target if self.cfg.auto_paste else None
             self._paste_target = None
+
+            # Bug D（v2.13.0）：raw 策略 → 立刻貼 Whisper 原文（不等 3-20s polish）
+            # polish 結果照樣跑、UI 會顯示「已潤飾」，但不再 paste 第二次（避免貼到
+            # user 已切走的視窗）。預設仍是 wait（品質優先）。
+            paste_strategy = getattr(self.cfg, "ollama_paste_strategy", "wait")
+            if paste_strategy == "raw" and self.cfg.auto_paste and target:
+                self._do_auto_paste(text, target)
+                target = None   # 告訴 _start_polish/_finish_polish 不要再 paste 第二次
+
             self._start_polish(gen, text, target)
             return
 
@@ -1792,18 +1801,40 @@ class AppWindow(ctk.CTkFrame):
         self._wraplength_debounce_id = self.after(80, self._apply_wraplength_to_blocks)
 
     def _apply_wraplength_to_blocks(self) -> None:
-        """計算當前 container 寬度並套用到所有 block 的 text label。"""
+        """計算當前 container 寬度並套用到所有 block 的 text label。
+
+        Bug C（v2.13.0）：加 width-change guard 避免 layout 抖動。
+        - winfo_width < 100：container 還沒 realized、不動
+        - 與上次差距 < 10px：寬度沒實質變化、不動（避免每次 scroll 都觸發
+          wraplength→block height→container Configure 死循環，scrollbar 被打斷）
+        - 動作完 → 主動觸發 CTkScrollableFrame 內部 canvas 重算 scrollregion，
+          確保 scrollbar 認得新的 content 高度
+        """
         self._wraplength_debounce_id = None
         try:
-            # container.winfo_width() 含 scrollbar；扣除 block padding（左右各 SPACE_XS）
-            # 與 block 內 text padding（左右各 SPACE_MD），保留下限 280 避免被 resize 到 0
             width = self._blocks_container.winfo_width()
+            if width < 100:
+                # 容器還沒 realized（初始化 / withdraw 時 winfo_width 可能 = 1）
+                return
             new_wrap = max(280, width - (SPACE_XS * 2) - (SPACE_MD * 2) - 20)
+            last_wrap = getattr(self, "_last_wraplength", -1)
+            if abs(new_wrap - last_wrap) < 10:
+                # 變動太小、skip 避免 layout 抖動
+                return
+            self._last_wraplength = new_wrap
             for blk in self._utterance_blocks:
                 try:
                     blk.update_wraplength(new_wrap)
                 except Exception:
                     pass
+            # Bug C：主動觸發 CTkScrollableFrame 重新計算 scrollregion
+            # block 高度變了，內部 canvas 必須知道才能正確顯示 scrollbar
+            try:
+                inner_canvas = self._blocks_container._parent_canvas
+                inner_canvas.update_idletasks()
+                inner_canvas.configure(scrollregion=inner_canvas.bbox("all"))
+            except Exception:
+                pass
         except Exception:
             log_error("blocks_wraplength_update_failed")
 
@@ -3158,6 +3189,46 @@ class SettingsWindow(ctk.CTkToplevel):
         row(ai, "啟用 AI 潤飾", make_sw(self._ollama_enabled_var, ACCENT))
         sep_line(ai)
 
+        # Bug D（v2.13.0）：貼上策略 chip — wait（品質優先）vs raw（速度優先）
+        # 預設 wait：等潤飾完再貼。對 12B 模型可能 3-20s，user 體感「貼上慢」。
+        # raw：先貼 Whisper 原文（即時），潤飾結果不再覆蓋（避免貼到不同視窗）。
+        # 適合：user 已經要快、品質可後續手動編輯。
+        self._paste_strategy_var = ctk.StringVar(
+            value=getattr(self.cfg, "ollama_paste_strategy", "wait")
+        )
+
+        def paste_strategy_row(r):
+            wrap = ctk.CTkFrame(r, fg_color="transparent")
+            wrap.pack(side="right")
+            self._paste_strategy_btns: dict[str, ctk.CTkButton] = {}
+            for value, label in (
+                ("wait", "等潤飾"),
+                ("raw", "先貼原文"),
+            ):
+                btn = ctk.CTkButton(
+                    wrap, text=label,
+                    width=80, height=30, corner_radius=8,
+                    font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
+                    border_width=1,
+                    command=lambda v=value: self._on_paste_strategy_clicked(v),
+                )
+                btn.pack(side="left", padx=(0, 4))
+                self._paste_strategy_btns[value] = btn
+            self._apply_paste_strategy_chip_style()
+
+        row(ai, "貼上策略", paste_strategy_row)
+        ctk.CTkLabel(
+            ai,
+            text=(
+                "等潤飾：等 AI 校正完成才貼上（品質優先、3-20s 視模型大小）\n"
+                "先貼原文：立即貼 Whisper 原文，潤飾結果只更新 UI 不再覆蓋（速度優先）"
+            ),
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
+            text_color=TEXT_3,
+            justify="left", anchor="w",
+        ).pack(anchor="w", padx=SPACE_LG, pady=(0, 10))
+        sep_line(ai)
+
         # 模型名稱（文字輸入；未來可改為動態 dropdown）
         model_row = ctk.CTkFrame(ai, fg_color="transparent", height=52)
         model_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
@@ -3513,6 +3584,30 @@ class SettingsWindow(ctk.CTkToplevel):
         except Exception:
             log_error("reduce_motion_live_apply_failed")
 
+    # Bug D（v2.13.0）：貼上策略 chip 樣式 / click handler ────────────────
+
+    def _apply_paste_strategy_chip_style(self) -> None:
+        """根據 _paste_strategy_var 重繪 2 顆 chip。"""
+        active = self._paste_strategy_var.get()
+        for value, btn in self._paste_strategy_btns.items():
+            if value == active:
+                btn.configure(
+                    fg_color=SURF_2, border_color=ACCENT,
+                    text_color=TEXT_1, hover_color=SURF_3,
+                )
+            else:
+                btn.configure(
+                    fg_color="transparent", border_color=SURF_3,
+                    text_color=TEXT_3, hover_color=SURF_2,
+                )
+
+    def _on_paste_strategy_clicked(self, value: str) -> None:
+        """點 chip → 預覽切換，按 Save 才落地到 cfg。"""
+        if value == self._paste_strategy_var.get():
+            return
+        self._paste_strategy_var.set(value)
+        self._apply_paste_strategy_chip_style()
+
     def _on_theme_clicked(self, new_theme: str) -> None:
         """使用者點主題 chip。跟現在不同就彈 confirm dialog。"""
         if new_theme == self.cfg.theme:
@@ -3671,6 +3766,8 @@ class SettingsWindow(ctk.CTkToplevel):
         self.cfg.auto_paste     = self._autopaste_var.get()
         # ── Ollama ────────────────────────────────────────────────────────
         self.cfg.ollama_enabled  = self._ollama_enabled_var.get()
+        # Bug D（v2.13.0）：貼上策略
+        self.cfg.ollama_paste_strategy = self._paste_strategy_var.get()
         model = self._ollama_model_var.get().strip()
         if model:
             self.cfg.ollama_model = model
