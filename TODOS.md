@@ -10,45 +10,20 @@ PR #13 累積 25 commits 後做了全專案 code review（4 個 sub-agent 並行
 P1（real bug）+ P2（worth fixing）共 4 個 bug 已在 Fix 9 修掉並補 7 個 regression test。
 以下 6 個 P3/P4 條目是當期決議「註 TODOS 後續」的部分，cleanup 性質，不影響 v2.3.0 功能。
 
-### P3 — 中優先
+**狀態（2026-05-23 v2.7.0 PR #17）**：P3/P4 全部處理完畢。Observer leak 在 P1 Cluster A 修，其餘 6 條在 B1-B6 修。
 
-- [ ] **DRY：`_on_dock_reopen` 重複實作 `_restore_root_if_minimized` 邏輯**
-  - 位置：`gui.py:1922-1933`
-  - 修法：改成 `self._restore_root_if_minimized("ReopenApplication"); self.winfo_toplevel().focus_force()`
-  - 為什麼後延：cosmetic、不影響功能。但兩處 if-state 邏輯漂移風險。
+### P3 — 中優先（全部 ✅ 完成 @ v2.7.0 PR #17）
 
-- [ ] **`_processing_timeout_check` timer leak**
-  - 位置：`gui.py` `_transition_to_processing` 內 `self.after(...)`
-  - 每次 `_transition_to_processing` schedule 一個 pending callback，沒 cancel。
-  - 快速連續 N 次錄音 → N 個 pending 都 alive 至各自 timeout 觸發。
-  - 修法：存 id 到 `self._processing_timeout_id`，下次 schedule 前 `after_cancel`。
+- [x] ~~**DRY：`_on_dock_reopen` 重複實作 `_restore_root_if_minimized` 邏輯**~~ — B1
+- [x] ~~**`_processing_timeout_check` timer leak**~~ — B2（加 3 個 regression test）
+- [x] ~~**`_restore_root_if_minimized` 漏 `'icon'` legacy state**~~ — B3
+- [x] ~~**MiniHUD `deiconify()` 後 NSWindow level 可能被重設**~~ — B4（抽 `_apply_panel_level` helper + `_reapply_panel_level`）
 
-- [ ] **`_restore_root_if_minimized` 漏 `'icon'` legacy state**
-  - 位置：`gui.py:1906` 附近
-  - Tk 文件列舉 wm_state 合法值含 `'icon'`（legacy），雖然 macOS 26.4 實測都是 `'iconic'`。
-  - 修法：`if state in ("iconic", "icon", "withdrawn"):` 零成本防禦。
+### P4 — 低優先（全部 ✅ 完成）
 
-- [ ] **MiniHUD `deiconify()` 後 NSWindow level 可能被重設**
-  - 位置：`gui.py` `MiniRecordingWindow.show_recording` / `show_processing` + `_upgrade_to_panel_level`
-  - Tk-on-Aqua 某些版本 `deiconify` 會重設 styleMask → 跨 Space 能力默默丟失。
-  - 修法：`show_recording` / `show_processing` 開頭 re-apply `setLevel_` + `setCollectionBehavior_`（cheap）。
-
-### P4 — 低優先
-
-- [ ] **`_install_cocoa_activation_observer` NSObject 沒 `removeObserver_`**
-  - 位置：`gui.py` cocoa observer install 處
-  - AppWindow.on_close 沒 cleanup observer。單視窗 App 退出時 OS 收回沒事，但未來 multi-window 會 leak。
-  - 修法：on_close 加 `NSNotificationCenter.defaultCenter().removeObserver_(...)`。
-
-- [ ] **MiniHUD `_upgrade_to_panel_level` 升級時點偏早**
-  - 位置：`gui.py` `MiniRecordingWindow.__init__` → `_upgrade_to_panel_level`
-  - `overrideredirect(True)` + `attributes("-alpha", ...)` + `title()` + `geometry()` 後 Tk 可能 deferred commit 蓋掉 setLevel。
-  - 修法：升級前 `self.withdraw(); self.update()` 強制 commit 一輪。
-
-- [ ] **MiniHUD 游標螢幕命中測試 closed interval bug**
-  - 位置：`gui.py` `_position_at_cursor_screen_bottom` for-loop
-  - 游標剛好在兩螢幕共用邊上時匹配迴圈順序第一個螢幕。實際幾乎察覺不到。
-  - 修法：右/上邊用 `<` 開區間。
+- [x] ~~**`_install_cocoa_activation_observer` NSObject 沒 `removeObserver_`**~~ — P1 Cluster A（PR #16）
+- [x] ~~**MiniHUD `_upgrade_to_panel_level` 升級時點偏早**~~ — B5（升級前 `withdraw + update_idletasks`）
+- [x] ~~**MiniHUD 游標螢幕命中測試 closed interval bug**~~ — B6（右/上邊改 `<` 開區間）
 
 ---
 
@@ -80,4 +55,28 @@ Path A 是否已足夠，再決定 Path B 是否真的要做。
 - [ ] **per-block 潤飾按鈕**（hover-only）：目前只能對最新段潤飾，舊段沒辦法重新潤。
   可加第三個 icon 跟 copy/delete 同一行。
 - [ ] **delete 動作的 undo toast**（5 秒內可救回）：避免誤刪整段語音內容無法挽回。
+
+
+---
+
+## 2026-05-23（v2.7.0 PR #17：UI 打磨 + P3/P4 cleanup）
+
+來源：使用者選擇「繼續做 v2.7.0 候選清單」→ A 批（UI 打磨）+ B 批（P3/P4 cleanup）一起做。
+
+**已完成（PR #17、84 tests）**：
+- A1 間距統一（59/73 4pt grid）
+- A2 等寬數字（splash 版本號補 mono）
+- A3 reduce-motion 偵測 + 3-way pref（auto/always/never，4 tests）
+- A4 舊 token 別名移除（v2.6.0 已完成、確認）
+- B1-B6 cleanup（observer leak 在 P1 Cluster A 已修）
+- B2 timer leak + 3 regression test
+
+**仍開放（v2.8.0+ 候選）**：
+
+- [ ] **A1 殘留 ~14 個非 4pt grid 值** — 主要 `padx=20`（12 hits）與 6/18/13/14/40
+  各 1-2 hits。要嘛加 `SPACE_LG_PLUS=20`（破壞 4pt grid 純度）、要嘛逐個改 24
+  （視覺微寬 4px、有風險）。建議實機看 v2.7.0 後再評估。
+- [ ] **Phase 4.2 menu bar icon** — `rumps` + tkinter event loop PoC，30 min。
+  CLAUDE.md §11 唯一未交付的 Speakly Phase 4 項目。
+- [ ] **App Icon 視覺微調** — 膠囊轉角已平，剩優化項目見 `assets/icon.png`。
 
