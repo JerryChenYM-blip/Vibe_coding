@@ -152,6 +152,17 @@ class AppWindow(ctk.CTkFrame):
     # 5 秒：權衡 detect latency 與 µs 級檢查成本。
     HOTKEY_WATCHDOG_INTERVAL_MS = 5000
 
+    # Fix 18 / 2026-05-23（Layer 2）：每 N 毫秒無條件 force-restart NSEvent monitor。
+    # 即使 monitor 物件還 alive、其底層 ObjC block 仍可能在閒置 1hr+ 後被 invalidate
+    # 而 watchdog 偵測不到（_monitor_global is not None 仍成立）。10 分鐘是
+    # 跟 pynput 時期 Layer 3 同樣節奏的 belt-and-suspenders；錄音中跳過避免吞 stop。
+    HOTKEY_FORCE_RESTART_INTERVAL_MS = 600_000
+
+    # Fix 18 / 2026-05-23（Layer 3）：監聽 monitor "alive" 但事件靜默的閾值。
+    # 超過此秒數沒收到任何 modifier 事件 + App active + idle → log 警告（不主動修，
+    # Layer 2 force-restart 已兜底）。純診斷用，未來看 log 趨勢決定要不要調整。
+    HOTKEY_SILENT_THRESHOLD_S = 300.0
+
     # Fix 10 / 2026-05-23：NSEvent handler 擱置的 tap 觸發輪詢間隔。
     # 詳見 _hotkey_tap / _poll_pending_tap 的 docstring（PyObjC + Tk GIL 衝突修法）。
     # 20ms 是 50 Hz 輪詢，使用者按鍵感受不到延遲；CPU 成本忽略不計。
@@ -198,6 +209,10 @@ class AppWindow(ctk.CTkFrame):
         # GIL 由 PyGILState_Ensure 拿著、安全），實際分派由 _poll_cocoa_pending_actions
         # 在 Tk mainloop iteration 跑。
         self._cocoa_pending_actions: list = []
+
+        # Fix 18 / 2026-05-23（Layer 2）：上次 force-restart NSEvent monitor 時間戳。
+        # 詳見 HOTKEY_FORCE_RESTART_INTERVAL_MS 與 _hotkey_watchdog。
+        self._last_hotkey_force_restart: float = time.monotonic()
 
         # State
         self._state:       str   = "idle"
@@ -534,18 +549,21 @@ class AppWindow(ctk.CTkFrame):
             fill="x", padx=20, pady=(6, 0)
         )
 
-        # Text area
-        self._textbox = ctk.CTkTextbox(
+        # Fix 19 Path B / 2026-05-23 — Speakly-style 獨立區塊容器。
+        # 取代原本的單一 CTkTextbox（多段累積 + 分隔線），改成 ScrollableFrame
+        # 內含一串 UtteranceBlock。每段獨立顯示時間戳、文字、per-block 動作。
+        self._blocks_container = ctk.CTkScrollableFrame(
             card,
-            font=ctk.CTkFont("SF Pro Text", 14),
-            wrap="word",
             corner_radius=0,
-            border_width=0,
             fg_color="transparent",
-            text_color=TEXT_1,
-            state="disabled",
+            scrollbar_button_color=SURF_3,
+            scrollbar_button_hover_color=SURF_4,
         )
-        self._textbox.pack(fill="both", expand=True, padx=8, pady=(4, 10))
+        self._blocks_container.pack(fill="both", expand=True, padx=8, pady=(4, 10))
+        # 區塊列表（最舊在 [0]、最新在 [-1]）
+        self._utterance_blocks: list[UtteranceBlock] = []
+        # 佔位文字（沒有任何 block 時顯示）
+        self._placeholder_label: Optional[ctk.CTkLabel] = None
         self._show_placeholder()
 
     # ── Action bar ───────────────────────────────────────────────────────────
@@ -1124,10 +1142,11 @@ class AppWindow(ctk.CTkFrame):
             self._show_toast(f"AI 潤飾失敗：{resp.error}")
             paste_text = raw_text
         else:
-            # 成功：textbox 的最新一段用潤飾版替換（textbox 此時是 Whisper 原文）
+            # 成功：把最新 block 切到潤飾版（block 自己存 raw + polished 兩份）
             polished = resp.text
             self._last_polished = polished
-            self._replace_latest_with(polished, expect_current=raw_text)
+            if self._utterance_blocks:
+                self._utterance_blocks[-1].set_polished(polished)
             self._showing_polished = True
             self._apply_toggle_style()          # 現在有潤飾版了 → 兩顆點亮
             self._title_status = f"已潤飾 · {resp.elapsed_seconds:.1f}s"
@@ -1209,44 +1228,22 @@ class AppWindow(ctk.CTkFrame):
         )
 
     def _set_showing_polished(self, show_polished: bool) -> None:
-        """切換 textbox 最新一段的顯示內容（原文 / 潤飾）。
+        """切換最新一段 block 的顯示內容（原文 / 潤飾）。
 
-        若最新段的內容與 _last_raw / _last_polished 不符（使用者手動編輯過），
-        沉默放棄切換，避免踩壞編輯。
+        Fix 19 Path B / 2026-05-23：直接呼叫 latest block 的 `set_showing_polished`，
+        block 內部會更新 label 內容與 showing_polished state。原本 textbox mark 比對
+        `expect_current` 的踩壞防護不再需要（block 自己有 raw/polished 兩個獨立欄位）。
         """
         if self._last_polished is None:
             return  # 沒有潤飾版可切
         if show_polished == self._showing_polished:
             return  # 已經是這個狀態
+        if not self._utterance_blocks:
+            return
 
-        target_text = self._last_polished if show_polished else self._last_raw
-        current_expected = self._last_raw if show_polished else self._last_polished
-        self._replace_latest_with(target_text, expect_current=current_expected)
-
+        self._utterance_blocks[-1].set_showing_polished(show_polished)
         self._showing_polished = show_polished
         self._apply_toggle_style()
-
-    def _replace_latest_with(self, new_text: str, expect_current: str) -> None:
-        """以 new_text 替換 textbox 最新一段的內容。
-
-        若 `expect_current` 與目前 mark 範圍內容不符，視為使用者已手動編輯或
-        又有新轉錄插入，放棄替換避免踩壞使用者操作。
-        """
-        try:
-            start = self._textbox.index("latest_start")
-            end   = self._textbox.index("latest_end")
-        except tk.TclError:
-            return
-        self._textbox.configure(state="normal")
-        current = self._textbox.get(start, end)
-        if current.strip() != expect_current.strip():
-            self._textbox.configure(state="disabled")
-            return
-        self._textbox.delete(start, end)
-        # 插入後 marks 會因 gravity 自動更新
-        self._textbox.insert(start, new_text)
-        self._textbox.see("latest_end")
-        self._textbox.configure(state="disabled")
 
     def _rebuild_result_title(self) -> None:
         """由 _title_base / _title_preset / _title_status 三段拼出標題。
@@ -1279,32 +1276,56 @@ class AppWindow(ctk.CTkFrame):
             self._show_toast("⌨  自動貼上失敗（請確認輔助使用權限）")
 
     def _display_result(self, result: TranscriptionResult) -> None:
-        """將轉錄結果插入 textbox，並以 tk mark 圈住最新一段供後續精準替換。"""
-        dur   = int(result.duration_seconds)
-        lang  = result.language.upper() if result.language else "?"
+        """新增一個 UtteranceBlock，取代之前在 textbox 累積插入文字的做法。
+
+        Fix 19 Path B / 2026-05-23：
+          • 每段獨立 block（時間戳 / 時長 / 文字 / 動作圖示）
+          • 自動把前一段的「最新」邊框取消
+          • 新 block pack 在底部 + 自動 scroll-to-bottom 讓使用者看到
+          • 標題仍顯示「最近一段的元資料」（時長 / 語言 / 模型）
+        """
+        dur   = float(result.duration_seconds)
+        lang  = (result.language.upper() if result.language else "?")
         model = self._model_var.get()
-        # C2：重設三段式標題狀態
-        self._title_base   = f"轉錄結果  ({dur}s · {lang} · {model})"
+        # C2：重設三段式標題狀態（以最新段為準）
+        self._title_base   = f"轉錄結果  ({int(dur)}s · {lang} · {model})"
         self._title_preset = None
         self._title_status = None
         self._rebuild_result_title()
-        self._textbox.configure(state="normal")
-        existing = self._textbox.get("1.0", "end").strip()
-        if existing and existing != "（等待第一次錄音...）":
-            self._textbox.insert("end", "\n\n─────────────\n\n")
-        if existing == "（等待第一次錄音...）":
-            self._textbox.delete("1.0", "end")
 
-        # 以 tk mark 圈住「最新一段」的起訖，之後潤飾完成時精準替換；
-        # left/right gravity 讓 mark 在插入／刪除時自動漂移到合理位置。
-        self._textbox.mark_set("latest_start", "end-1c")
-        self._textbox.mark_gravity("latest_start", "left")
-        self._textbox.insert("end", result.text)
-        self._textbox.mark_set("latest_end", "end-1c")
-        self._textbox.mark_gravity("latest_end", "right")
+        # 清掉佔位符
+        self._clear_placeholder()
 
-        self._textbox.see("end")
-        self._textbox.configure(state="disabled")
+        # 把前一段「最新」邊框取消
+        if self._utterance_blocks:
+            self._utterance_blocks[-1].highlight_as_latest(False)
+
+        # 建立新 block 並 pack 在底部
+        import datetime as _dt
+        timestamp_iso = _dt.datetime.now().strftime("%H:%M")
+        block = UtteranceBlock(
+            self._blocks_container,
+            raw_text=result.text,
+            timestamp_iso=timestamp_iso,
+            duration_s=dur,
+            language=lang,
+            model=model,
+            on_copy=self._on_block_copy,
+            on_delete=self._on_block_delete,
+        )
+        block.pack(fill="x", padx=4, pady=(0, 8))
+        block.highlight_as_latest(True)
+        self._utterance_blocks.append(block)
+
+        # 自動 scroll 到底（讓使用者看到最新一段）
+        # _parent_canvas.yview_moveto(1.0) 是 CTkScrollableFrame 的 idiom
+        # 必須延後執行，等 layout 算完高度
+        def _scroll_to_bottom():
+            try:
+                self._blocks_container._parent_canvas.yview_moveto(1.0)
+            except Exception:
+                pass
+        self.after(50, _scroll_to_bottom)
 
     # ═══════════════════════════════════════════════════════════════════════
     #  AMBIENT CHAMBER — render loop + draw + events
@@ -1594,19 +1615,84 @@ class AppWindow(ctk.CTkFrame):
             self._transition_to_processing()
 
     def _on_copy(self) -> None:
-        """複製按鈕：將目前 textbox 內容複製到剪貼簿。"""
-        text = self._get_result_text()
+        """複製按鈕：複製「最新一段」block 的目前顯示文字（原文或潤飾）。
+
+        Fix 19 Path B / 2026-05-23 — block-based 重構後不再用 Tk mark，直接從
+        `self._utterance_blocks[-1]` 取目前顯示內容。語意跟 Path A 一致：
+        每次錄完音點複製 = 拿剛剛那一段。
+        """
+        if not self._utterance_blocks:
+            log_action("copy_clicked_empty")
+            return
+        latest = self._utterance_blocks[-1]
+        text = latest.get_current_text().strip()
         if not text:
             log_action("copy_clicked_empty")
             return
         try:
             import pyperclip
             pyperclip.copy(text)
-            log_action("copy_succeeded", text_len=len(text))
-            self._show_toast("已複製到剪貼簿")
+            log_action("copy_succeeded", text_len=len(text), scope="latest_block")
+            self._show_toast("已複製最後一段")
         except Exception as e:
             log_error("copy_failed", text_len=len(text))
             self._show_toast(f"複製失敗: {e}")
+
+    def _on_block_copy(self, block: "UtteranceBlock") -> None:
+        """Per-block 複製圖示：直接複製這個 block 的目前顯示文字。"""
+        text = block.get_current_text().strip()
+        if not text:
+            return
+        try:
+            import pyperclip
+            pyperclip.copy(text)
+            log_action("copy_succeeded", text_len=len(text), scope="block")
+            self._show_toast("已複製這一段")
+        except Exception as e:
+            log_error("copy_failed", text_len=len(text))
+            self._show_toast(f"複製失敗: {e}")
+
+    def _on_block_delete(self, block: "UtteranceBlock") -> None:
+        """Per-block 刪除圖示：把這個 block 從畫面與列表中移除。
+
+        若刪掉的剛好是最新 block 且還有其他 block → 把新的「最新」標示出來、
+        重置 toggle / polish 狀態（_last_raw / _last_polished 對齊新的 latest）。
+        若刪到剩 0 個 → 顯示佔位符 + 完整重置 toggle 狀態。
+        """
+        if block not in self._utterance_blocks:
+            return
+        was_latest = (block is self._utterance_blocks[-1])
+        self._utterance_blocks.remove(block)
+        try:
+            block.destroy()
+        except Exception:
+            pass
+        log_action("block_deleted", remaining=len(self._utterance_blocks))
+
+        if not self._utterance_blocks:
+            # 全清空 → 重置標題、toggle、顯示 placeholder
+            self._title_base   = "轉錄結果"
+            self._title_preset = None
+            self._title_status = None
+            self._rebuild_result_title()
+            self._last_raw         = ""
+            self._last_llm_input   = None
+            self._last_polished    = None
+            self._showing_polished = True
+            self._apply_toggle_style()
+            self._show_placeholder()
+            return
+
+        if was_latest:
+            # 新的最新一段 = 之前的倒數第二段
+            new_latest = self._utterance_blocks[-1]
+            for b in self._utterance_blocks:
+                b.highlight_as_latest(b is new_latest)
+            # toggle / polish 狀態跟著對齊新的 latest
+            self._last_raw         = new_latest.raw_text
+            self._last_polished    = new_latest.polished_text
+            self._showing_polished = new_latest.showing_polished
+            self._apply_toggle_style()
 
     def _on_save(self) -> None:
         """存檔按鈕：開啟 Save As 對話框，將結果寫成 .txt 檔。"""
@@ -1632,11 +1718,15 @@ class AppWindow(ctk.CTkFrame):
             log_action("save_cancelled")
 
     def _on_clear(self) -> None:
-        """清除按鈕：清空 textbox，重置三段式標題與 toggle 狀態，顯示佔位符。"""
-        log_action("clear_clicked")
-        self._textbox.configure(state="normal")
-        self._textbox.delete("1.0", "end")
-        self._textbox.configure(state="disabled")
+        """清除按鈕：銷毀所有 UtteranceBlock、重置標題與 toggle、顯示佔位符。"""
+        log_action("clear_clicked", blocks_cleared=len(self._utterance_blocks))
+        # 銷毀所有 block 並清空列表
+        for b in list(self._utterance_blocks):
+            try:
+                b.destroy()
+            except Exception:
+                pass
+        self._utterance_blocks.clear()
         # 重置三段式標題
         self._title_base   = "轉錄結果"
         self._title_preset = None
@@ -1667,7 +1757,13 @@ class AppWindow(ctk.CTkFrame):
         self._show_toast("自動貼上已開啟" if on else "自動貼上已關閉")
 
     def _on_ollama(self) -> None:
-        """手動按「潤飾」鈕：對目前 textbox 內容執行一次潤飾。"""
+        """手動按「潤飾」鈕：對「最新一段 block」執行一次潤飾。
+
+        Fix 19 Path B / 2026-05-23 行為微調：原本「整坨結果替換」在 block 化
+        UI 之後失去意義（沒有單一 textbox 可整坨替換）。改成跟 auto-polish
+        一致 → 對最新 block 的 raw_text 跑潤飾、結果寫進該 block 的 polished_text。
+        舊段落不動。
+        """
         if not self.cfg.ollama_enabled:
             log_action("ollama_clicked_disabled")
             self._show_toast("AI 潤飾未啟用，請到「設定」開啟")
@@ -1675,19 +1771,22 @@ class AppWindow(ctk.CTkFrame):
         if self.ollama.health_ok is False:
             log_action("ollama_clicked_offline")
             self._show_toast("無法連線 Ollama 服務，請確認 ollama serve 已啟動")
-            # 重新探一次，下次點擊就能反映最新狀態
             self._refresh_ollama_health()
             return
         if self._polish_busy:
             log_action("ollama_clicked_busy")
             self._show_toast("目前已在潤飾中，請稍候…")
             return
+        if not self._utterance_blocks:
+            log_action("ollama_clicked_empty")
+            return
 
-        text = self._get_result_text()
+        latest = self._utterance_blocks[-1]
+        text = latest.raw_text.strip()
         if not text:
             log_action("ollama_clicked_empty")
             return
-        log_action("ollama_clicked", text_len=len(text))
+        log_action("ollama_clicked", text_len=len(text), scope="latest_block")
 
         self._ollama_btn.configure(state="disabled", text="處理中…")
         self._polish_busy = True
@@ -1706,11 +1805,12 @@ class AppWindow(ctk.CTkFrame):
             if result.error:
                 self._show_toast(f"AI 潤飾失敗：{result.error}")
                 return
-            # 整段覆蓋（手動潤飾情境下，使用者就是要整坨結果被替換）
-            self._textbox.configure(state="normal")
-            self._textbox.delete("1.0", "end")
-            self._textbox.insert("end", result.text)
-            self._textbox.configure(state="disabled")
+            # 把潤飾版寫進最新 block；toggle chip 自動點亮
+            if self._utterance_blocks:
+                self._utterance_blocks[-1].set_polished(result.text)
+                self._last_polished    = result.text
+                self._showing_polished = True
+                self._apply_toggle_style()
             self._show_toast(f"AI 潤飾完成 · {result.elapsed_seconds:.1f}s")
 
         threading.Thread(target=_run, daemon=True).start()
@@ -1856,11 +1956,34 @@ class AppWindow(ctk.CTkFrame):
         self._last_llm_input   = None
         self._last_polished    = None
         self._showing_polished = True
-        # textbox 換成舊的原文（讓 _finish_polish 的 expect_current 比對過）
-        self._textbox.configure(state="normal")
-        self._textbox.delete("1.0", "end")
-        self._textbox.insert("1.0", entry.raw_text)
-        self._textbox.configure(state="disabled")
+
+        # Fix 19 Path B / 2026-05-23：把歷史原文當成一個新 block append 進結果區，
+        # _finish_polish 完成時會更新「最新 block」（= 剛 append 的這個）的 polished_text。
+        # 之前是塞回 textbox 整坨清空再 insert；block 化後改成 append + 標示最新。
+        self._clear_placeholder()
+        if self._utterance_blocks:
+            self._utterance_blocks[-1].highlight_as_latest(False)
+
+        import datetime as _dt
+        try:
+            ts = _dt.datetime.fromtimestamp(entry.timestamp).strftime("%H:%M")
+        except Exception:
+            ts = _dt.datetime.now().strftime("%H:%M")
+        block = UtteranceBlock(
+            self._blocks_container,
+            raw_text=entry.raw_text,
+            timestamp_iso=f"{ts} (history)",
+            duration_s=float(entry.duration_s or 0.0),
+            language=entry.language or "?",
+            model=entry.model_whisper or "?",
+            on_copy=self._on_block_copy,
+            on_delete=self._on_block_delete,
+        )
+        block.pack(fill="x", padx=4, pady=(0, 8))
+        block.highlight_as_latest(True)
+        self._utterance_blocks.append(block)
+        self.after(50, lambda: self._blocks_container._parent_canvas.yview_moveto(1.0))
+
         self._apply_toggle_style()
         self._frontmost_app = entry.target_app   # 讓 preset 路由走原本的 app
 
@@ -2008,6 +2131,49 @@ class AppWindow(ctk.CTkFrame):
                 log.warning("HOTKEY: watchdog restarting NSEvent monitor (reason=monitor_missing)")
                 log_action("hotkey_listener_auto_restarted", reason="monitor_missing")
                 mgr.restart(self.cfg.hotkey)
+                self._last_hotkey_force_restart = time.monotonic()
+            else:
+                now = time.monotonic()
+
+                # Fix 18 / 2026-05-23（Layer 2）：每 10 分鐘 force-restart。
+                # 實機觀察：閒置 ~60 min 後 NSEvent monitor 物件仍 alive 但 ObjC
+                # block 失效，handler 收不到事件。watchdog 用 is_not_None 偵測不到。
+                # 唯一可靠的修法是定時 force restart。state guard：錄音中跳過，
+                # 避免 50ms restart window 吞掉使用者的 stop tap。
+                since_restart = now - self._last_hotkey_force_restart
+                if (
+                    self._state == "idle"
+                    and since_restart * 1000.0 > self.HOTKEY_FORCE_RESTART_INTERVAL_MS
+                ):
+                    log.info(
+                        f"HOTKEY: watchdog force-restart (reason=periodic, "
+                        f"since_last={since_restart:.0f}s)"
+                    )
+                    log_action("hotkey_listener_auto_restarted", reason="periodic")
+                    mgr.restart(self.cfg.hotkey)
+                    self._last_hotkey_force_restart = now
+
+                # Fix 18 / 2026-05-23（Layer 3）：靜默偵測（純診斷 log）。
+                # monitor 物件還在但 5 分鐘沒任何事件 + idle → 嫌疑 H1/H2 發生中。
+                # 不主動修復（Layer 2 兜底），只記錄供未來 log 分析。每次符合
+                # 條件都 log 太吵 → 5 分鐘節流（per watchdog cycle 觸發一次即可）。
+                last_event_at = getattr(mgr, "_last_event_at", 0.0)
+                if (
+                    last_event_at > 0
+                    and self._state == "idle"
+                ):
+                    silence_s = now - last_event_at
+                    if (
+                        silence_s > self.HOTKEY_SILENT_THRESHOLD_S
+                        and silence_s % self.HOTKEY_SILENT_THRESHOLD_S < (
+                            self.HOTKEY_WATCHDOG_INTERVAL_MS / 1000.0
+                        )
+                    ):
+                        log.info(
+                            f"HOTKEY: diagnostic — monitor alive but silent "
+                            f"for {silence_s:.0f}s (Layer 2 will force-restart at "
+                            f"{self.HOTKEY_FORCE_RESTART_INTERVAL_MS / 1000.0:.0f}s)"
+                        )
         except Exception:
             log_error("hotkey_watchdog_failed")
         finally:
@@ -2284,16 +2450,31 @@ class AppWindow(ctk.CTkFrame):
         threading.Thread(target=_load, daemon=True).start()
 
     def _show_placeholder(self) -> None:
-        """若 textbox 為空，插入佔位符文字。"""
-        self._textbox.configure(state="normal")
-        if not self._textbox.get("1.0", "end").strip():
-            self._textbox.insert("1.0", "（等待第一次錄音...）")
-        self._textbox.configure(state="disabled")
+        """沒有任何 UtteranceBlock 時，顯示置中的佔位符 label。"""
+        if self._placeholder_label is not None or self._utterance_blocks:
+            return
+        self._placeholder_label = ctk.CTkLabel(
+            self._blocks_container,
+            text="（等待第一次錄音...）",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 14),
+            text_color=TEXT_4,
+        )
+        self._placeholder_label.pack(pady=40)
+
+    def _clear_placeholder(self) -> None:
+        """新增 block 之前清掉佔位符。"""
+        if self._placeholder_label is not None:
+            try:
+                self._placeholder_label.destroy()
+            except Exception:
+                pass
+            self._placeholder_label = None
 
     def _get_result_text(self) -> str:
-        """取得 textbox 的有效文字；佔位符或空白回傳空字串。"""
-        t = self._textbox.get("1.0", "end").strip()
-        return "" if t == "（等待第一次錄音...）" else t
+        """所有 block 串接（換行分隔）；給「存檔」用。"""
+        if not self._utterance_blocks:
+            return ""
+        return "\n\n".join(b.get_current_text() for b in self._utterance_blocks)
 
     def _show_toast(self, message: str) -> None:
         """在視窗右下角顯示一個浮動 toast，2.8 秒後自動消失。"""
@@ -3759,6 +3940,140 @@ def _walk_children(widget):
     for child in widget.winfo_children():
         yield child
         yield from _walk_children(child)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  UtteranceBlock（Fix 19 Path B / 2026-05-23）— Speakly-style 獨立段落區塊
+# ─────────────────────────────────────────────────────────────────────────────
+
+class UtteranceBlock(ctk.CTkFrame):
+    """單一語音段的視覺容器（Speakly 風格獨立 block）。
+
+    每個 block 顯示一段轉錄結果，含時間戳、時長、語言/模型、文字、
+    per-block 動作圖示（複製 / 刪除）。最新 block 由 AppWindow 標示
+    （邊框 ACCENT）；舊 block 邊框灰色。
+
+    原文 / 潤飾 toggle 仍由 AppWindow 頂部 chip 全域控制（操作最新 block），
+    但 polished_text 與 raw_text 都存在 block 自己，舊 block 切換時的狀態被
+    凍結保留（PR #14 之後若需要 per-block toggle，加 hover-only 圖示即可）。
+    """
+
+    HEADER_ICON_SIZE = 14
+
+    def __init__(
+        self,
+        master,
+        *,
+        raw_text: str,
+        timestamp_iso: str,
+        duration_s: float,
+        language: str,
+        model: str,
+        on_copy,
+        on_delete,
+        wraplength: int = 600,
+    ) -> None:
+        super().__init__(
+            master, corner_radius=10,
+            fg_color=SURF_1,
+            border_width=1, border_color=SURF_3,
+        )
+        # State
+        self.raw_text: str = raw_text
+        self.polished_text: Optional[str] = None
+        self.showing_polished: bool = False
+        self.timestamp_iso = timestamp_iso
+        self.duration_s = duration_s
+        self.language = language
+        self.model = model
+        self._on_copy = on_copy
+        self._on_delete = on_delete
+        self._wraplength = wraplength
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        # Header row：時間戳 + 元資料 | 動作圖示
+        hdr = ctk.CTkFrame(self, fg_color="transparent")
+        hdr.pack(fill="x", padx=SPACE_MD, pady=(SPACE_SM, 2))
+
+        meta_text = (
+            f"{self.timestamp_iso}  ·  {self.duration_s:.1f}s  ·  "
+            f"{self.language.upper() if self.language else '?'}  ·  {self.model}"
+        )
+        ctk.CTkLabel(
+            hdr, text=meta_text,
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 11),
+            text_color=TEXT_3,
+            anchor="w",
+        ).pack(side="left")
+
+        # 動作圖示在右側
+        actions = ctk.CTkFrame(hdr, fg_color="transparent")
+        actions.pack(side="right")
+        btn_common = dict(
+            text="", width=24, height=24, corner_radius=4,
+            fg_color="transparent",
+            hover_color=SURF_2,
+            border_width=0,
+        )
+        ctk.CTkButton(
+            actions,
+            image=get_icon("copy", self.HEADER_ICON_SIZE, TEXT_3),
+            command=lambda: self._on_copy(self),
+            **btn_common,
+        ).pack(side="left", padx=1)
+        ctk.CTkButton(
+            actions,
+            image=get_icon("x", self.HEADER_ICON_SIZE, TEXT_3),
+            command=lambda: self._on_delete(self),
+            **btn_common,
+        ).pack(side="left", padx=1)
+
+        # Body：文字顯示
+        self._text_label = ctk.CTkLabel(
+            self, text=self.raw_text,
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 14),
+            text_color=TEXT_1,
+            justify="left", anchor="w",
+            wraplength=self._wraplength,
+        )
+        self._text_label.pack(
+            fill="x", padx=SPACE_MD, pady=(0, SPACE_MD),
+        )
+
+    # ── 對外 API ──────────────────────────────────────────────────────────
+
+    def get_current_text(self) -> str:
+        """目前顯示的文字（依 showing_polished 決定 raw / polished）。"""
+        if self.showing_polished and self.polished_text is not None:
+            return self.polished_text
+        return self.raw_text
+
+    def set_polished(self, polished_text: str) -> None:
+        """寫入潤飾版並切換顯示為潤飾版。"""
+        self.polished_text = polished_text
+        self.showing_polished = True
+        self._text_label.configure(text=polished_text)
+
+    def set_showing_polished(self, show_polished: bool) -> None:
+        """切換顯示原文 / 潤飾版；無潤飾版時 noop。"""
+        if self.polished_text is None:
+            return
+        if show_polished == self.showing_polished:
+            return
+        self.showing_polished = show_polished
+        self._text_label.configure(text=self.get_current_text())
+
+    def highlight_as_latest(self, is_latest: bool) -> None:
+        """視覺標示「我是最新一段」（邊框色變化）。"""
+        self.configure(
+            border_color=(ACCENT if is_latest else SURF_3),
+        )
+
+    def update_wraplength(self, new_wraplength: int) -> None:
+        """視窗 resize 時呼叫，讓文字 wrap 寬度跟著變。"""
+        self._wraplength = new_wraplength
+        self._text_label.configure(wraplength=new_wraplength)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

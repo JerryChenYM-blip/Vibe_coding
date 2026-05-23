@@ -420,6 +420,14 @@ class HotkeyManager:
         self._last_event_at:   float = 0.0           # 最後一次事件的時間戳
         self._monitor_global = None                    # NSEvent 後端：其他 App focus 時收事件
         self._monitor_local  = None                    # NSEvent 後端：本 App focus 時收事件
+        # Fix 18 / 2026-05-23（Layer 1）：handler bound method 強引用。
+        # 之前直接 `self._on_ns_event_global` 傳給 addGlobalMonitor*，那是 transient
+        # bound method object，每次 access 都 re-create；PyObjC bridge 可能無法保證
+        # 跨 Python GC 週期存活，閒置 60+ min 後 GC 觸發 → block 指向已釋放 callable
+        # → 事件抵達但 silent noop（log 完全沒紀錄，watchdog 偵測不到因為
+        # _monitor_global is not None 仍成立）。改成 instance attr 強引用根治。
+        self._ns_handler_global = None
+        self._ns_handler_local  = None
         self._backend:       str = "none"              # "nsevent" / "none"
         self._lock = threading.Lock()
         # Fix 9 / 2026-05-22（P1-A）：FlagsChanged 專用「sided keycode hold」集合。
@@ -498,12 +506,16 @@ class HotkeyManager:
             | NSEventMaskKeyDown
             | NSEventMaskKeyUp
         )
+        # Fix 18 / 2026-05-23（Layer 1）：先把 bound method 存成 instance attribute
+        # 強引用，再傳給 AppKit。詳見 __init__ 註解。
+        self._ns_handler_global = self._on_ns_event_global
+        self._ns_handler_local  = self._on_ns_event_local
         self._monitor_global = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
-            mask, self._on_ns_event_global,
+            mask, self._ns_handler_global,
         )
         # Local monitor：回傳 event 讓事件繼續傳遞給 Tk；回傳 None 會吃掉事件。
         self._monitor_local = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
-            mask, self._on_ns_event_local,
+            mask, self._ns_handler_local,
         )
 
     def _on_ns_event_global(self, event) -> None:
@@ -608,6 +620,9 @@ class HotkeyManager:
             mon_local        = self._monitor_local
             self._monitor_global  = None
             self._monitor_local   = None
+            # Fix 18 / 2026-05-23（Layer 1）：清空 handler 強引用
+            self._ns_handler_global = None
+            self._ns_handler_local  = None
             self._pressed.clear()
             self._ns_held_modifiers.clear()
             self._combo_active = False
