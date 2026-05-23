@@ -186,6 +186,11 @@ class Transcriber:
         self._lock               = threading.Lock()  # 保護模型載入（防止並行載入兩次）
         self._transcription_lock = threading.Lock()  # 防止同時進行兩個轉錄任務
         self._dictionary_terms:  list[str] = []     # 個人字典術語列表
+        # D2-S3（v2.9.0）：保護 _dictionary_terms 的 reassign 與 snapshot。
+        # transcribe() 入口 acquire 一次取 snapshot 給整次推論用，避免
+        # 推論跑時 user 改字典 + hot reload 觸發、TypeError fallback path
+        # 第二次讀 `self._dictionary_terms` 拿到不一致的狀態。
+        self._dictionary_lock    = threading.Lock()
 
     def set_dictionary_terms(self, terms: list[str]) -> None:
         """更新個人字典術語列表，下次 transcribe() 時注入 initial_prompt。
@@ -193,15 +198,33 @@ class Transcriber:
         Args:
             terms: 術語字串列表，例如 ["Kubernetes", "Whisper Pro"]。
         """
-        self._dictionary_terms = list(terms) if terms else []
+        with self._dictionary_lock:
+            self._dictionary_terms = list(terms) if terms else []
 
-    def _build_initial_prompt(self) -> str:
+    def _snapshot_dictionary_terms(self) -> list[str]:
+        """D2-S3：lock 內取 _dictionary_terms 的淺拷貝快照。
+
+        transcribe() 入口呼叫一次，整次推論都用同一份 snapshot，
+        確保 MLX / CTranslate2 兩次 _build_initial_prompt（try + TypeError
+        fallback）拿到的字典完全一致、不受 mid-flight set_dictionary_terms 影響。
+        """
+        with self._dictionary_lock:
+            return list(self._dictionary_terms)
+
+    def _build_initial_prompt(self, terms: Optional[list[str]] = None) -> str:
         """動態組合傳給 Whisper 的 initial_prompt（支援 prompts.py 熱重載）。
 
         每次轉錄前呼叫，確保 prompt_reloader 重載後的新 prompt 立即生效。
+
+        Args:
+            terms: 字典術語 snapshot。None 時 fallback 讀 `self._dictionary_terms`
+                   （給 warmup 等不需要 snapshot 的呼叫路徑）。
+                   transcribe 路徑必須傳 snapshot（D2-S3）。
         """
+        if terms is None:
+            terms = self._dictionary_terms
         try:
-            return prompts.format_whisper_prompt(self._dictionary_terms)
+            return prompts.format_whisper_prompt(terms)
         except Exception:
             log_error("format_whisper_prompt_failed")
             return prompts.WHISPER_INITIAL_PROMPT   # 降級回基礎 prompt
@@ -269,17 +292,22 @@ class Transcriber:
                 elapsed_seconds=time.perf_counter() - t0,
             )
 
+        # D2-S3（v2.9.0）：入口 snapshot dictionary terms，整次推論用同一份。
+        # 避免 transcribe 跑 ~3s 間 user 改字典 + hot reload → fallback 路徑
+        # 拿到不一致字典，或 MLX → CTranslate fallback 時兩個後端用不同字典。
+        dict_terms_snapshot = self._snapshot_dictionary_terms()
+
         # 依後端分發推論
         if BACKEND == "mlx":
             try:
-                result = self._transcribe_mlx(audio, model_size, language)
+                result = self._transcribe_mlx(audio, model_size, language, dict_terms_snapshot)
             except Exception:
                 # MLX 失敗時降級到 CPU，確保功能不中斷
                 log_error("mlx_backend_failed", model=model_size)
                 log.warning("WHISPER: Falling back to CPU CTranslate2 backend.")
-                result = self._transcribe_ctranslate(audio, model_size, language)
+                result = self._transcribe_ctranslate(audio, model_size, language, dict_terms_snapshot)
         else:
-            result = self._transcribe_ctranslate(audio, model_size, language)
+            result = self._transcribe_ctranslate(audio, model_size, language, dict_terms_snapshot)
 
         # 填入實際的音訊長度與推論耗時（兩個後端的 _transcribe_* 不填這兩欄）
         result.duration_seconds = duration
@@ -356,12 +384,15 @@ class Transcriber:
         # 用 "small" 模型做快速推論（在此場景下 small 的速度/品質比最佳）
         model = self._ensure_model("small")
 
+        # D2-S3：snapshot dict 鎖在當下狀態（streaming 路徑同樣保護）
+        initial_prompt = self._build_initial_prompt(self._snapshot_dictionary_terms())
+
         with self._transcription_lock:
             segments_iter, info = model.transcribe(
                 audio,
                 language=language,
                 beam_size=1,                              # 貪婪解碼，最快
-                initial_prompt=self._build_initial_prompt(),
+                initial_prompt=initial_prompt,
                 condition_on_previous_text=False,         # 不依賴前文，避免幻覺傳播
                 vad_filter=True,                          # 內建 VAD 過濾靜音
                 # 寬鬆 VAD：threshold 降低讓小聲也偵測到；silence 拉長避免句中停頓
@@ -486,6 +517,7 @@ class Transcriber:
         audio,
         model_size: str,
         language: Optional[str],
+        dict_terms: Optional[list[str]] = None,   # D2-S3：dict snapshot
     ) -> TranscriptionResult:
         """使用 mlx-whisper 進行推論（Metal GPU 加速）。
 
@@ -517,6 +549,10 @@ class Transcriber:
                 "condition_on_previous_text": False,
             }
 
+        # D2-S3：build initial_prompt 用入口 snapshot；try + TypeError fallback
+        # 都用同一份 prompt string、保證一致
+        initial_prompt = self._build_initial_prompt(dict_terms)
+
         with self._transcription_lock:
             try:
                 try:
@@ -524,7 +560,7 @@ class Transcriber:
                         audio,
                         path_or_hf_repo=hf_repo,
                         language=language,
-                        initial_prompt=self._build_initial_prompt(),
+                        initial_prompt=initial_prompt,
                         verbose=False,
                         **short_kwargs,
                     )
@@ -539,7 +575,7 @@ class Transcriber:
                         audio,
                         path_or_hf_repo=hf_repo,
                         language=language,
-                        initial_prompt=self._build_initial_prompt(),
+                        initial_prompt=initial_prompt,
                         verbose=False,
                     )
             except Exception as e:
@@ -583,6 +619,7 @@ class Transcriber:
         audio,
         model_size: str,
         language: Optional[str],
+        dict_terms: Optional[list[str]] = None,   # D2-S3：dict snapshot
     ) -> TranscriptionResult:
         """使用 faster-whisper（CTranslate2）進行 CPU int8 推論。"""
         model = self._ensure_model(model_size)
@@ -592,13 +629,16 @@ class Transcriber:
         # start 造成 cascading error。
         long_audio = len(audio) >= 30 * 16_000
 
+        # D2-S3：snapshot dictionary terms → initial_prompt 鎖在當下狀態
+        initial_prompt = self._build_initial_prompt(dict_terms)
+
         with self._transcription_lock:
             segments_iter, info = model.transcribe(
                 audio,
                 language=language,
                 beam_size=5,               # beam 越大越準，但越慢
                 repetition_penalty=1.1,    # 輕微懲罰重複，抑制幻覺循環
-                initial_prompt=self._build_initial_prompt(),
+                initial_prompt=initial_prompt,
                 condition_on_previous_text=long_audio,   # 長音訊才依賴前文
                 vad_filter=True,           # 內建 VAD，過濾靜音段落
                 # 寬鬆 VAD — 避免漏字/漏段：

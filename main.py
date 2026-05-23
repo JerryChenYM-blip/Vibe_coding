@@ -235,9 +235,21 @@ def main() -> None:
     root.withdraw()
     try:
         from splash import SplashScreen
+
+        # D4-S4（v2.9.0）：splash 顯示期間（1.5s + 200ms fade）user 若 ⌘Q，
+        # root 會被銷毀；splash callback 對已銷毀 root 跑 deiconify 會拋
+        # TclError。winfo_exists 檢查避免 log_error 噪音與潛在 race。
+        def _splash_done():
+            try:
+                if root.winfo_exists():
+                    root.deiconify()
+                    root.lift()
+            except Exception:
+                log_error("splash_on_done_root_destroyed")
+
         SplashScreen(
             root,
-            on_done=lambda: (root.deiconify(), root.lift()),
+            on_done=_splash_done,
             version=f"v{__version__}",
         )
     except Exception:

@@ -820,3 +820,154 @@ def test_a3_resolve_reduce_motion_unknown_falls_back_to_auto(monkeypatch):
     monkeypatch.setattr(gui, "system_reduce_motion", lambda: False)
     assert gui.resolve_reduce_motion("bogus_value") is False
     assert gui.resolve_reduce_motion("") is False
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# v2.9.0 — D2-S1 / D2-S3 / D4-S4 regression tests
+# ═════════════════════════════════════════════════════════════════════════════
+
+# D2-S1: PortAudio stale callback 不應寫到下一段已重置的 buffer
+
+def test_d2s1_stale_callback_does_not_write_to_new_buffer():
+    """D2-S1（v2.9.0）：start() bump generation 後，舊段 in-flight callback 不該
+    把 frames 寫進新段已重置的 _frames。"""
+    from recorder import AudioRecorder
+    import numpy as np
+
+    rec = AudioRecorder()
+    # 模擬第 1 段 start：generation 變 1
+    rec._capture_gen = 0
+    rec._is_recording = True
+    # 第 1 段的 callback 拿到 gen=1（仍 match）
+    chunk1 = np.ones((1600, 1), dtype=np.float32) * 0.1
+    rec._audio_callback(chunk1, 1600, None, None, gen=1)
+    rec._capture_gen = 1  # start() 內 bump 後的值（模擬第 1 段 start 完成）
+    # 第 1 段「正常的」callback（gen=1 與 _capture_gen 同步）
+    rec._audio_callback(chunk1, 1600, None, None, gen=1)
+    assert len(rec._frames) == 1, "正常 callback 應寫入"
+
+    # 模擬 stop() 跑：bump generation 但 in-flight 的 stale callback 還在路上
+    rec._is_recording = False
+    rec._capture_gen = 2
+
+    # 模擬第 2 段 start：reset frames、再次 bump
+    rec._frames = []
+    rec._capture_gen = 3
+    rec._is_recording = True
+
+    # 第 1 段尾巴的 stale callback（gen=1）此時才被 PortAudio dispatch
+    rec._audio_callback(chunk1, 1600, None, None, gen=1)
+    assert len(rec._frames) == 0, (
+        f"stale callback (gen=1) 不應寫進第 2 段 buffer (current gen=3)；"
+        f"實際拿到 {len(rec._frames)} frames"
+    )
+
+
+def test_d2s1_stale_callback_does_not_update_rms():
+    """D2-S1：stale callback 不更新 _rms_level，避免上一段尾音的音量殘留 UI。"""
+    from recorder import AudioRecorder
+    import numpy as np
+
+    rec = AudioRecorder()
+    rec._capture_gen = 5
+    rec._is_recording = True
+    rec._rms_level = 0.0
+    # stale gen=3，current gen=5 → 不該動 RMS
+    chunk = np.ones((1600, 1), dtype=np.float32) * 0.5
+    rec._audio_callback(chunk, 1600, None, None, gen=3)
+    assert rec._rms_level == 0.0
+
+
+# D2-S3: dictionary snapshot 在 transcribe 入口取一次，mid-flight 修改不影響當次
+
+def test_d2s3_dict_snapshot_locks_terms_for_one_transcribe():
+    """D2-S3（v2.9.0）：transcribe 入口 snapshot dict terms。
+    snapshot 後改字典不影響該次推論。"""
+    from transcriber import Transcriber
+
+    tr = Transcriber()
+    tr.set_dictionary_terms(["Kubernetes", "Whisper"])
+
+    # snapshot → 拿到當下的 list copy
+    snap = tr._snapshot_dictionary_terms()
+    assert snap == ["Kubernetes", "Whisper"]
+
+    # 後續改字典不該影響已取的 snapshot
+    tr.set_dictionary_terms(["AWS"])
+    assert snap == ["Kubernetes", "Whisper"], "snapshot 應該是獨立 copy"
+    # 新 snapshot 反映新值
+    new_snap = tr._snapshot_dictionary_terms()
+    assert new_snap == ["AWS"]
+
+
+def test_d2s3_build_initial_prompt_uses_passed_terms_not_current_state():
+    """D2-S3：_build_initial_prompt(terms=...) 用傳入 snapshot，不讀 self._dictionary_terms。
+    驗證 try + TypeError fallback 兩個 call 都會拿到一致的 prompt。"""
+    from transcriber import Transcriber
+
+    tr = Transcriber()
+    tr.set_dictionary_terms(["initial_term"])
+
+    snap = tr._snapshot_dictionary_terms()
+    # 模擬 mid-flight 改字典
+    tr.set_dictionary_terms(["mid_flight_change"])
+
+    # _build_initial_prompt(snap) 應該用 snap 而非當下的 _dictionary_terms
+    prompt = tr._build_initial_prompt(snap)
+    assert "initial_term" in prompt or "initial_term" in str(prompt), (
+        f"prompt 應該含 snapshot 內容 'initial_term'，實際拿到：{prompt!r}"
+    )
+    # 一定不該漏進新加的字
+    assert "mid_flight_change" not in prompt
+
+
+def test_d2s3_set_dictionary_terms_acquires_lock():
+    """D2-S3：set_dictionary_terms 用 _dictionary_lock 保護 reassign。"""
+    from transcriber import Transcriber
+    tr = Transcriber()
+    # lock 必須存在且 acquirable
+    assert tr._dictionary_lock.acquire(blocking=False)
+    tr._dictionary_lock.release()
+    # set_dictionary_terms 內 acquire；不會 deadlock（用 Lock 不是 RLock 也 OK，
+    # 因為只在 _dictionary_lock 內做 list reassign，不會 reentrant call）
+    tr.set_dictionary_terms(["a", "b"])
+    assert tr._dictionary_terms == ["a", "b"]
+
+
+# D4-S4: Splash fade_tick 偵測 root 已銷毀 → 直接收尾、不再排程
+
+def test_d4s4_splash_fade_tick_detects_destroyed_root():
+    """D4-S4（v2.9.0）：root 銷毀後 winfo_exists 回 False，fade_tick 應直接
+    mark _closed=True return，不再排程下一個 tick、不再呼叫 attributes。"""
+    from splash import SplashScreen
+    splash = SplashScreen.__new__(SplashScreen)
+    splash._closed = False
+    splash._fade_step = 0
+    splash._on_done = MagicMock()
+
+    # 模擬 winfo_exists 回 False（root 已銷毀）
+    splash.winfo_exists = MagicMock(return_value=False)
+    splash.attributes = MagicMock()  # 不該被呼叫
+    splash.after = MagicMock()       # 不該被呼叫
+
+    splash._fade_tick()
+    assert splash._closed is True
+    splash.attributes.assert_not_called()
+    splash.after.assert_not_called()
+
+
+def test_d4s4_splash_fade_tick_winfo_exists_exception_also_safe():
+    """D4-S4：winfo_exists 本身拋例外（極端 race）也該安全 mark closed return。"""
+    from splash import SplashScreen
+    splash = SplashScreen.__new__(SplashScreen)
+    splash._closed = False
+    splash._fade_step = 0
+
+    splash.winfo_exists = MagicMock(side_effect=RuntimeError("destroyed"))
+    splash.attributes = MagicMock()
+    splash.after = MagicMock()
+
+    splash._fade_tick()   # 不應拋
+    assert splash._closed is True
+    splash.attributes.assert_not_called()
+    splash.after.assert_not_called()
