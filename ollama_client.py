@@ -79,10 +79,17 @@ class OllamaResponse:
 class OllamaClient:
     """執行緒安全的 Ollama HTTP 客戶端。"""
 
+    # D5-S7（v2.10.0 / 2026-05-23）：health cache TTL（秒）
+    # 預設 30s——平衡「不要每秒 ping、也不要長時間 stale」。Ollama 服務
+    # 通常 start/stop 後 user 不會立刻錄音，30s 內若有狀態改變下次自然 expire。
+    HEALTH_TTL_SEC = 30.0
+
     def __init__(self, config: Optional[OllamaConfig] = None) -> None:
         self.config = config or OllamaConfig()
         self._session = requests.Session()
         self._health_ok: Optional[bool] = None
+        # D5-S7：cache 寫入時間。read 時若超過 TTL 視為過期、強制重 check。
+        self._health_cached_at: float = 0.0
         self._health_lock = threading.Lock()
 
     # ── 設定同步 ─────────────────────────────────────────────────────────────
@@ -113,13 +120,20 @@ class OllamaClient:
 
     @property
     def health_ok(self) -> Optional[bool]:
+        """讀 cached health 狀態。D5-S7：超過 TTL 視為 None（強制重 check）。"""
         with self._health_lock:
+            if self._health_ok is None:
+                return None
+            # D5-S7：cache 過期 → 視同未知，呼叫端應 trigger re-check
+            if (time.monotonic() - self._health_cached_at) > self.HEALTH_TTL_SEC:
+                return None
             return self._health_ok
 
     def health_check_sync(self) -> bool:
         if not self.config.enabled:
             with self._health_lock:
                 self._health_ok = False
+                self._health_cached_at = time.monotonic()
             return False
         try:
             resp = self._session.get(
@@ -134,6 +148,7 @@ class OllamaClient:
             ok = False
         with self._health_lock:
             self._health_ok = ok
+            self._health_cached_at = time.monotonic()   # D5-S7：戳新時間
         return ok
 
     def health_check_async(
