@@ -11,14 +11,35 @@ Prompt 熱重載（#2）。
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import os
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 _POLL_INTERVAL_SEC = 2.0
+
+# Fix Cluster E / 2026-05-23：reload 與讀取 prompts.X 同步用的 RLock。
+# `importlib.reload(mod)` 不是 atomic — 中途 module attribute 可能不一致或
+# 短暫 AttributeError。Consumer（ollama_client）讀 prompts.ATTR 時用 `reload_lock()`
+# context manager 互斥；reload 期間 consumer 短暫阻塞、reload 完成才繼續。
+_RELOAD_LOCK = threading.RLock()
+
+
+@contextlib.contextmanager
+def reload_lock() -> Iterator[None]:
+    """Consumer 讀 prompts.X 時包這個 context manager、與 reload 互斥。
+
+    用 RLock 而非 Lock：reload_one 自己也呼叫 on_reload callback、callback 內若也
+    讀 prompts.X 不會自鎖死。
+    """
+    _RELOAD_LOCK.acquire()
+    try:
+        yield
+    finally:
+        _RELOAD_LOCK.release()
 
 
 class PromptReloader:
@@ -90,16 +111,18 @@ class PromptReloader:
                     self._mtimes[name] = mtime
 
     def _reload_one(self, name: str) -> bool:
-        try:
-            mod = importlib.import_module(name)
-            importlib.reload(mod)
-            print(f"PROMPT_RELOADER: reloaded {name}")
-            if self._on_reload is not None:
-                try:
-                    self._on_reload(name)
-                except Exception as e:
-                    print(f"PROMPT_RELOADER: on_reload callback error: {e}")
-            return True
-        except Exception as e:
-            print(f"PROMPT_RELOADER: reload {name} failed: {e}")
-            return False
+        # Cluster E：reload 期間鎖住，讓 consumer（ollama_client）讀 prompts.X 等
+        with _RELOAD_LOCK:
+            try:
+                mod = importlib.import_module(name)
+                importlib.reload(mod)
+                print(f"PROMPT_RELOADER: reloaded {name}")
+                if self._on_reload is not None:
+                    try:
+                        self._on_reload(name)
+                    except Exception as e:
+                        print(f"PROMPT_RELOADER: on_reload callback error: {e}")
+                return True
+            except Exception as e:
+                print(f"PROMPT_RELOADER: reload {name} failed: {e}")
+                return False

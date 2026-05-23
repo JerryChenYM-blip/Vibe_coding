@@ -186,6 +186,10 @@ def _make_stub_appwindow_for_watchdog():
     win.hotkey_mgr._monitor_global = object()
     win.hotkey_mgr._monitor_local  = object()
     win.hotkey_mgr._last_event_at = time.monotonic()   # 預設「剛剛有事件」
+    # Cluster G / 2026-05-23：force-restart 新邏輯會檢查 _pressed + _combo_active；
+    # MagicMock 預設 truthy 會誤觸發 defer。stub 顯式設成「沒按鍵 in-flight」。
+    win.hotkey_mgr._pressed = set()
+    win.hotkey_mgr._combo_active = False
     # Fix 18 / 2026-05-23：watchdog 新分支需要 _state + _last_hotkey_force_restart
     win._state = "idle"
     win._last_hotkey_force_restart = time.monotonic()

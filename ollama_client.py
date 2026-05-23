@@ -197,17 +197,21 @@ class OllamaClient:
                 error="輸入為空", preset_name=preset_name,
             )
 
-        # 動態查詢 prompt（支援熱重載）
-        if prompt_template is None:
-            prompt_template = prompts.OLLAMA_POLISH_PROMPT
+        # Fix Cluster E / 2026-05-23：動態查詢 prompt 與 prompt_reloader 互斥，
+        # 避免讀到 importlib.reload 中途的不一致 attribute（AttributeError / 半新半舊）。
+        from prompt_reloader import reload_lock as _reload_lock
+        with _reload_lock():
+            # 動態查詢 prompt（支援熱重載）
+            if prompt_template is None:
+                prompt_template = prompts.OLLAMA_POLISH_PROMPT
 
-        # 注入字典約束（若有）
-        try:
-            prompt_template = prompts.format_polish_prompt(
-                prompt_template, dictionary_terms,
-            )
-        except Exception:
-            log_error("format_polish_prompt_failed")
+            # 注入字典約束（若有）
+            try:
+                prompt_template = prompts.format_polish_prompt(
+                    prompt_template, dictionary_terms,
+                )
+            except Exception:
+                log_error("format_polish_prompt_failed")
 
         prompt = prompt_template.format(text=text)
         payload = {
