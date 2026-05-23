@@ -1172,7 +1172,7 @@ class AppWindow(ctk.CTkFrame):
         # Cluster B：抓「當下 latest」block ref 一起傳進 _finish_polish。
         # polish 跑回來時這個 ref 可能已被 delete（不在 list 內）或不再是 latest，
         # _finish_polish 用 identity 比對來決定是否安全 set_polished。
-        target_block = self._utterance_blocks[-1] if self._utterance_blocks else None
+        target_block = self._utterance_blocks[0] if self._utterance_blocks else None
 
         # C2：三段式標題狀態（preset 名稱不會被後續 status 吃掉）
         self._title_preset = preset.display_name if preset_name != "default" else None
@@ -1227,7 +1227,7 @@ class AppWindow(ctk.CTkFrame):
             block_ok = (
                 target_block is not None
                 and target_block in self._utterance_blocks
-                and target_block is self._utterance_blocks[-1]
+                and target_block is self._utterance_blocks[0]
             )
             if block_ok:
                 target_block.set_polished(polished)
@@ -1238,7 +1238,7 @@ class AppWindow(ctk.CTkFrame):
                 log_action(
                     "polish_dropped_block_changed",
                     target_alive=(target_block in self._utterance_blocks),
-                    is_latest=(target_block is self._utterance_blocks[-1]
+                    is_latest=(target_block is self._utterance_blocks[0]
                                if self._utterance_blocks else False),
                 )
             self._showing_polished = True
@@ -1335,7 +1335,7 @@ class AppWindow(ctk.CTkFrame):
         if not self._utterance_blocks:
             return
 
-        self._utterance_blocks[-1].set_showing_polished(show_polished)
+        self._utterance_blocks[0].set_showing_polished(show_polished)
         self._showing_polished = show_polished
         self._apply_toggle_style()
 
@@ -1390,11 +1390,13 @@ class AppWindow(ctk.CTkFrame):
         # 清掉佔位符
         self._clear_placeholder()
 
-        # 把前一段「最新」邊框取消
+        # Bug 3（v2.8.0 / 2026-05-23）：_utterance_blocks 反轉為「新→舊」順序，
+        # [0] = 最新、[-1] = 最舊（與 UI 視覺順序一致：最新在最上）。
+        # 把前一段「最新」邊框取消（[0] = 上一段最新）。
         if self._utterance_blocks:
-            self._utterance_blocks[-1].highlight_as_latest(False)
+            self._utterance_blocks[0].highlight_as_latest(False)
 
-        # 建立新 block 並 pack 在底部
+        # 建立新 block 並 pack 在最頂端
         import datetime as _dt
         timestamp_iso = _dt.datetime.now().strftime("%H:%M")
         block = UtteranceBlock(
@@ -1407,19 +1409,24 @@ class AppWindow(ctk.CTkFrame):
             on_copy=self._on_block_copy,
             on_delete=self._on_block_delete,
         )
-        block.pack(fill="x", padx=SPACE_XS, pady=(0, 8))
+        # pack(before=existing_first) 插到現有最頂端 widget 之前
+        if self._utterance_blocks:
+            block.pack(
+                fill="x", padx=SPACE_XS, pady=(0, 8),
+                before=self._utterance_blocks[0],
+            )
+        else:
+            block.pack(fill="x", padx=SPACE_XS, pady=(0, 8))
         block.highlight_as_latest(True)
-        self._utterance_blocks.append(block)
+        self._utterance_blocks.insert(0, block)
 
-        # 自動 scroll 到底（讓使用者看到最新一段）
-        # _parent_canvas.yview_moveto(1.0) 是 CTkScrollableFrame 的 idiom
-        # 必須延後執行，等 layout 算完高度
-        def _scroll_to_bottom():
+        # 自動 scroll 到頂（最新永遠在頂部）
+        def _scroll_to_top():
             try:
-                self._blocks_container._parent_canvas.yview_moveto(1.0)
+                self._blocks_container._parent_canvas.yview_moveto(0.0)
             except Exception:
                 pass
-        self.after(50, _scroll_to_bottom)
+        self.after(50, _scroll_to_top)
 
     # ═══════════════════════════════════════════════════════════════════════
     #  AMBIENT CHAMBER — render loop + draw + events
@@ -1712,13 +1719,13 @@ class AppWindow(ctk.CTkFrame):
         """複製按鈕：複製「最新一段」block 的目前顯示文字（原文或潤飾）。
 
         Fix 19 Path B / 2026-05-23 — block-based 重構後不再用 Tk mark，直接從
-        `self._utterance_blocks[-1]` 取目前顯示內容。語意跟 Path A 一致：
+        `self._utterance_blocks[0]` 取目前顯示內容。語意跟 Path A 一致：
         每次錄完音點複製 = 拿剛剛那一段。
         """
         if not self._utterance_blocks:
             log_action("copy_clicked_empty")
             return
-        latest = self._utterance_blocks[-1]
+        latest = self._utterance_blocks[0]
         text = latest.get_current_text().strip()
         if not text:
             log_action("copy_clicked_empty")
@@ -1755,7 +1762,7 @@ class AppWindow(ctk.CTkFrame):
         """
         if block not in self._utterance_blocks:
             return
-        was_latest = (block is self._utterance_blocks[-1])
+        was_latest = (block is self._utterance_blocks[0])
         self._utterance_blocks.remove(block)
         try:
             block.destroy()
@@ -1779,7 +1786,7 @@ class AppWindow(ctk.CTkFrame):
 
         if was_latest:
             # 新的最新一段 = 之前的倒數第二段
-            new_latest = self._utterance_blocks[-1]
+            new_latest = self._utterance_blocks[0]
             for b in self._utterance_blocks:
                 b.highlight_as_latest(b is new_latest)
             # toggle / polish 狀態跟著對齊新的 latest
@@ -1875,7 +1882,7 @@ class AppWindow(ctk.CTkFrame):
             log_action("ollama_clicked_empty")
             return
 
-        latest = self._utterance_blocks[-1]
+        latest = self._utterance_blocks[0]
         text = latest.raw_text.strip()
         if not text:
             log_action("ollama_clicked_empty")
@@ -1911,7 +1918,7 @@ class AppWindow(ctk.CTkFrame):
                 return
             block_ok = (
                 target_block in self._utterance_blocks
-                and target_block is self._utterance_blocks[-1]
+                and target_block is self._utterance_blocks[0]
             )
             if block_ok:
                 target_block.set_polished(result.text)
@@ -2032,7 +2039,7 @@ class AppWindow(ctk.CTkFrame):
         SettingsWindow(self, self.cfg, self._on_settings_saved)
 
     def _do_theme_relaunch(self, on_failure=None) -> None:
-        """v2.6.0 主題切換後執行：toast → 800ms → cleanup → spawn → exit。
+        """v2.6.0 主題切換後執行：[pre-flight] → toast → 800ms → cleanup → spawn → exit。
 
         Eng Review Issue 1 / 2026-05-23：cleanup-first 順序避免新舊 process 共存
         race window（雙 NSEvent monitor / mic 衝突 / config.json race）。
@@ -2040,9 +2047,38 @@ class AppWindow(ctk.CTkFrame):
         Fix Cluster D-1 / 2026-05-23：spawn 失敗時呼叫 on_failure callback（讓
         SettingsWindow rollback config.theme），避免使用者下次啟動莫名變新主題。
 
+        Bug 1（v2.8.0 / 2026-05-23）：pre-flight 檢查 .app bundle 是否存在。不存在
+        就**不要**跑 cleanup（否則 App 會半殘：hotkey 死、mini HUD 不見、history
+        關掉），直接 rollback + toast 提示。
+
         SettingsWindow 已 save config + destroy 自己；本函式由 AppWindow 跑收尾。
         """
         log_action("theme_relaunch_started")
+
+        # Bug 1 pre-flight：spawn 不可能就不要 cleanup（保住 App 仍可用）
+        try:
+            import main as _main
+            app_bundle_exists = _main._APP_BUNDLE.exists()
+        except Exception:
+            app_bundle_exists = False
+
+        if not app_bundle_exists:
+            log.warning(
+                f"THEME: 無 .app bundle ({getattr(_main, '_APP_BUNDLE', '?')})，"
+                f"略過 cleanup 直接 rollback 並提示使用者手動重啟"
+            )
+            if on_failure is not None:
+                try:
+                    on_failure()
+                except Exception:
+                    log_error("theme_relaunch_on_failure_callback_failed")
+            try:
+                self._show_toast("無 .app bundle、請手動關閉並重新啟動 App（執行 build_app.sh 後即可自動重啟）")
+            except Exception:
+                pass
+            log_error("theme_relaunch_no_app_bundle")
+            return
+
         # Step 0：toast 通知（fire-and-forget）
         try:
             self._show_toast("主題切換中、~2 秒…")
@@ -2072,6 +2108,7 @@ class AppWindow(ctk.CTkFrame):
                 sys.exit(0)
             else:
                 # Cluster D-1：全部失敗 → 回滾 config.theme，不 exit、讓使用者手動處理
+                # 注意：能走到這代表 .app bundle 存在但 open -n 失敗（罕見）。
                 if on_failure is not None:
                     try:
                         on_failure()
@@ -2126,7 +2163,7 @@ class AppWindow(ctk.CTkFrame):
         # 之前是塞回 textbox 整坨清空再 insert；block 化後改成 append + 標示最新。
         self._clear_placeholder()
         if self._utterance_blocks:
-            self._utterance_blocks[-1].highlight_as_latest(False)
+            self._utterance_blocks[0].highlight_as_latest(False)
 
         import datetime as _dt
         try:
@@ -2143,10 +2180,17 @@ class AppWindow(ctk.CTkFrame):
             on_copy=self._on_block_copy,
             on_delete=self._on_block_delete,
         )
-        block.pack(fill="x", padx=SPACE_XS, pady=(0, 8))
+        # Bug 3（v2.8.0）：插最頂 + insert(0)
+        if self._utterance_blocks:
+            block.pack(
+                fill="x", padx=SPACE_XS, pady=(0, 8),
+                before=self._utterance_blocks[0],
+            )
+        else:
+            block.pack(fill="x", padx=SPACE_XS, pady=(0, 8))
         block.highlight_as_latest(True)
-        self._utterance_blocks.append(block)
-        self.after(50, lambda: self._blocks_container._parent_canvas.yview_moveto(1.0))
+        self._utterance_blocks.insert(0, block)
+        self.after(50, lambda: self._blocks_container._parent_canvas.yview_moveto(0.0))
 
         self._apply_toggle_style()
         self._frontmost_app = entry.target_app   # 讓 preset 路由走原本的 app

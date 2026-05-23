@@ -57,19 +57,25 @@ def get_frontmost_app() -> Optional[str]:
 def paste_to_app(
     text: str,
     app_name: Optional[str],
-    activate_delay: float = 0.18,   # 等待 App 拉到前景的緩衝時間（秒）
+    activate_delay: float = 0.18,            # 一般情況的緩衝（秒）
+    fullscreen_activate_delay: float = 0.55, # 全螢幕 Space 切換的緩衝（秒）
+    max_wait_for_frontmost: float = 1.5,     # frontmost polling 最久等多久
 ) -> bool:
     """將文字貼到指定 App 的當前游標位置。
 
     三步驟：
       1. 把 text 寫入系統剪貼簿
       2. 用 osascript 把 app_name 拉到前景
-      3. 用 pynput 模擬 ⌘V
+      3. **Poll frontmost 確認真的切過去**（Bug 2 / 2026-05-23：全螢幕 Space 切換動畫 ≈ 0.5s）
+      4. 用 pynput 模擬 ⌘V
 
     Args:
-        text:           要貼上的文字。
-        app_name:       目標 App 名稱（由 get_frontmost_app() 取得），None 則跳過拉前景。
-        activate_delay: 拉前景後等待的秒數，給 App 時間完成視窗切換。
+        text:                       要貼上的文字。
+        app_name:                   目標 App 名稱（由 get_frontmost_app() 取得），None 則跳過拉前景。
+        activate_delay:             一般情況下 activate 後的初始等待時間。
+        fullscreen_activate_delay:  目標 App 在全螢幕獨立 Space 時的初始等待（更長，
+                                    給 macOS Space 切換動畫時間）。
+        max_wait_for_frontmost:     polling frontmost 切換的最大等待秒數。
 
     Returns:
         True 代表 ⌘V 成功送出，False 代表任何步驟失敗。
@@ -83,29 +89,80 @@ def paste_to_app(
         log_error("auto_paste_clipboard_failed", text_len=len(text))
         return False
 
-    # ── 步驟 2：把目標 App 拉到前景 ─────────────────────────────────────────
+    # ── 步驟 2：把目標 App 拉到前景 + 等 Space 切換 ─────────────────────────
     if app_name:
+        # Bug 2（v2.8.0 / 2026-05-23）：先偵測目標 App 是否在全螢幕 Space。
+        # 全螢幕 App 的 NSWindow 屬於獨立 Space，activate 觸發 OS 跨 Space 動畫
+        # （~0.5s）；0.18s 太短，⌘V 還在原 Space 觸發 → 落到錯誤的 App。
+        is_fullscreen = _is_app_fullscreen(app_name)
+        delay = fullscreen_activate_delay if is_fullscreen else activate_delay
         try:
-            # AppleScript 字串內必須 escape 雙引號和反斜線，否則 app 名含
-            # `"`（罕見但理論上可能）會打斷 `tell application "..."` 語法。
+            # AppleScript 字串內必須 escape 雙引號和反斜線
             safe_name = app_name.replace("\\", "\\\\").replace('"', '\\"')
             subprocess.run(
                 ["osascript", "-e", f'tell application "{safe_name}" to activate'],
-                timeout=3,   # 若 App 無回應，最多等 3 秒
+                timeout=3,
             )
-            time.sleep(activate_delay)   # 給 App 時間完成視窗切換，再送 ⌘V
+            time.sleep(delay)
+
+            # Bug 2：activate 後 poll frontmost 確認真的切過去（最多再等 max_wait）。
+            # 若 max_wait 過了還沒切，依然繼續送 ⌘V（避免使用者被永久卡住）。
+            deadline = time.monotonic() + max_wait_for_frontmost
+            poll_count = 0
+            while time.monotonic() < deadline:
+                front = get_frontmost_app()
+                poll_count += 1
+                if front and front == app_name:
+                    break
+                time.sleep(0.08)
+            else:
+                # 迴圈正常結束（沒 break）= 超時但 frontmost 仍不對
+                log.warning(
+                    f"AUTO-PASTE: frontmost still != '{app_name}' after "
+                    f"{max_wait_for_frontmost}s (fullscreen={is_fullscreen}, "
+                    f"polls={poll_count}). 仍送 ⌘V。"
+                )
         except Exception:
             log_error("auto_paste_activate_failed", app=app_name)
-            # 繼續往下執行——貼到目前焦點視窗，雖不完美但比什麼都不做好
 
     # ── 步驟 3：模擬 ⌘V ─────────────────────────────────────────────────────
     try:
         from pynput.keyboard import Controller, Key
         kb = Controller()
-        with kb.pressed(Key.cmd):   # 按住 Command 鍵
-            kb.tap("v")             # 按 V，等同 ⌘V
-        log.info(f"AUTO-PASTE: ⌘V sent → '{app_name}' (text_len={len(text)})")
+        with kb.pressed(Key.cmd):
+            kb.tap("v")
+        log.info(
+            f"AUTO-PASTE: ⌘V sent → '{app_name}' "
+            f"(text_len={len(text)}, fullscreen={_is_app_fullscreen(app_name) if app_name else 'n/a'})"
+        )
         return True
     except Exception:
         log_error("auto_paste_keyboard_failed", app=app_name)
+        return False
+
+
+def _is_app_fullscreen(app_name: str) -> bool:
+    """Bug 2（v2.8.0）：偵測指定 App 的前景視窗是否處於全螢幕（獨立 Space）狀態。
+
+    用 AppleScript 問 System Events 該 process 第一個 window 的 `value of attribute "AXFullScreen"`。
+    回 True 表示綠按鈕全螢幕、視窗在獨立 Space。
+
+    任何錯誤（App 不存在、權限不足、無 AXFullScreen 屬性）都回 False（保守處理：
+    走一般 activate_delay 即可，不會更慘）。
+    """
+    if not app_name:
+        return False
+    try:
+        safe_name = app_name.replace("\\", "\\\\").replace('"', '\\"')
+        result = subprocess.run(
+            [
+                "osascript", "-e",
+                f'tell application "System Events" to tell process "{safe_name}" '
+                f'to get value of attribute "AXFullScreen" of front window',
+            ],
+            capture_output=True, text=True, timeout=1.0,
+        )
+        out = result.stdout.strip().lower()
+        return out == "true"
+    except Exception:
         return False

@@ -113,14 +113,17 @@ def test_cluster_B_finish_polish_drops_when_block_deleted():
 
 
 def test_cluster_B_finish_polish_drops_when_block_no_longer_latest():
-    """Polish 跑完時 target_block 還在 list 但不再是 latest（user 又錄新音）→ drop。"""
+    """Polish 跑完時 target_block 還在 list 但不再是 latest（user 又錄新音）→ drop。
+
+    v2.8.0 Bug 3：list 反轉為 [0]=最新；new_latest 在 [0]、blk_target 在 [1]。
+    """
     win = _make_polish_stub()
     blk_target = MagicMock()
     blk_target.set_polished = MagicMock()
     new_latest = MagicMock()
     new_latest.set_polished = MagicMock()
-    # target 還在 list 內、但 user 又錄新音 → 新 block 變 latest
-    win._utterance_blocks = [blk_target, new_latest]
+    # target 還在 list 內、但 user 又錄新音 → 新 block 變 latest（在 [0]）
+    win._utterance_blocks = [new_latest, blk_target]
     resp = types.SimpleNamespace(text="polished!", error=None, elapsed_seconds=1.2)
 
     win._finish_polish(gen=0, raw_text="raw", target=None, resp=resp, target_block=blk_target)

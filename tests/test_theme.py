@@ -66,11 +66,12 @@ def test_unknown_theme_falls_back_to_dark():
 #  main._relaunch_app() 兩條路徑（T8.3 + T8.4）
 # ═════════════════════════════════════════════════════════════════════════════
 
-def test_relaunch_helper_chooses_app_bundle_when_bundled():
-    """T8.3：sys.executable 含 'WhisperPro.app' → 用 subprocess.Popen([open, -n, ...])。"""
+def test_relaunch_helper_chooses_app_bundle_when_bundle_exists():
+    """T8.3（v2.8.0 Bug 1 更新）：只要 .app bundle 存在就用 open -n、
+    不論 sys.executable 是否含 WhisperPro.app（修原本 dev 模式必走 execv 的問題）。"""
     import main
-    fake_exec = "/Users/x/Applications/WhisperPro.app/Contents/Frameworks/Python.app/Contents/MacOS/Python"
-    # PosixPath.exists 是 read-only、不能直接 patch.object；改用 fake bundle MagicMock
+    # 即使 sys.executable 是 venv python（dev 模式），.app 存在仍走 open -n
+    fake_exec = "/usr/local/bin/python3"
     fake_bundle = MagicMock()
     fake_bundle.exists.return_value = True
     fake_bundle.__str__ = lambda self: "/fake/WhisperPro.app"
@@ -85,27 +86,30 @@ def test_relaunch_helper_chooses_app_bundle_when_bundled():
     call_args = popen_spy.call_args[0][0]
     assert call_args[0] == "open"
     assert call_args[1] == "-n"
-    # call_args[2] 是 str(_APP_BUNDLE) — 因為 MagicMock 不一定能直接 str()，
-    # 確認有非空字串被傳進去就足夠（重點是 open + -n + 某個 path）
     assert isinstance(call_args[2], str) and len(call_args[2]) > 0
-    execv_spy.assert_not_called()   # bundle 成功就不走 execv
+    execv_spy.assert_not_called()   # .app 成功就不走 execv
 
 
-def test_relaunch_helper_falls_back_to_execv_when_not_bundled():
-    """T8.4：dev 模式（sys.executable 不含 WhisperPro.app）→ os.execv 自我 re-exec。"""
+def test_relaunch_helper_falls_back_to_execv_when_no_bundle():
+    """T8.4（v2.8.0 Bug 1 更新）：.app bundle 不存在才走 os.execv fallback。
+
+    舊邏輯（v2.6.0/v2.7.0）：以 sys.executable 是否含 WhisperPro.app 判斷
+    bundled。新邏輯改用 `_APP_BUNDLE.exists()`，比 sys.executable 更可靠。
+    """
     import main
     fake_exec = "/usr/local/bin/python3"
+    fake_bundle = MagicMock()
+    fake_bundle.exists.return_value = False   # .app 不存在
     with patch.object(sys, "executable", fake_exec), \
+         patch.object(main, "_APP_BUNDLE", fake_bundle), \
          patch("subprocess.Popen") as popen_spy, \
          patch("os.execv") as execv_spy:
-        # execv 通常不 return（replace process image）；mock 它就 return None、
-        # function 走到 return False。所以期望 False（execv 沒真正 execute）。
         ok = main._relaunch_app()
 
-    popen_spy.assert_not_called()   # 不是 bundle，不走 open -n
+    popen_spy.assert_not_called()   # .app 不存在，不走 open -n
     execv_spy.assert_called_once()
-    assert execv_spy.call_args[0][0] == fake_exec   # 第一個 arg = sys.executable
-    # ok 是 False 是因為 mock 的 execv 直接 return（真實環境會 replace image 不 return）
+    assert execv_spy.call_args[0][0] == fake_exec
+    # ok=False 是因為 mock 的 execv 直接 return（真實環境會 replace image 不 return）
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -116,8 +120,10 @@ def test_relaunch_calls_cleanup_before_spawn():
     """Issue 1 / cleanup-first：_do_theme_relaunch 內 on_close 必須在 _relaunch_app 之前。
 
     驗證呼叫順序：on_close → _relaunch_app → sys.exit。
+    v2.8.0 Bug 1：加 pre-flight 後需 patch _APP_BUNDLE 存在才會走到 cleanup 路徑。
     """
     from gui import AppWindow
+    import main
     win = AppWindow.__new__(AppWindow)
 
     # 用 single MagicMock 蒐集所有呼叫的順序
@@ -131,7 +137,12 @@ def test_relaunch_calls_cleanup_before_spawn():
         scheduled.append((ms, fn))
     win.after = fake_after
 
-    win._do_theme_relaunch()
+    # v2.8.0 Bug 1：pre-flight 要 .app 存在才會走到 cleanup
+    fake_bundle = MagicMock()
+    fake_bundle.exists.return_value = True
+    fake_bundle.__str__ = lambda self: "/fake/WhisperPro.app"
+    with patch.object(main, "_APP_BUNDLE", fake_bundle):
+        win._do_theme_relaunch()
 
     # 應該有一個 after(800, _do_relaunch_sequence) 被排
     assert len(scheduled) == 1
@@ -156,6 +167,43 @@ def test_relaunch_calls_cleanup_before_spawn():
     relevant = [n for n in names if n in ("on_close", "relaunch_inner", "exit_inner")]
     assert relevant == ["on_close", "relaunch_inner", "exit_inner"], \
         f"順序錯誤：實際 {relevant}"
+
+
+def test_bug1_skip_cleanup_when_app_bundle_missing():
+    """Bug 1（v2.8.0）：.app bundle 不存在時 pre-flight 直接 rollback、不 cleanup。
+
+    舊行為（v2.6.0/v2.7.0）：on_close 先跑 → App 半殘（hotkey 死 / mini HUD 不見 /
+    history 關掉）→ spawn 失敗 → toast 提示重啟。即使 rollback config 成功，
+    App 已經不能正常用，使用者必須手動關閉。
+    新行為：偵測 .app 不存在直接 abort，rollback + toast，App 維持完整功能。
+    """
+    from gui import AppWindow
+    import main
+    win = AppWindow.__new__(AppWindow)
+
+    tracker = MagicMock()
+    win.on_close = tracker.on_close
+    win._show_toast = tracker.show_toast
+    rollback = MagicMock()
+
+    # after 不該被排程（pre-flight 直接 return）
+    scheduled = []
+    win.after = lambda ms, fn: scheduled.append((ms, fn))
+
+    # .app 不存在
+    fake_bundle = MagicMock()
+    fake_bundle.exists.return_value = False
+    with patch.object(main, "_APP_BUNDLE", fake_bundle):
+        win._do_theme_relaunch(on_failure=rollback)
+
+    # on_close 不該被呼叫（App 保持完整）
+    tracker.on_close.assert_not_called()
+    # 沒有 after schedule（pre-flight 直接 return）
+    assert scheduled == []
+    # rollback callback 必須被呼叫（config 回滾）
+    rollback.assert_called_once()
+    # toast 提示使用者
+    tracker.show_toast.assert_called()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
