@@ -32,15 +32,44 @@ WHISPER_INITIAL_PROMPT = (
 # Phase 1 通用潤飾 prompt（default preset 也用這個）。
 # 嚴格版：正面清單 + 負面清單 + 固定結尾「只輸出修正後的文字」收斂 LLM 行為。
 OLLAMA_POLISH_PROMPT = (
-    "你是語音轉文字後處理助理。輸入是一段 Whisper 中英混講轉錄，你要做下列事情：\n"
-    "1. 刪除語氣詞與無意義重複（嗯、啊、那個、然後那個、所以那個、um、uh、like、you know）\n"
-    "2. 修正明顯的同音錯字（例：在／再、做／坐、的／得／地）\n"
-    "3. 補上合適的標點與斷句\n"
-    "4. 保留所有英文原文（專有名詞、技術術語、品牌名不要翻譯）\n"
-    "5. 保留語意與說話者原意，**不要增加、刪減或改寫內容**\n"
-    "6. 若原文極短（≤5 字），僅做最小幅度修正\n\n"
-    "只輸出修正後的文字，不要加任何說明、標題、前綴、引號或括號。\n\n"
-    "原文：\n{text}"
+    "以下是 Whisper 語音轉文字的結果（中英混講）。請只做三件事：\n"
+    "1. 修正明顯的同音錯字（例：在/再、的/得/地、措置率→錯字率）\n"
+    "2. 補上適當的標點符號與斷句\n"
+    "3. 刪除無意義贅詞（嗯、啊、那個、um、uh）\n\n"
+    "**Whisper 常見誤辨識修正（重要、必做）**：\n"
+    "Whisper 經常把 Claude（/klɔːd/）誤聽成 Cloud（/klaʊd/）。請依以下規則**主動逆向校正**：\n\n"
+    "原文出現「Cloud」時，**必須改成「Claude」**的情況：\n"
+    "  - 「Cloud Code」→ Claude Code（Anthropic 命令列工具）\n"
+    "  - 「Cloud AI」→ Claude AI\n"
+    "  - 「Cloud Sonnet」/「Cloud Opus」→ Claude Sonnet/Opus（Anthropic 模型）\n"
+    "  - 「跟 Cloud 講話/對話」→ 跟 Claude 講話/對話\n"
+    "  - 「問 Cloud」/「Cloud 回答」/「Cloud 幫我」→ Claude\n"
+    "  - 「Cloud 寫 code/程式」/「Cloud 寫文章」→ Claude\n"
+    "  - 「Cloud 模型」（在 AI 語境）→ Claude 模型\n\n"
+    "**只在以下語境保留「Cloud」**：\n"
+    "  - Google Cloud、AWS、Azure、Cloud Run、Cloud Storage（明確雲端服務）\n"
+    "  - 部署到 Cloud、Cloud 上、雲端搭配的 Cloud\n\n"
+    "範例：\n"
+    "  原：「我用 Cloud Code 寫程式」→ 改：「我用 Claude Code 寫程式」\n"
+    "  原：「我跟 Cloud 對話」→ 改：「我跟 Claude 對話」\n"
+    "  原：「我用 Cloud AI 寫 code,然後部署到 Google Cloud」→ 改：「我用 Claude AI 寫 code,然後部署到 Google Cloud」\n"
+    "  原：「Code 放到 Google Cloud 上」→ 保留：「Code 放到 Google Cloud 上」\n\n"
+    "**絕對禁止**：\n"
+    "- 不要翻譯成英文或其他語言\n"
+    "- 不要改寫、不要重新表達\n"
+    "- 不要增加任何說明、前綴或解釋\n"
+    "- 輸出語言必須**完全等於原文語言**\n\n"
+    "原文：\n{text}\n\n"
+    "修正後（直接輸出，不加任何說明）："
+)
+
+# v2.13.0：Ollama /api/generate 的 system 欄位，給 instruct 模型更明確 role。
+# qwen2.5:3b-instruct 等小型 instruct 模型對純 prompt 易過度發揮（擴寫、翻譯），
+# 用 system role 鎖定行為。對不支援 system 的模型仍會 fallback 走 prompt 描述。
+OLLAMA_POLISH_SYSTEM = (
+    "你是中文校對員。只做三件事：修同音錯字、補標點、刪贅詞。"
+    "絕對不翻譯、不改寫、不增刪內容。"
+    "輸出語言必須等於原文語言。"
 )
 
 # 舊別名（向後相容）

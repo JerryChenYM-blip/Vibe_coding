@@ -33,6 +33,28 @@ if [ -z "$VERSION" ]; then
 fi
 echo "BUILD: Whisper Pro v$VERSION"
 
+# v2.12.0：sanity check — 比對 _version.py 與 git latest tag。
+# 之前曾發生 _version 卡 v2.6.0 但已 tag 到 v2.11.0（splash 一直顯示舊版）。
+# 不一致就 prompt 使用者確認、避免直接 build 出版本錯亂的 .app。
+LATEST_TAG=$(cd "$PROJECT_DIR" 2>/dev/null && git describe --tags --abbrev=0 2>/dev/null || echo "")
+if [ -n "$LATEST_TAG" ]; then
+    TAG_VERSION="${LATEST_TAG#v}"   # 去掉 v 前綴
+    if [ "$VERSION" != "$TAG_VERSION" ]; then
+        echo ""
+        echo "⚠️  WARNING: 版本不一致！"
+        echo "    _version.py  = $VERSION"
+        echo "    git latest tag = $LATEST_TAG ($TAG_VERSION)"
+        echo ""
+        echo "如果現在要發新版，應該先 bump _version.py 到新版本再 build。"
+        echo "Continue anyway? (y/N): "
+        read -r REPLY
+        if [ "$REPLY" != "y" ] && [ "$REPLY" != "Y" ]; then
+            echo "Aborted. 請先 bump _version.py 或 git tag。"
+            exit 1
+        fi
+    fi
+fi
+
 APP_ROOT="$HOME/Applications/WhisperPro.app"
 CONTENTS_DIR="$APP_ROOT/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"

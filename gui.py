@@ -207,6 +207,16 @@ class AppWindow(ctk.CTkFrame):
 
         self.cfg = cfg
         self.recorder    = AudioRecorder()
+        # F1（v2.12.0）：啟動時依 cfg.input_device 設裝置；失敗回退系統預設
+        if cfg.input_device:
+            try:
+                if not self.recorder.set_device_by_name(cfg.input_device):
+                    log.warning(
+                        f"RECORD: startup input_device '{cfg.input_device}' "
+                        f"找不到，回退到系統預設"
+                    )
+            except Exception:
+                log_error("startup_set_device_failed", device=cfg.input_device)
         self.transcriber = Transcriber()
         self.ollama      = OllamaClient()
         # 用設定檔同步 Ollama 參數（base_url / model / enabled / timeout）
@@ -776,17 +786,26 @@ class AppWindow(ctk.CTkFrame):
         self._target_label.configure(text="")
 
         def _capture_frontmost():
+            # Bug B（v2.12.0）：擴大自我識別清單，避免把 Whisper Pro 自己當成貼上目標。
+            # NSWorkspace 在 .app bundle 模式下會回「Whisper Pro」；dev 模式回「Python」。
+            # 兩種情境都該排除，但**不要**直接 return（會錯過真實 frontmost）；
+            # 改成：只跳過「我自己」的判斷，仍把 frontmost 紀錄起來（_frontmost_app 用於 preset
+            # 路由），但不設 paste_target（避免貼到自己）。
+            SELF_APP_NAMES = {"Python", "python3", "WhisperPro", "Whisper Pro", "whisper_pro"}
             app = _ap.get_frontmost_app()
-            if not app or app in ("Python", "python3"):
+            if not app:
                 return
             def _apply():
                 if self._state != "recording":
                     return
-                self._frontmost_app = app
-                # 只有 auto_paste 開啟時才作為 ⌘V 目標 + 顯示提示
-                if self.cfg.auto_paste:
+                self._frontmost_app = app   # 永遠記錄（preset 路由用）
+                # paste_target 排除自我，避免貼到自己
+                if self.cfg.auto_paste and app not in SELF_APP_NAMES:
                     self._paste_target = app
                     self._target_label.configure(text=f"→ {app}")
+                elif app in SELF_APP_NAMES:
+                    # 自我前景時不顯示 → 標籤
+                    log.debug(f"AUTO-PASTE: frontmost is self ({app!r}), skip paste_target")
             self.after(0, _apply)
         threading.Thread(target=_capture_frontmost, daemon=True).start()
 
@@ -1105,10 +1124,17 @@ class AppWindow(ctk.CTkFrame):
 
         # 決定路徑：能潤飾就走潤飾流程，失敗自動降級回原文。
         # 規劃書 6.4「策略 B」：等潤飾完再貼，因此 auto-paste 也延到潤飾後。
+        # v2.13.0 / 2026-05-24：修「Ollama 啟用但 health_ok=None 跳過 polish」。
+        # 根因：D5-S7 TTL 30s 過期會回 None；剛 enable Ollama health check 還沒
+        # 回來也是 None；舊邏輯 `is True` 排除 None → user 雖然開了 Ollama
+        # 但每次 cache 過期或剛啟用都不會 polish、直接貼 Whisper 原文（含「措置率」
+        # 這種同音錯字）。改用 `is not False` 放寬：None / True 都試一下；
+        # 真的 False（確定沒跑）才略過。process() 內部 ConnectionError fallback
+        # 自然會降級回原文，使用者不會卡住。
         take_polish_path = (
             valid
             and self.cfg.ollama_enabled
-            and self.ollama.health_ok is True
+            and self.ollama.health_ok is not False
         )
 
         if take_polish_path:
@@ -1123,6 +1149,15 @@ class AppWindow(ctk.CTkFrame):
 
             target = self._paste_target if self.cfg.auto_paste else None
             self._paste_target = None
+
+            # Bug D（v2.13.0）：raw 策略 → 立刻貼 Whisper 原文（不等 3-20s polish）
+            # polish 結果照樣跑、UI 會顯示「已潤飾」，但不再 paste 第二次（避免貼到
+            # user 已切走的視窗）。預設仍是 wait（品質優先）。
+            paste_strategy = getattr(self.cfg, "ollama_paste_strategy", "wait")
+            if paste_strategy == "raw" and self.cfg.auto_paste and target:
+                self._do_auto_paste(text, target)
+                target = None   # 告訴 _start_polish/_finish_polish 不要再 paste 第二次
+
             self._start_polish(gen, text, target)
             return
 
@@ -1766,18 +1801,40 @@ class AppWindow(ctk.CTkFrame):
         self._wraplength_debounce_id = self.after(80, self._apply_wraplength_to_blocks)
 
     def _apply_wraplength_to_blocks(self) -> None:
-        """計算當前 container 寬度並套用到所有 block 的 text label。"""
+        """計算當前 container 寬度並套用到所有 block 的 text label。
+
+        Bug C（v2.13.0）：加 width-change guard 避免 layout 抖動。
+        - winfo_width < 100：container 還沒 realized、不動
+        - 與上次差距 < 10px：寬度沒實質變化、不動（避免每次 scroll 都觸發
+          wraplength→block height→container Configure 死循環，scrollbar 被打斷）
+        - 動作完 → 主動觸發 CTkScrollableFrame 內部 canvas 重算 scrollregion，
+          確保 scrollbar 認得新的 content 高度
+        """
         self._wraplength_debounce_id = None
         try:
-            # container.winfo_width() 含 scrollbar；扣除 block padding（左右各 SPACE_XS）
-            # 與 block 內 text padding（左右各 SPACE_MD），保留下限 280 避免被 resize 到 0
             width = self._blocks_container.winfo_width()
+            if width < 100:
+                # 容器還沒 realized（初始化 / withdraw 時 winfo_width 可能 = 1）
+                return
             new_wrap = max(280, width - (SPACE_XS * 2) - (SPACE_MD * 2) - 20)
+            last_wrap = getattr(self, "_last_wraplength", -1)
+            if abs(new_wrap - last_wrap) < 10:
+                # 變動太小、skip 避免 layout 抖動
+                return
+            self._last_wraplength = new_wrap
             for blk in self._utterance_blocks:
                 try:
                     blk.update_wraplength(new_wrap)
                 except Exception:
                     pass
+            # Bug C：主動觸發 CTkScrollableFrame 重新計算 scrollregion
+            # block 高度變了，內部 canvas 必須知道才能正確顯示 scrollbar
+            try:
+                inner_canvas = self._blocks_container._parent_canvas
+                inner_canvas.update_idletasks()
+                inner_canvas.configure(scrollregion=inner_canvas.bbox("all"))
+            except Exception:
+                pass
         except Exception:
             log_error("blocks_wraplength_update_failed")
 
@@ -2251,11 +2308,20 @@ class AppWindow(ctk.CTkFrame):
     # ── Phase 4.3 mini 錄音窗 ──────────────────────────────────────────────
 
     def _ensure_mini_window(self) -> None:
-        """Lazy 建立 MiniRecordingWindow；toggle on 時呼叫。"""
+        """Lazy 建立 MiniRecordingWindow；toggle on 時呼叫。
+
+        Bug A（v2.12.0）：成功 / 失敗都 log 一行，方便 user log 回報時定位。
+        """
         if self._mini_window is not None:
             return
         try:
             self._mini_window = MiniRecordingWindow(self)
+            # log 是否升級成 NSPanel level（決定能否跨 Space 可見）
+            ns_ok = getattr(self._mini_window, "_ns_window", None) is not None
+            log.info(
+                f"MINI_HUD: instance created (panel_level_upgraded={ns_ok})。"
+                f"{'跨 Space / 全螢幕可見' if ns_ok else '退化模式，僅同 Space 可見'}"
+            )
         except Exception:
             log_error("mini_window_init_failed")
             self._mini_window = None
@@ -2309,6 +2375,23 @@ class AppWindow(ctk.CTkFrame):
         self._hotkey_status.configure(text=cfg.format_hotkey_display())
         self._model_var.set(cfg.model)
         self._lang_var.set(cfg.language)
+        # F1（v2.12.0）：麥克風來源變更 → 套到 recorder。下次 start() 時用新 device。
+        # 不需要 stream restart，因為當前若在錄音中、user 該手動停止再換。
+        try:
+            if cfg.input_device:
+                ok = self.recorder.set_device_by_name(cfg.input_device)
+                if not ok:
+                    log.warning(
+                        f"RECORD: input_device '{cfg.input_device}' 找不到、"
+                        f"回退到系統預設"
+                    )
+                log_settings("device_applied", device=cfg.input_device, found=ok)
+            else:
+                # input_device=None → 用系統預設
+                self.recorder._device_index = None
+                log_settings("device_applied", device="(system default)")
+        except Exception:
+            log_error("settings_apply_device_failed")
         on = cfg.auto_paste
         self._ap_btn.configure(
             fg_color=INDIGO if on else SURF_1,
@@ -2997,6 +3080,47 @@ class SettingsWindow(ctk.CTkToplevel):
             ).pack(side="right")
 
         row(stt, "辨識語言", lang_row)
+        sep_line(stt)
+
+        # ── 麥克風來源（F1 / v2.12.0）────────────────────────────────────
+        # 列出本機所有有輸入聲道的音訊裝置（含實體 + 虛擬如 BlackHole / Loopback 等）
+        # 第一筆固定為「（系統預設）」對應 input_device=None。
+        from recorder import AudioRecorder as _AR
+        try:
+            self._available_devices = _AR.list_devices()
+        except Exception:
+            self._available_devices = []
+            log_error("settings_list_devices_failed")
+        # dropdown 顯示清單：先放「系統預設」，後面是各裝置名
+        self._device_values = ["（系統預設）"] + [d["name"] for d in self._available_devices]
+        # 初始選擇：cfg.input_device 對應的 device 名（找不到就回預設）
+        _current_dev = self.cfg.input_device
+        if _current_dev and _current_dev in (d["name"] for d in self._available_devices):
+            initial = _current_dev
+        else:
+            initial = "（系統預設）"
+        self._device_var = ctk.StringVar(value=initial)
+
+        def device_row(r):
+            ctk.CTkOptionMenu(
+                r, values=self._device_values,
+                variable=self._device_var,
+                width=240, height=30, corner_radius=8,
+                fg_color=SURF_2, button_color=SURF_2,
+                button_hover_color=SURF_3,
+                dropdown_fg_color=SURF_1,
+                text_color=TEXT_1,
+                font=ctk.CTkFont("SF Pro Text", 13),
+            ).pack(side="right")
+
+        row(stt, "麥克風來源", device_row)
+        ctk.CTkLabel(
+            stt,
+            text=f"偵測到 {len(self._available_devices)} 個輸入裝置；「系統預設」會跟隨 macOS 設定。",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
+            text_color=TEXT_3,
+            justify="left", anchor="w",
+        ).pack(anchor="w", padx=SPACE_LG, pady=(0, 10))
 
         # ── 快捷鍵 ────────────────────────────────────────────────────────
         hk = section("快捷鍵")
@@ -3065,7 +3189,48 @@ class SettingsWindow(ctk.CTkToplevel):
         row(ai, "啟用 AI 潤飾", make_sw(self._ollama_enabled_var, ACCENT))
         sep_line(ai)
 
-        # 模型名稱（文字輸入；未來可改為動態 dropdown）
+        # Bug D（v2.13.0）：貼上策略 chip — wait（品質優先）vs raw（速度優先）
+        # 預設 wait：等潤飾完再貼。對 12B 模型可能 3-20s，user 體感「貼上慢」。
+        # raw：先貼 Whisper 原文（即時），潤飾結果不再覆蓋（避免貼到不同視窗）。
+        # 適合：user 已經要快、品質可後續手動編輯。
+        self._paste_strategy_var = ctk.StringVar(
+            value=getattr(self.cfg, "ollama_paste_strategy", "wait")
+        )
+
+        def paste_strategy_row(r):
+            wrap = ctk.CTkFrame(r, fg_color="transparent")
+            wrap.pack(side="right")
+            self._paste_strategy_btns: dict[str, ctk.CTkButton] = {}
+            for value, label in (
+                ("wait", "等潤飾"),
+                ("raw", "先貼原文"),
+            ):
+                btn = ctk.CTkButton(
+                    wrap, text=label,
+                    width=80, height=30, corner_radius=8,
+                    font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
+                    border_width=1,
+                    command=lambda v=value: self._on_paste_strategy_clicked(v),
+                )
+                btn.pack(side="left", padx=(0, 4))
+                self._paste_strategy_btns[value] = btn
+            self._apply_paste_strategy_chip_style()
+
+        row(ai, "貼上策略", paste_strategy_row)
+        ctk.CTkLabel(
+            ai,
+            text=(
+                "等潤飾：等 AI 校正完成才貼上（品質優先、3-20s 視模型大小）\n"
+                "先貼原文：立即貼 Whisper 原文，潤飾結果只更新 UI 不再覆蓋（速度優先）"
+            ),
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
+            text_color=TEXT_3,
+            justify="left", anchor="w",
+        ).pack(anchor="w", padx=SPACE_LG, pady=(0, 10))
+        sep_line(ai)
+
+        # v2.13.0：模型下拉選單（自動偵測本機 Ollama 已安裝模型，取代手動輸入）
+        # get_models() 有 3s timeout，Ollama 沒跑也不會卡太久。
         model_row = ctk.CTkFrame(ai, fg_color="transparent", height=52)
         model_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
         model_row.pack_propagate(False)
@@ -3073,14 +3238,25 @@ class SettingsWindow(ctk.CTkToplevel):
             model_row, text="模型名稱", anchor="w",
             font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
         ).pack(side="left")
+        # 偵測 + 選預設
         self._ollama_model_var = ctk.StringVar(value=self.cfg.ollama_model)
-        ctk.CTkEntry(
-            model_row, textvariable=self._ollama_model_var,
-            width=200, height=30, corner_radius=8,
-            fg_color=SURF_2, border_color=SURF_3,
-            text_color=TEXT_1,
-            font=ctk.CTkFont(FONT_FAMILY_MONO, 12),
-        ).pack(side="right")
+        self._ollama_model_menu_wrap = ctk.CTkFrame(model_row, fg_color="transparent")
+        self._ollama_model_menu_wrap.pack(side="right")
+        self._build_ollama_model_menu()  # 建 OptionMenu + 刷新按鈕（首次同步偵測）
+        # v2.13.0：速度／品質提示（user 反映 12B 慢；3-4B 模型對純錯字校正夠用）
+        ctk.CTkLabel(
+            ai,
+            text=(
+                "速度建議（M 系列 Apple Silicon）：\n"
+                "• qwen2.5:3b-instruct — 1-2 秒（推薦，中文校正夠用）\n"
+                "• gemma3:4b — 1-3 秒（平衡）\n"
+                "• gemma3:12b — 3-6 秒（品質優、但體感較慢）\n"
+                "找不到模型？終端機跑 `ollama pull <名稱>` 後按 ↻ 重新偵測"
+            ),
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
+            text_color=TEXT_3,
+            justify="left", anchor="w",
+        ).pack(anchor="w", padx=SPACE_LG, pady=(0, 10))
         sep_line(ai)
 
         # Base URL（進階；一般使用者不需要改）
@@ -3223,8 +3399,9 @@ class SettingsWindow(ctk.CTkToplevel):
         dict_btn_row = ctk.CTkFrame(dsec, fg_color="transparent", height=52)
         dict_btn_row.pack(fill="x", padx=SPACE_LG, pady=(4, 8))
         dict_btn_row.pack_propagate(False)
+        # v2.13.0：動態顯示「目前 N 個 term」讓 user 知道字典規模
         self._dict_status_label = ctk.CTkLabel(
-            dict_btn_row, text="", anchor="w",
+            dict_btn_row, text=self._compute_dict_status(), anchor="w",
             font=ctk.CTkFont("SF Pro Text", 12), text_color=TEXT_3,
         )
         self._dict_status_label.pack(side="left")
@@ -3235,6 +3412,17 @@ class SettingsWindow(ctk.CTkToplevel):
             font=ctk.CTkFont("SF Pro Text", 12),
             command=self._open_dictionary_file,
         ).pack(side="right")
+        # v2.13.0：說明常見同音字消歧使用方式
+        ctk.CTkLabel(
+            dsec,
+            text=(
+                "字典術語會注入 Whisper 與 Ollama prompt，提升專有名詞辨識率。\n"
+                "例：把「Claude」「Cloud」「Cursor」加進去，可避免同音字誤判（/klɔːd/ vs /klaʊd/）。"
+            ),
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
+            text_color=TEXT_3,
+            justify="left", anchor="w",
+        ).pack(anchor="w", padx=SPACE_LG, pady=(0, 10))
 
         # ── 介面 (Phase 4.3) ────────────────────────────────────────────
         ui_sec = section("介面")
@@ -3420,6 +3608,30 @@ class SettingsWindow(ctk.CTkToplevel):
         except Exception:
             log_error("reduce_motion_live_apply_failed")
 
+    # Bug D（v2.13.0）：貼上策略 chip 樣式 / click handler ────────────────
+
+    def _apply_paste_strategy_chip_style(self) -> None:
+        """根據 _paste_strategy_var 重繪 2 顆 chip。"""
+        active = self._paste_strategy_var.get()
+        for value, btn in self._paste_strategy_btns.items():
+            if value == active:
+                btn.configure(
+                    fg_color=SURF_2, border_color=ACCENT,
+                    text_color=TEXT_1, hover_color=SURF_3,
+                )
+            else:
+                btn.configure(
+                    fg_color="transparent", border_color=SURF_3,
+                    text_color=TEXT_3, hover_color=SURF_2,
+                )
+
+    def _on_paste_strategy_clicked(self, value: str) -> None:
+        """點 chip → 預覽切換，按 Save 才落地到 cfg。"""
+        if value == self._paste_strategy_var.get():
+            return
+        self._paste_strategy_var.set(value)
+        self._apply_paste_strategy_chip_style()
+
     def _on_theme_clicked(self, new_theme: str) -> None:
         """使用者點主題 chip。跟現在不同就彈 confirm dialog。"""
         if new_theme == self.cfg.theme:
@@ -3567,11 +3779,19 @@ class SettingsWindow(ctk.CTkToplevel):
         """從表單欄位蒐集所有值、呼叫 cfg.save() 並通知主視窗。"""
         self.cfg.model          = self._model_var.get()
         self.cfg.language       = self._lang_var.get()
+        # F1（v2.12.0）：麥克風來源 — 顯示「（系統預設）」對應 None
+        _dev_sel = self._device_var.get()
+        if _dev_sel == "（系統預設）":
+            self.cfg.input_device = None
+        else:
+            self.cfg.input_device = _dev_sel
         self.cfg.append_results = self._append_var.get()
         self.cfg.auto_copy      = self._autocopy_var.get()
         self.cfg.auto_paste     = self._autopaste_var.get()
         # ── Ollama ────────────────────────────────────────────────────────
         self.cfg.ollama_enabled  = self._ollama_enabled_var.get()
+        # Bug D（v2.13.0）：貼上策略
+        self.cfg.ollama_paste_strategy = self._paste_strategy_var.get()
         model = self._ollama_model_var.get().strip()
         if model:
             self.cfg.ollama_model = model
@@ -3604,6 +3824,70 @@ class SettingsWindow(ctk.CTkToplevel):
         self.cfg.save()
         self._on_save_cb(self.cfg)   # 通知主視窗（destroy 由 _save 的 finally 負責）
 
+    # v2.13.0：Ollama 模型 dropdown ────────────────────────────────────────
+
+    def _build_ollama_model_menu(self) -> None:
+        """偵測本機 Ollama 模型、建立下拉選單（含刷新按鈕）。
+
+        - 開啟 Settings 時自動偵測一次（synchronous，3s timeout）
+        - 列表含「目前 cfg 值」即使本機沒這個模型也保留（避免清掉 user 設定）
+        - 點 ↻ 重新偵測（user `ollama pull` 後不用重開 Settings）
+        - Ollama 沒跑 → 列表只剩 cfg 值（避免 dropdown 變空）
+        """
+        # 清空現有 widget（refresh 用）
+        for w in self._ollama_model_menu_wrap.winfo_children():
+            w.destroy()
+
+        # 偵測模型清單
+        try:
+            installed = self._parent.ollama.get_models()
+        except Exception:
+            log_error("settings_get_ollama_models_failed")
+            installed = []
+
+        current = self._ollama_model_var.get().strip() or self.cfg.ollama_model
+        values = list(installed)
+        # 確保 current 值在列表內（即使本機沒裝、也讓 user 看到他選了什麼）
+        if current and current not in values:
+            values.append(current)
+        # 沒任何模型：顯示提示文字
+        if not values:
+            values = ["（Ollama 未啟動或無模型）"]
+            current = values[0]
+            self._ollama_model_var.set(current)
+
+        # OptionMenu 本體
+        ctk.CTkOptionMenu(
+            self._ollama_model_menu_wrap,
+            values=values,
+            variable=self._ollama_model_var,
+            width=200, height=30, corner_radius=8,
+            fg_color=SURF_2, button_color=SURF_2,
+            button_hover_color=SURF_3,
+            dropdown_fg_color=SURF_1,
+            text_color=TEXT_1,
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 12),
+        ).pack(side="left")
+        # 刷新按鈕（重新偵測 Ollama）
+        ctk.CTkButton(
+            self._ollama_model_menu_wrap,
+            text="↻", width=30, height=30, corner_radius=8,
+            fg_color=SURF_2, hover_color=SURF_3, border_width=1, border_color=SURF_3,
+            text_color=TEXT_2,
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 14),
+            command=self._refresh_ollama_model_list,
+        ).pack(side="left", padx=(4, 0))
+
+    def _refresh_ollama_model_list(self) -> None:
+        """重新偵測 Ollama 模型清單（不關閉 Settings）。"""
+        log_action("ollama_model_list_refresh")
+        # 先觸發 health check 同步（避免 stale）
+        try:
+            self._parent.ollama.health_check_sync()
+        except Exception:
+            pass
+        self._build_ollama_model_menu()
+
     def _reload_prompts_now(self) -> None:
         """立即觸發 PromptReloader.reload_now()，並以狀態標籤顯示結果。"""
         reloader = getattr(self._parent, "_prompt_reloader", None)
@@ -3621,6 +3905,24 @@ class SettingsWindow(ctk.CTkToplevel):
                 text_color=DANGER,
             )
 
+    def _compute_dict_status(self) -> str:
+        """讀字典檔回傳「目前 N 個 term + M 條 corrections」狀態字串。"""
+        try:
+            path_str = (self.cfg.dictionary_path or "").strip() or str(_dictionary.DEFAULT_PATH)
+            from pathlib import Path as _P
+            path = _P(path_str).expanduser()
+            if not path.exists():
+                return "字典檔不存在（點按鈕建立）"
+            import json as _json
+            data = _json.loads(path.read_text(encoding="utf-8"))
+            n_terms = len(data.get("terms", []))
+            n_corr = len(data.get("corrections", []))
+            if n_corr:
+                return f"目前 {n_terms} 個 term、{n_corr} 條校正規則"
+            return f"目前 {n_terms} 個 term"
+        except Exception:
+            return "讀取字典失敗"
+
     def _open_dictionary_file(self) -> None:
         """在預設編輯器開啟字典 JSON。"""
         path_str = (self._dict_path_var.get().strip()
@@ -3631,7 +3933,7 @@ class SettingsWindow(ctk.CTkToplevel):
         try:
             subprocess.run(["open", str(path)])
             self._dict_status_label.configure(
-                text=f"已開啟 {path.name}", text_color=TEXT_3,
+                text=f"已開啟 {path.name}（編輯後存檔自動生效）", text_color=TEXT_3,
             )
         except Exception as e:
             self._dict_status_label.configure(
@@ -4868,6 +5170,7 @@ class MiniRecordingWindow(tk.Toplevel):
         """把對應 NSWindow 升到 NSStatusWindowLevel + collectionBehavior。
 
         失敗時靜默 fallback；HUD 仍能用，只是缺「跨 Space / 全螢幕可見」。
+        Bug A（v2.12.0）：升級失敗時加 `-topmost` 兜底，至少同 Space 在最頂。
         """
         try:
             from AppKit import NSApp  # type: ignore
@@ -4884,14 +5187,28 @@ class MiniRecordingWindow(tk.Toplevel):
 
             if ns_window is None:
                 log_error("mini_hud_nswindow_not_found")
+                self._fallback_topmost()  # Bug A：找不到 NSWindow → topmost 兜底
                 return
 
             self._apply_panel_level(ns_window)
             self._ns_window = ns_window
             log_state("mini_hud_panel_level_upgraded")
         except Exception as e:
-            # PyObjC import 失敗或其他例外 → fallback 成普通 Toplevel
+            # PyObjC import 失敗或其他例外 → fallback 成普通 Toplevel + topmost
             log_error(f"mini_hud_panel_upgrade_failed: {e}")
+            self._fallback_topmost()
+
+    def _fallback_topmost(self) -> None:
+        """Bug A（v2.12.0）：NSPanel-level 升級失敗時的兜底措施。
+
+        無法跨 Space / 全螢幕可見，但至少在「同 Space」最頂端，使用者仍能
+        看到 mini HUD（總比完全看不見好）。Tk `-topmost` 跨平台、無 PyObjC 依賴。
+        """
+        try:
+            self.attributes("-topmost", True)
+            log.info("MINI_HUD: panel-level 升級失敗，啟用 Tk -topmost fallback")
+        except Exception:
+            log_error("mini_hud_topmost_fallback_failed")
 
     def _reapply_panel_level(self) -> None:
         """B4（v2.7.0）：每次 show_* 前 re-apply NSWindow level。
@@ -4913,8 +5230,10 @@ class MiniRecordingWindow(tk.Toplevel):
 
         每次顯示前重新定位到游標所在螢幕中下方（Speakly 風格）。
         B4（v2.7.0）：deiconify 後 re-apply panel level（cheap 保險）。
+        Bug A（v2.12.0）：加診斷 log（geometry + 視窗 state）+ topmost 重新確認。
         """
         if self._closed:
+            log.warning("MINI_HUD: show_recording on closed window, skip")
             return
         self._position_at_cursor_screen_bottom()
         self._dot.configure(fg=DANGER)
@@ -4922,6 +5241,16 @@ class MiniRecordingWindow(tk.Toplevel):
         self._timer.configure(text="00:00")
         self.deiconify()
         self._reapply_panel_level()
+        # Bug A：若 NSPanel 升級失敗（_ns_window=None），重新跑 topmost 保證可見
+        if self._ns_window is None:
+            self._fallback_topmost()
+        try:
+            log.info(
+                f"MINI_HUD: show_recording → geom={self.winfo_geometry()} "
+                f"state={self.state()} ns_panel={'on' if self._ns_window else 'fallback'}"
+            )
+        except Exception:
+            pass
 
     def show_processing(self) -> None:
         """進入處理中狀態 → 琥珀色 + 「轉錄中」。

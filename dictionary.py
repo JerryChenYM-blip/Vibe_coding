@@ -105,3 +105,57 @@ def load_terms(path: PathLike = DEFAULT_PATH) -> list[str]:
     except Exception:
         log_error("dictionary_load_terms_failed", path=str(path))
         return []
+
+
+def load_corrections(path: PathLike = DEFAULT_PATH) -> list[tuple[str, str]]:
+    """讀字典的 `corrections` 段（v2.13.0），回傳 (from, to) tuple list。
+
+    用途：規則式預先校正 — Whisper 系統性誤辨識（例：Cloud Code → Claude Code）
+    走字串替換 < 1ms 解決，不需要靠 LLM 推理。校正在 transcribe() 完後、polish
+    之前套用，連 polish 都 disable 的情況也生效。
+
+    Schema：
+      {
+        "corrections": [
+          {"from": "Cloud Code", "to": "Claude Code", "note": "..."}
+        ]
+      }
+
+    保序：依字典出現順序套用、user 可控優先級。長字串應該排前面（避免短字串
+    先 match 吃掉部分）。
+    """
+    try:
+        p = Path(path).expanduser() if not isinstance(path, Path) else path
+        if not p.exists():
+            return []
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return []
+        raw = data.get("corrections", [])
+        out: list[tuple[str, str]] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            src = str(entry.get("from", "")).strip()
+            dst = str(entry.get("to", "")).strip()
+            if src and dst and src != dst:
+                out.append((src, dst))
+        return out
+    except Exception:
+        log_error("dictionary_load_corrections_failed", path=str(path))
+        return []
+
+
+def apply_corrections(text: str, corrections: list[tuple[str, str]]) -> str:
+    """套用 corrections list 到 text；保序、不對已替換的內容再 match。
+
+    用 Python str.replace 一條條套用。corrections 排序由 caller 決定
+    （load_corrections 保留字典順序、user 可控）。
+    """
+    if not text or not corrections:
+        return text
+    out = text
+    for src, dst in corrections:
+        if src in out:
+            out = out.replace(src, dst)
+    return out
