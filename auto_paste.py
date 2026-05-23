@@ -30,9 +30,13 @@ def get_frontmost_app() -> Optional[str]:
     透過 osascript 執行一小段 AppleScript，查詢 System Events
     目前 frontmost=true 的 process 名稱。
 
+    D5-S10（v2.10.0 / 2026-05-23）：強化 timeout/格式處理
+      • osascript 可能回多行（罕見 race）→ 只取第一行非空字串
+      • timeout 從 2 降為 1.2（System Events 通常 <50ms）
+      • subprocess.TimeoutExpired 單獨分支，log 顯示原因
+
     Returns:
-        前景 App 的顯示名稱字串（例如 "Notion"、"Slack"），
-        若 osascript 失敗或回傳空字串則回傳 None。
+        前景 App 的顯示名稱字串，失敗 / 空字串 / 超時都回 None。
     """
     try:
         result = subprocess.run(
@@ -44,11 +48,25 @@ def get_frontmost_app() -> Optional[str]:
             ],
             capture_output=True,
             text=True,
-            timeout=2,   # 防止 osascript 卡住阻塞 UI 執行緒
+            timeout=1.2,
         )
-        name = result.stdout.strip()
-        log.debug(f"AUTO-PASTE: frontmost app = '{name}'")
-        return name or None   # 空字串轉 None，讓呼叫端統一判斷
+        if result.returncode != 0:
+            log_error(
+                "get_frontmost_app_nonzero",
+                rc=result.returncode,
+                stderr=(result.stderr or "")[:200],
+            )
+            return None
+        # D5-S10：取第一行非空字串（防 osascript 偶發多行輸出）
+        raw = (result.stdout or "").strip()
+        if not raw:
+            return None
+        first_line = raw.splitlines()[0].strip()
+        log.debug(f"AUTO-PASTE: frontmost app = '{first_line}'")
+        return first_line or None
+    except subprocess.TimeoutExpired:
+        log_error("get_frontmost_app_timeout", timeout_s=1.2)
+        return None
     except Exception:
         log_error("get_frontmost_app_failed")
         return None
@@ -97,12 +115,25 @@ def paste_to_app(
         is_fullscreen = _is_app_fullscreen(app_name)
         delay = fullscreen_activate_delay if is_fullscreen else activate_delay
         try:
-            # AppleScript 字串內必須 escape 雙引號和反斜線
+            # D5-S10（v2.10.0 / 2026-05-23）：capture osascript stderr，timeout
+            # 從 3 降為 1.5（activate 不該等這麼久）；timeout / 非 0 returncode
+            # 都當 activate 失敗 log_error 帶 stderr，但仍繼續送 ⌘V。
+            # AppleScript 字串內必須 escape 雙引號和反斜線。
             safe_name = app_name.replace("\\", "\\\\").replace('"', '\\"')
-            subprocess.run(
-                ["osascript", "-e", f'tell application "{safe_name}" to activate'],
-                timeout=3,
-            )
+            try:
+                result = subprocess.run(
+                    ["osascript", "-e", f'tell application "{safe_name}" to activate'],
+                    capture_output=True, text=True, timeout=1.5,
+                )
+                if result.returncode != 0:
+                    log_error(
+                        "auto_paste_activate_nonzero",
+                        app=app_name,
+                        rc=result.returncode,
+                        stderr=(result.stderr or "")[:200],
+                    )
+            except subprocess.TimeoutExpired:
+                log_error("auto_paste_activate_timeout", app=app_name, timeout_s=1.5)
             time.sleep(delay)
 
             # Bug 2：activate 後 poll frontmost 確認真的切過去（最多再等 max_wait）。

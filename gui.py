@@ -587,8 +587,14 @@ class AppWindow(ctk.CTkFrame):
             scrollbar_button_hover_color=SURF_4,
         )
         self._blocks_container.pack(fill="both", expand=True, padx=SPACE_SM, pady=(4, 10))
-        # 區塊列表（最舊在 [0]、最新在 [-1]）
+        # 區塊列表（v2.8.0 Bug 3 反轉後：最新在 [0]、最舊在 [-1]）
         self._utterance_blocks: list[UtteranceBlock] = []
+
+        # D3-S7（v2.10.0）：動態 wraplength。視窗 resize 時更新所有 block 的
+        # wraplength = container.width - container padding - block border 預留。
+        # debounce 80ms 避免 resize 拖曳時 fire 過頻。
+        self._wraplength_debounce_id: Optional[str] = None
+        self._blocks_container.bind("<Configure>", self._on_blocks_container_resize)
         # 佔位文字（沒有任何 block 時顯示）
         self._placeholder_label: Optional[ctk.CTkLabel] = None
         self._show_placeholder()
@@ -1420,13 +1426,22 @@ class AppWindow(ctk.CTkFrame):
         block.highlight_as_latest(True)
         self._utterance_blocks.insert(0, block)
 
-        # 自動 scroll 到頂（最新永遠在頂部）
+        # D3-S5（v2.10.0 / 2026-05-23）：auto-scroll 兩段式
+        # 第一段：強制 layout 跑完（update_idletasks）→ 確保 _parent_canvas
+        # 已知道新 block 的高度。
+        # 第二段：after(150ms) 再 scroll 一次保險（macOS Tk 某些版本第一輪
+        # idle 還沒 commit layout 就 scroll 會跳到舊位置）。Bug 3 反轉後現在
+        # scroll 到頂（moveto 0.0），但 layout 沒算完 scroll 還是失效。
         def _scroll_to_top():
             try:
+                self._blocks_container.update_idletasks()
                 self._blocks_container._parent_canvas.yview_moveto(0.0)
             except Exception:
                 pass
-        self.after(50, _scroll_to_top)
+        # 立刻試一次（多數情況夠）
+        self.after(0, _scroll_to_top)
+        # 150ms 後再試一次（保險：layout 慢於預期）
+        self.after(150, _scroll_to_top)
 
     # ═══════════════════════════════════════════════════════════════════════
     #  AMBIENT CHAMBER — render loop + draw + events
@@ -1738,6 +1753,33 @@ class AppWindow(ctk.CTkFrame):
         except Exception as e:
             log_error("copy_failed", text_len=len(text))
             self._show_toast(f"複製失敗: {e}")
+
+    # D3-S7（v2.10.0）：動態 wraplength ────────────────────────────────────
+
+    def _on_blocks_container_resize(self, event=None) -> None:
+        """blocks_container resize 時 debounce 80ms 後更新所有 block 的 wraplength。"""
+        if self._wraplength_debounce_id is not None:
+            try:
+                self.after_cancel(self._wraplength_debounce_id)
+            except Exception:
+                pass
+        self._wraplength_debounce_id = self.after(80, self._apply_wraplength_to_blocks)
+
+    def _apply_wraplength_to_blocks(self) -> None:
+        """計算當前 container 寬度並套用到所有 block 的 text label。"""
+        self._wraplength_debounce_id = None
+        try:
+            # container.winfo_width() 含 scrollbar；扣除 block padding（左右各 SPACE_XS）
+            # 與 block 內 text padding（左右各 SPACE_MD），保留下限 280 避免被 resize 到 0
+            width = self._blocks_container.winfo_width()
+            new_wrap = max(280, width - (SPACE_XS * 2) - (SPACE_MD * 2) - 20)
+            for blk in self._utterance_blocks:
+                try:
+                    blk.update_wraplength(new_wrap)
+                except Exception:
+                    pass
+        except Exception:
+            log_error("blocks_wraplength_update_failed")
 
     def _on_block_copy(self, block: "UtteranceBlock") -> None:
         """Per-block 複製圖示：直接複製這個 block 的目前顯示文字。"""
@@ -2190,7 +2232,15 @@ class AppWindow(ctk.CTkFrame):
             block.pack(fill="x", padx=SPACE_XS, pady=(0, 8))
         block.highlight_as_latest(True)
         self._utterance_blocks.insert(0, block)
-        self.after(50, lambda: self._blocks_container._parent_canvas.yview_moveto(0.0))
+        # D3-S5：兩段式 scroll（同 _display_result）
+        def _scroll_to_top_history():
+            try:
+                self._blocks_container.update_idletasks()
+                self._blocks_container._parent_canvas.yview_moveto(0.0)
+            except Exception:
+                pass
+        self.after(0, _scroll_to_top_history)
+        self.after(150, _scroll_to_top_history)
 
         self._apply_toggle_style()
         self._frontmost_app = entry.target_app   # 讓 preset 路由走原本的 app
@@ -4043,11 +4093,19 @@ class HotkeyBindDialog(ctk.CTkToplevel):
         except Exception:
             pass
         # Cluster H：dialog 關閉時 restart hotkey monitor 回來（無論走 _apply / 取消 / 紅×）
+        # D4-S6（v2.10.0 / 2026-05-23）：用 hotkey_mgr 內部 `_combo_str`（上次 restart
+        # 用的 combo）而非 `aw.cfg.hotkey`。當 user 在 SettingsWindow 內已透過
+        # HotkeyBindDialog 改了 _apply_hotkey（寫 SettingsWindow.cfg.hotkey）但
+        # 還沒按 Save → AppWindow.cfg.hotkey 仍是舊值；restart 用 aw.cfg.hotkey
+        # 雖然能 resume 監聽，但對舊 cfg 一致；改用 `_combo_str` 也一樣（兩者
+        # 在這個時點是同的），純粹更貼近「resume 當前 effective combo」語意，
+        # 避免未來 cfg 被別處非同步改動時 race。
         if getattr(self, "_app_window", None) is not None:
             try:
                 aw = self._app_window
-                aw.hotkey_mgr.restart(aw.cfg.hotkey)
-                log.info("HOTKEY: monitor resumed after HotkeyBindDialog")
+                last_combo = getattr(aw.hotkey_mgr, "_combo_str", None) or aw.cfg.hotkey
+                aw.hotkey_mgr.restart(last_combo)
+                log.info(f"HOTKEY: monitor resumed after HotkeyBindDialog (combo={last_combo!r})")
                 self._app_window = None   # 防止重複 restart
             except Exception:
                 log_error("hotkey_mgr_resume_after_dialog_failed")
@@ -4868,11 +4926,15 @@ class MiniRecordingWindow(tk.Toplevel):
     def show_processing(self) -> None:
         """進入處理中狀態 → 琥珀色 + 「轉錄中」。
 
-        錄音剛結束時延續錄音時的位置；不重定位，避免 HUD 跳動。
+        D3-S6（v2.10.0 / 2026-05-23）：原本「不重定位以避免跳動」的設計
+        在多螢幕場景下會把 HUD 留在錄音時的螢幕上，user 若把焦點 / 游標
+        移到副螢幕就看不到「轉錄中」狀態。改成 always 重定位到游標所在
+        螢幕；單螢幕用戶感知不到（位置不變）。
         B4（v2.7.0）：deiconify 後 re-apply panel level。
         """
         if self._closed:
             return
+        self._position_at_cursor_screen_bottom()   # D3-S6：multi-monitor 跟手
         self._dot.configure(fg=WARN)
         self._label.configure(text="轉錄中")
         self.deiconify()
