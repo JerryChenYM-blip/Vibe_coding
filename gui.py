@@ -3245,6 +3245,20 @@ class SettingsWindow(ctk.CTkToplevel):
             text_color=TEXT_1,
             font=ctk.CTkFont(FONT_FAMILY_MONO, 12),
         ).pack(side="right")
+        # v2.13.0：速度／品質提示（user 反映 12B 慢；3-4B 模型對純錯字校正夠用）
+        ctk.CTkLabel(
+            ai,
+            text=(
+                "速度建議（M 系列 Apple Silicon）：\n"
+                "• qwen2.5:3b-instruct — 1-2 秒（推薦，中文校正夠用）\n"
+                "• gemma3:4b — 1-3 秒（平衡）\n"
+                "• gemma3:12b — 3-6 秒（品質優、但體感較慢）\n"
+                "終端機跑 `ollama pull qwen2.5:3b-instruct` 安裝"
+            ),
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
+            text_color=TEXT_3,
+            justify="left", anchor="w",
+        ).pack(anchor="w", padx=SPACE_LG, pady=(0, 10))
         sep_line(ai)
 
         # Base URL（進階；一般使用者不需要改）

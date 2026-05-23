@@ -39,11 +39,17 @@ DEFAULT_BASE_URL = "http://localhost:11434"
 DEFAULT_MODEL    = "qwen2.5:3b-instruct"
 
 # 潤飾任務用的 LLM 參數（規劃書 6.3）
-_POLISH_OPTIONS: dict = {
+# v2.13.0：num_predict 從固定 1024 改成 process() 內依輸入長度自適應。
+# top_p 留 0.9（穩定）、temperature 0.2（少量創意修錯字、不太敢加料）。
+_POLISH_OPTIONS_BASE: dict = {
     "temperature": 0.2,
     "top_p":       0.9,
-    "num_predict": 1024,
 }
+
+# v2.13.0：Ollama keep_alive — 模型載入 VRAM 後保留多久。
+# Ollama 預設 5 分鐘，user 反映「使用後 GPU 一路高負載」其實是 VRAM 佔用，
+# compute 為 0。縮成 "2m" — 連續使用仍快、停止 2 分鐘後釋放 ~12GB VRAM。
+_OLLAMA_KEEP_ALIVE = "2m"
 
 # health check 用較短 timeout
 _HEALTH_TIMEOUT_SEC = 1.5
@@ -229,11 +235,18 @@ class OllamaClient:
                 log_error("format_polish_prompt_failed")
 
         prompt = prompt_template.format(text=text)
+        # v2.13.0：num_predict 自適應 — 輸出長度通常 ≈ 輸入（校正錯字 + 標點，不增刪內容）
+        # 預留 1.5x buffer 避免長句裁切；下限 64 tokens 給超短句留 headroom。
+        # 中文每字約 1 token，英文約 0.5 token；以輸入長度 × 1.5 上限估算最寬鬆值。
+        adaptive_num_predict = max(64, int(len(text) * 2.0))
+        options = {**_POLISH_OPTIONS_BASE, "num_predict": adaptive_num_predict}
         payload = {
-            "model":   self.config.model,
-            "prompt":  prompt,
-            "stream":  self.config.stream and on_token is not None,
-            "options": _POLISH_OPTIONS,
+            "model":      self.config.model,
+            "prompt":     prompt,
+            "stream":     self.config.stream and on_token is not None,
+            "options":    options,
+            # v2.13.0：縮短 VRAM keep_alive（避免 user 看到「不用也高負載」）
+            "keep_alive": _OLLAMA_KEEP_ALIVE,
         }
 
         t0 = time.perf_counter()
