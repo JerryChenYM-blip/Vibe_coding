@@ -246,6 +246,11 @@ class OllamaClient:
             "options":    options,
             # v2.13.0：縮短 VRAM keep_alive（避免 user 看到「不用也高負載」）
             "keep_alive": _OLLAMA_KEEP_ALIVE,
+            # v2.13.1：關 Qwen 3+ / DeepSeek-R1 等 reasoning model 的 thinking mode。
+            # polish 是 deterministic 校正任務不需要 chain-of-thought；thinking 會
+            # 把整個 num_predict 配額耗在 <think>...</think> 內、最後輸出空字串。
+            # Ollama /api/generate 自 v0.x 支援這個 top-level 參數；老版本忽略不傷。
+            "think":      False,
         }
         # v2.13.0：instruct 模型加 system role 鎖定行為。
         # qwen2.5:3b-instruct 對純 prompt 易過度發揮（擴寫、翻譯成英文）
