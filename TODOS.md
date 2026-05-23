@@ -51,3 +51,23 @@ P1（real bug）+ P2（worth fixing）共 4 個 bug 已在 Fix 9 修掉並補 7 
   - 修法：右/上邊用 `<` 開區間。
 
 ---
+
+## 2026-05-23（Fix 19 follow-up：結果區 Speakly-style 重構）
+
+來源：`/plan-eng-review` D2 三明治決議 ── Fix 19 PR 出 Path A（複製只取最後一段）、
+Path B（完整 Speakly-style list-of-blocks UI 重構）延後到本條。先用一週判斷
+Path A 是否已足夠，再決定 Path B 是否真的要做。
+
+- [ ] **Path B：結果區重構為 Speakly-style UtteranceBlock list**
+  - 來源：Fix 19 範圍決議 C（2026-05-23），使用者要求最終 UI 對齊 Speakly 截圖
+  - 範疇估計：~300-400 LOC 新 widget + 重構：
+    - 新增 `UtteranceBlock(ctk.CTkFrame)`：timestamp + text + 個別 copy/polish icon
+    - `ScrollableFrame` 取代現有 `_textbox`
+    - 重寫 `_show_result` / `_apply_polish_to_textbox` / `_get_result_text`
+    - 移除 `latest_start..latest_end` Tk marks（改 list index）
+  - 阻塞：必須先走 `/plan-design-review` 釐清互動模型：
+    - 「原文/潤飾 toggle」per-block 還是 global
+    - 每 block 獨立按鈕還是 hover-only
+    - 主視窗結果區與歷史視窗的關係（合併 / 分開 / 雙視圖）
+  - 為什麼不在 Fix 19 一起做：UI 重設計風險高，使用者需要先用 Path A 一週判斷需求
+

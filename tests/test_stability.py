@@ -185,6 +185,10 @@ def _make_stub_appwindow_for_watchdog():
     win.hotkey_mgr = MagicMock()
     win.hotkey_mgr._monitor_global = object()
     win.hotkey_mgr._monitor_local  = object()
+    win.hotkey_mgr._last_event_at = time.monotonic()   # 預設「剛剛有事件」
+    # Fix 18 / 2026-05-23：watchdog 新分支需要 _state + _last_hotkey_force_restart
+    win._state = "idle"
+    win._last_hotkey_force_restart = time.monotonic()
     # after 攔成 no-op（不然會卡到真正的 Tk 排程）
     win.after = MagicMock()
     return win
@@ -528,3 +532,136 @@ def test_p2b_minihud_title_unique_per_instance():
     assert m1._ns_title != m2._ns_title
     assert m1._ns_title.startswith("WhisperProMiniHUD-")
     assert m2._ns_title.startswith("WhisperProMiniHUD-")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Fix 18 — 熱鍵閒置 resilience v2（handler 強引用 + 10min force-restart）
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_fix18_layer1_nsevent_handler_strong_ref_held():
+    """Fix 18 Layer 1：bound method 必須存成 instance attribute 強引用。
+
+    根因：原本 `self._on_ns_event_global` 每次 access re-create transient bound
+    method，PyObjC bridge 跨 GC 週期可能失去引用 → 閒置 60+ min 後 ObjC block
+    指向已釋放的 Python callable → 事件 silent noop。
+
+    驗證：HotkeyManager 必須有 _ns_handler_global / _ns_handler_local 兩個屬性
+    存在（即使尚未啟動 monitor 也要初始化為 None），且啟動後是 method-like 物件。
+    """
+    mgr = HotkeyManager(on_tap_cb=lambda: None)
+    # 屬性必須存在（避免 _start_nsevent_monitors 內 setattr 才生效卻被 GC）
+    assert hasattr(mgr, "_ns_handler_global")
+    assert hasattr(mgr, "_ns_handler_local")
+    # 初始值為 None（尚未呼叫 restart）
+    assert mgr._ns_handler_global is None
+    assert mgr._ns_handler_local is None
+
+
+def test_fix18_layer2_watchdog_force_restart_periodic():
+    """Fix 18 Layer 2：閒置 + 超過 10 分鐘上次 restart → force restart。"""
+    win = _make_stub_appwindow_for_watchdog()
+    # monitor 物件「還活著」（_monitor_global / local 都 non-None）
+    # 但上次 restart 是 11 分鐘前
+    win._last_hotkey_force_restart = time.monotonic() - 660.0
+    win._state = "idle"
+
+    win._hotkey_watchdog()
+
+    win.hotkey_mgr.restart.assert_called_once_with("cmd+alt+r")
+    # restart 後時間戳必須更新
+    assert time.monotonic() - win._last_hotkey_force_restart < 1.0
+
+
+def test_fix18_layer2_watchdog_force_restart_skipped_during_recording():
+    """Fix 18 Layer 2：錄音中跳過 force-restart（避免吞掉 stop 訊號）。
+
+    根因：restart 期間 NSEvent monitor 短暫拔掉 ~50ms，使用者錄音中按 hotkey 想停止
+    剛好打在這個 window → 訊號遺失、錄音卡住。錄音中必須跳過 periodic restart。
+    """
+    win = _make_stub_appwindow_for_watchdog()
+    win._last_hotkey_force_restart = time.monotonic() - 660.0   # > 10 min
+    win._state = "recording"   # 錄音中
+
+    win._hotkey_watchdog()
+
+    # 完全不應該 restart
+    win.hotkey_mgr.restart.assert_not_called()
+
+
+def test_fix18_layer3_watchdog_diagnostic_silent_monitor():
+    """Fix 18 Layer 3：monitor alive 但 5 分鐘沒事件 → log 診斷訊息（不主動 restart）。
+
+    從 log 角度驗證：watchdog 抓到 silent state 時不會把 hotkey_mgr.restart 叫出來
+    （那是 Layer 2 force-restart 的工作；Layer 3 純診斷）。所以 restart 不被 call、
+    after 仍排下一次。
+    """
+    win = _make_stub_appwindow_for_watchdog()
+    # 模擬：monitor 物件還活著，但 6 分鐘沒任何事件，且還沒到 10min force-restart 門檻
+    win.hotkey_mgr._last_event_at = time.monotonic() - 360.0   # 6 min silent
+    win._last_hotkey_force_restart = time.monotonic() - 60.0   # 只過了 1 min，不該 force restart
+    win._state = "idle"
+
+    win._hotkey_watchdog()
+
+    # Layer 3 是診斷 log，不應該 restart
+    win.hotkey_mgr.restart.assert_not_called()
+    # 但仍要排下一次 watchdog
+    win.after.assert_called_once()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Fix 19 — 複製按鈕只取最後一段（不是整段累積）
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _make_stub_appwindow_for_copy():
+    """繞過 __init__ 建出含 _textbox / _get_result_text / _show_toast 的 stub。"""
+    from gui import AppWindow
+    win = AppWindow.__new__(AppWindow)
+    win._textbox = MagicMock()
+    win._show_toast = MagicMock()
+    win._get_result_text = MagicMock(return_value="")   # fallback 用
+    return win
+
+
+def test_fix19_on_copy_uses_latest_mark_only():
+    """Fix 19：_on_copy 只取 latest_start..latest_end 範圍，不取整段。"""
+    win = _make_stub_appwindow_for_copy()
+    # 模擬 textbox.get("latest_start", "latest_end") 回「我當然就好奇了。」
+    win._textbox.get.return_value = "我當然就好奇了。  "   # 含尾隨空白
+
+    import sys
+    fake_pyperclip = types.SimpleNamespace(copy=MagicMock())
+    sys.modules["pyperclip"] = fake_pyperclip
+    try:
+        win._on_copy()
+    finally:
+        sys.modules.pop("pyperclip", None)
+
+    # textbox.get 必須是用 latest_start / latest_end 兩個 mark
+    win._textbox.get.assert_called_once_with("latest_start", "latest_end")
+    # 剪貼簿收到的是 strip 過的最後一段（不含前面歷史）
+    fake_pyperclip.copy.assert_called_once_with("我當然就好奇了。")
+    # toast 顯示新文字
+    win._show_toast.assert_called_once_with("已複製最後一段")
+
+
+def test_fix19_on_copy_fallback_when_no_latest_mark():
+    """Fix 19：textbox.get raise（mark 不存在）→ fallback 走 _get_result_text。"""
+    win = _make_stub_appwindow_for_copy()
+    # mark 不存在 → Tk 會 raise TclError；模擬 generic Exception 也走 fallback
+    win._textbox.get.side_effect = RuntimeError("no such mark")
+    # _get_result_text 也回空（首次啟動的真實狀況）
+    win._get_result_text.return_value = ""
+
+    import sys
+    fake_pyperclip = types.SimpleNamespace(copy=MagicMock())
+    sys.modules["pyperclip"] = fake_pyperclip
+    try:
+        win._on_copy()
+    finally:
+        sys.modules.pop("pyperclip", None)
+
+    # 空字串 → 不該呼叫 pyperclip
+    fake_pyperclip.copy.assert_not_called()
+    # 也不該 show toast（log_action("copy_clicked_empty") 而已）
+    win._show_toast.assert_not_called()

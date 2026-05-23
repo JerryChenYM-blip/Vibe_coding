@@ -152,6 +152,17 @@ class AppWindow(ctk.CTkFrame):
     # 5 秒：權衡 detect latency 與 µs 級檢查成本。
     HOTKEY_WATCHDOG_INTERVAL_MS = 5000
 
+    # Fix 18 / 2026-05-23（Layer 2）：每 N 毫秒無條件 force-restart NSEvent monitor。
+    # 即使 monitor 物件還 alive、其底層 ObjC block 仍可能在閒置 1hr+ 後被 invalidate
+    # 而 watchdog 偵測不到（_monitor_global is not None 仍成立）。10 分鐘是
+    # 跟 pynput 時期 Layer 3 同樣節奏的 belt-and-suspenders；錄音中跳過避免吞 stop。
+    HOTKEY_FORCE_RESTART_INTERVAL_MS = 600_000
+
+    # Fix 18 / 2026-05-23（Layer 3）：監聽 monitor "alive" 但事件靜默的閾值。
+    # 超過此秒數沒收到任何 modifier 事件 + App active + idle → log 警告（不主動修，
+    # Layer 2 force-restart 已兜底）。純診斷用，未來看 log 趨勢決定要不要調整。
+    HOTKEY_SILENT_THRESHOLD_S = 300.0
+
     # Fix 10 / 2026-05-23：NSEvent handler 擱置的 tap 觸發輪詢間隔。
     # 詳見 _hotkey_tap / _poll_pending_tap 的 docstring（PyObjC + Tk GIL 衝突修法）。
     # 20ms 是 50 Hz 輪詢，使用者按鍵感受不到延遲；CPU 成本忽略不計。
@@ -198,6 +209,10 @@ class AppWindow(ctk.CTkFrame):
         # GIL 由 PyGILState_Ensure 拿著、安全），實際分派由 _poll_cocoa_pending_actions
         # 在 Tk mainloop iteration 跑。
         self._cocoa_pending_actions: list = []
+
+        # Fix 18 / 2026-05-23（Layer 2）：上次 force-restart NSEvent monitor 時間戳。
+        # 詳見 HOTKEY_FORCE_RESTART_INTERVAL_MS 與 _hotkey_watchdog。
+        self._last_hotkey_force_restart: float = time.monotonic()
 
         # State
         self._state:       str   = "idle"
@@ -1594,16 +1609,29 @@ class AppWindow(ctk.CTkFrame):
             self._transition_to_processing()
 
     def _on_copy(self) -> None:
-        """複製按鈕：將目前 textbox 內容複製到剪貼簿。"""
-        text = self._get_result_text()
+        """複製按鈕：將「最新一段」轉錄結果複製到剪貼簿。
+
+        Fix 19 / 2026-05-23 — 行為從「複製整段累積歷史」改成「複製最後一段」。
+        使用者預期跟 Speakly 一致：每次錄完音點複製 = 拿那一段話。利用既有的
+        `latest_start..latest_end` Tk mark（原本給 Polish 替換用）精準圈住最新段。
+
+        Mark 不存在的情境（App 剛啟動還沒任何錄音）→ fallback 全段（會是空）。
+        存檔（_on_save）語意維持「整段歷史」不動，使用者要存整輪對話的場景。
+        """
+        try:
+            text = self._textbox.get("latest_start", "latest_end").strip()
+        except Exception:
+            # latest_start/end mark 尚未 mark_set（首次啟動還沒任何錄音）
+            text = self._get_result_text()
+
         if not text:
             log_action("copy_clicked_empty")
             return
         try:
             import pyperclip
             pyperclip.copy(text)
-            log_action("copy_succeeded", text_len=len(text))
-            self._show_toast("已複製到剪貼簿")
+            log_action("copy_succeeded", text_len=len(text), scope="latest")
+            self._show_toast("已複製最後一段")
         except Exception as e:
             log_error("copy_failed", text_len=len(text))
             self._show_toast(f"複製失敗: {e}")
@@ -2008,6 +2036,49 @@ class AppWindow(ctk.CTkFrame):
                 log.warning("HOTKEY: watchdog restarting NSEvent monitor (reason=monitor_missing)")
                 log_action("hotkey_listener_auto_restarted", reason="monitor_missing")
                 mgr.restart(self.cfg.hotkey)
+                self._last_hotkey_force_restart = time.monotonic()
+            else:
+                now = time.monotonic()
+
+                # Fix 18 / 2026-05-23（Layer 2）：每 10 分鐘 force-restart。
+                # 實機觀察：閒置 ~60 min 後 NSEvent monitor 物件仍 alive 但 ObjC
+                # block 失效，handler 收不到事件。watchdog 用 is_not_None 偵測不到。
+                # 唯一可靠的修法是定時 force restart。state guard：錄音中跳過，
+                # 避免 50ms restart window 吞掉使用者的 stop tap。
+                since_restart = now - self._last_hotkey_force_restart
+                if (
+                    self._state == "idle"
+                    and since_restart * 1000.0 > self.HOTKEY_FORCE_RESTART_INTERVAL_MS
+                ):
+                    log.info(
+                        f"HOTKEY: watchdog force-restart (reason=periodic, "
+                        f"since_last={since_restart:.0f}s)"
+                    )
+                    log_action("hotkey_listener_auto_restarted", reason="periodic")
+                    mgr.restart(self.cfg.hotkey)
+                    self._last_hotkey_force_restart = now
+
+                # Fix 18 / 2026-05-23（Layer 3）：靜默偵測（純診斷 log）。
+                # monitor 物件還在但 5 分鐘沒任何事件 + idle → 嫌疑 H1/H2 發生中。
+                # 不主動修復（Layer 2 兜底），只記錄供未來 log 分析。每次符合
+                # 條件都 log 太吵 → 5 分鐘節流（per watchdog cycle 觸發一次即可）。
+                last_event_at = getattr(mgr, "_last_event_at", 0.0)
+                if (
+                    last_event_at > 0
+                    and self._state == "idle"
+                ):
+                    silence_s = now - last_event_at
+                    if (
+                        silence_s > self.HOTKEY_SILENT_THRESHOLD_S
+                        and silence_s % self.HOTKEY_SILENT_THRESHOLD_S < (
+                            self.HOTKEY_WATCHDOG_INTERVAL_MS / 1000.0
+                        )
+                    ):
+                        log.info(
+                            f"HOTKEY: diagnostic — monitor alive but silent "
+                            f"for {silence_s:.0f}s (Layer 2 will force-restart at "
+                            f"{self.HOTKEY_FORCE_RESTART_INTERVAL_MS / 1000.0:.0f}s)"
+                        )
         except Exception:
             log_error("hotkey_watchdog_failed")
         finally:
