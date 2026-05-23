@@ -55,6 +55,10 @@ from gui import WIN_W, WIN_H, AppWindow, AccessibilityDialog
 from _version import __version__
 from hotkey_manager import check_accessibility, is_pynput_available
 
+# .app bundle 路徑（給 _relaunch_app 用）
+import pathlib as _pathlib
+_APP_BUNDLE = _pathlib.Path.home() / "Applications" / "WhisperPro.app"
+
 
 def check_dependencies() -> list[str]:
     """嘗試 import 所有關鍵套件，回傳缺少的套件名稱清單。"""
@@ -103,6 +107,54 @@ def _disable_app_nap() -> None:
         log.warning(f"APP_NAP: suppression failed - {e}")
 
 
+def _relaunch_app() -> bool:
+    """重啟自己（v2.6.0 主題切換用）。
+
+    呼叫者必須**先**完成所有 cleanup（hotkey_mgr.stop / recorder.stop / mini HUD destroy /
+    history.db close / Cocoa observer removeObserver_）再呼叫本函式，避免新舊 process
+    共存的 race window（Eng Review Issue 1）。
+
+    路徑：
+      • 從 `.app` bundle 啟動：`subprocess.Popen(["open", "-n", "...WhisperPro.app"])`
+        然後**呼叫者**需要 `sys.exit(0)` 收尾。新 instance 經 LaunchServices 啟動、
+        完全獨立於本 process。
+      • 從 CLI / dev 模式：`os.execv(sys.executable, [sys.executable, "main.py"])`
+        本 process image 被 replace、呼叫者不需要 exit（function 不會 return）。
+
+    Returns:
+        True  — spawn 成功（呼叫者該繼續 exit）
+        False — 全部失敗（呼叫者應 fallback 顯示 toast 提示手動重啟）
+
+    錯誤處理：所有 exception 都包到 try、寫進 log_error；不 raise。
+    """
+    import subprocess
+    # 偵測是否從 .app bundle 啟動：sys.executable 含 "WhisperPro.app" 是 shim Python
+    is_bundled = "WhisperPro.app" in sys.executable
+
+    if is_bundled and _APP_BUNDLE.exists():
+        try:
+            subprocess.Popen(
+                ["open", "-n", str(_APP_BUNDLE)],
+                start_new_session=True,
+            )
+            log.info(f"RELAUNCH: spawned new instance via 'open -n {_APP_BUNDLE}'")
+            return True
+        except Exception:
+            log_error("relaunch_app_bundle_failed")
+            # 不直接 return False、繼續試 execv 兜底（雖然 dev 路徑用 venv python 不是
+            # shim python、launcher 邏輯不同；但「失敗時試試看」比直接放棄好）
+    # Dev 模式 / .app 失敗 fallback：re-exec 同個 python + main.py
+    try:
+        main_py = str(_pathlib.Path(__file__).resolve())
+        log.info(f"RELAUNCH: os.execv({sys.executable}, [..., {main_py}])")
+        os.execv(sys.executable, [sys.executable, main_py])
+        # execv 不會 return；走到這行表示真的失敗
+        return False
+    except Exception:
+        log_error("relaunch_execv_failed")
+        return False
+
+
 def main() -> None:
     """應用程式主流程：依賴檢查 → 載入設定 → 建立視窗 → 主迴圈。"""
 
@@ -122,8 +174,15 @@ def main() -> None:
     cfg = Config.load()
     log.info(
         f"CONFIG: loaded model={cfg.model} language={cfg.language} "
-        f"hotkey={cfg.hotkey} auto_paste={cfg.auto_paste} auto_copy={cfg.auto_copy}"
+        f"hotkey={cfg.hotkey} auto_paste={cfg.auto_paste} auto_copy={cfg.auto_copy} "
+        f"theme={cfg.theme}"
     )
+
+    # ── 2a. CustomTkinter appearance mode（v2.6.0）────────────────────────
+    # 讓 CTk 內建 widget（scrollbar、dropdown 預設樣式等）跟隨 cfg.theme。
+    # 我們自訂 widget 用 tokens.py 的 single-value 常數已自動跟著 theme；
+    # 但 CTk 內建預設值只認識 set_appearance_mode 的 Light / Dark。
+    ctk.set_appearance_mode("Light" if cfg.theme == "light" else "Dark")
 
     # ── 3. 建立 tkinter 根視窗 ────────────────────────────────────────────────
     root = ctk.CTk()
