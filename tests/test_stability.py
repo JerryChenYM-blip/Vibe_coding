@@ -614,20 +614,34 @@ def test_fix18_layer3_watchdog_diagnostic_silent_monitor():
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _make_stub_appwindow_for_copy():
-    """繞過 __init__ 建出含 _textbox / _get_result_text / _show_toast 的 stub。"""
+    """繞過 __init__ 建出含 _utterance_blocks / _show_toast 的 stub。
+
+    Fix 19 Path B / 2026-05-23：複製流程從 textbox mark-based 改成 block-based，
+    stub 直接給一個 list of block-like objects（含 get_current_text）。
+    """
     from gui import AppWindow
     win = AppWindow.__new__(AppWindow)
-    win._textbox = MagicMock()
+    win._utterance_blocks = []
     win._show_toast = MagicMock()
-    win._get_result_text = MagicMock(return_value="")   # fallback 用
     return win
 
 
-def test_fix19_on_copy_uses_latest_mark_only():
-    """Fix 19：_on_copy 只取 latest_start..latest_end 範圍，不取整段。"""
+def _make_block(text: str):
+    """建一個假 UtteranceBlock；只給 get_current_text 即可。"""
+    block = MagicMock()
+    block.get_current_text.return_value = text
+    return block
+
+
+def test_fix19_on_copy_uses_latest_block():
+    """Fix 19 Path B：_on_copy 取 _utterance_blocks[-1] 的目前顯示文字，不取整段。"""
     win = _make_stub_appwindow_for_copy()
-    # 模擬 textbox.get("latest_start", "latest_end") 回「我當然就好奇了。」
-    win._textbox.get.return_value = "我當然就好奇了。  "   # 含尾隨空白
+    # 三個 block，最新是第 3 個（最後一個）
+    win._utterance_blocks = [
+        _make_block("第一段。"),
+        _make_block("第二段。"),
+        _make_block("我當然就好奇了。  "),   # 含尾隨空白，要被 strip
+    ]
 
     import sys
     fake_pyperclip = types.SimpleNamespace(copy=MagicMock())
@@ -637,22 +651,15 @@ def test_fix19_on_copy_uses_latest_mark_only():
     finally:
         sys.modules.pop("pyperclip", None)
 
-    # textbox.get 必須是用 latest_start / latest_end 兩個 mark
-    win._textbox.get.assert_called_once_with("latest_start", "latest_end")
     # 剪貼簿收到的是 strip 過的最後一段（不含前面歷史）
     fake_pyperclip.copy.assert_called_once_with("我當然就好奇了。")
-    # toast 顯示新文字
     win._show_toast.assert_called_once_with("已複製最後一段")
 
 
-def test_fix19_on_copy_fallback_when_no_latest_mark():
-    """Fix 19：textbox.get raise（mark 不存在）→ fallback 走 _get_result_text。"""
+def test_fix19_on_copy_noop_when_no_blocks():
+    """Fix 19 Path B：沒有任何 block（剛啟動）→ 不該 copy，不該 toast。"""
     win = _make_stub_appwindow_for_copy()
-    # mark 不存在 → Tk 會 raise TclError；模擬 generic Exception 也走 fallback
-    win._textbox.get.side_effect = RuntimeError("no such mark")
-    # _get_result_text 也回空（首次啟動的真實狀況）
-    win._get_result_text.return_value = ""
-
+    # _utterance_blocks 已是空 list
     import sys
     fake_pyperclip = types.SimpleNamespace(copy=MagicMock())
     sys.modules["pyperclip"] = fake_pyperclip
@@ -661,7 +668,5 @@ def test_fix19_on_copy_fallback_when_no_latest_mark():
     finally:
         sys.modules.pop("pyperclip", None)
 
-    # 空字串 → 不該呼叫 pyperclip
     fake_pyperclip.copy.assert_not_called()
-    # 也不該 show toast（log_action("copy_clicked_empty") 而已）
     win._show_toast.assert_not_called()
