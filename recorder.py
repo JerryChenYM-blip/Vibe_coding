@@ -93,6 +93,14 @@ class AudioRecorder:
         self._device_index: Optional[int] = None  # None = 系統預設麥克風
         self._monitor_thread: Optional[threading.Thread] = None
 
+        # D2-S1（v2.9.0）：generation counter 防 stale callback。
+        # 流程：每次 start() bump +1；stop() 也 bump +1。callback 在進入時帶
+        # 入「當時的 gen」snapshot，寫 frame 前比對 self._capture_gen 是否相符；
+        # 不符就直接 drop（PortAudio in-flight callback 在 stop() 還沒 drain
+        # 完時可能還會 fire 一次，舊 callback 不能把上一段 frames 寫進下一段
+        # 已重置的 self._frames）。bump 不需要 lock 保護（int 賦值原子）。
+        self._capture_gen: int = 0
+
     # ── 公開介面 ──────────────────────────────────────────────────────────────
 
     def set_device_by_name(self, name: str) -> bool:
@@ -131,21 +139,28 @@ class AudioRecorder:
             # 重置所有狀態，確保每次錄音都是乾淨開始
             self._frames = []
             self._rms_level = 0.0
+            # D2-S1：bump generation；舊段 in-flight callback 拿到的 my_gen 立刻 stale
+            self._capture_gen += 1
+            my_gen = self._capture_gen
             # 每個 callback 接收的 sample 數 = 採樣率 × 時間塊
             blocksize = int(BLOCK_MS / 1000 * SAMPLE_RATE)
 
             try:
                 log.info(
                     f"RECORD: Attempting to start microphone. "
-                    f"Device={self._device_index}, Samplerate={SAMPLE_RATE}, Blocksize={blocksize}"
+                    f"Device={self._device_index}, Samplerate={SAMPLE_RATE}, "
+                    f"Blocksize={blocksize}, gen={my_gen}"
                 )
+                # D2-S1：closure 帶入當前 gen snapshot，callback 只在 gen 仍匹配時寫
+                def _cb(indata, frames, time_info, status, _gen=my_gen):
+                    self._audio_callback(indata, frames, time_info, status, _gen)
                 self._stream = sd.InputStream(
                     samplerate=SAMPLE_RATE,
                     channels=CHANNELS,
                     dtype=DTYPE,
                     blocksize=blocksize,
                     device=self._device_index,
-                    callback=self._audio_callback,  # PortAudio 執行緒呼叫此函式
+                    callback=_cb,                    # PortAudio 執行緒呼叫此函式
                 )
                 self._stream.start()
                 self._is_recording = True
@@ -175,6 +190,8 @@ class AudioRecorder:
 
             log.info("RECORD: Stopping audio stream...")
             self._is_recording = False
+            # D2-S1：bump generation；任何還沒 drain 的 in-flight callback 立刻 stale
+            self._capture_gen += 1
 
             # 關閉 PortAudio 串流，釋放硬體資源
             if self._stream is not None:
@@ -267,21 +284,33 @@ class AudioRecorder:
         frames: int,           # 本次 callback 的 sample 數（= blocksize）
         time_info,             # PortAudio 時間資訊（目前未使用）
         status: sd.CallbackFlags,
+        gen: int = 0,          # D2-S1：start() 時 closure capture 的 generation
     ) -> None:
         """PortAudio 執行緒呼叫的音訊回調函式——必須極快，不可阻塞。
 
         此函式在 PortAudio 的即時執行緒中執行，任何耗時操作（I/O、大量計算）
         都會造成錄音中斷（buffer underflow）。
+
+        D2-S1（v2.9.0）：`gen` 是 start() 時 closure capture 的 snapshot；
+        stop() / 下次 start() 都會 bump `self._capture_gen`，gen 不符就直接 drop，
+        防止第一段尾巴的 in-flight callback 把 frames 寫進第二段已重置的 buffer。
         """
         if status:
             # PortAudio 回報的狀態警告（如 input overflow），記錄但不中止
             log.warning(f"SD STATUS: {status}")
 
+        # D2-S1：generation 比對在 lock 外做（int 讀取原子），不符直接丟、
+        # 不更新 RMS（避免上一段尾巴的音量殘留 UI）
+        if gen != self._capture_gen:
+            return
+
         try:
             chunk = indata.copy()   # 複製一份，避免 PortAudio 回收緩衝區後資料消失
             with self._lock:
-                if self._is_recording:
-                    self._frames.append(chunk)   # 加入幀列表
+                # D2-S1：lock 內再 double-check（lock acquire 期間 stop() 可能 bump）
+                if not (self._is_recording and gen == self._capture_gen):
+                    return
+                self._frames.append(chunk)   # 加入幀列表
             # 計算 RMS 振幅（不在鎖內，因為 float 賦值是原子操作）
             self._rms_level = float(np.sqrt(np.mean(chunk ** 2)))
         except Exception:

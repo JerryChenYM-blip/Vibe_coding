@@ -172,6 +172,17 @@ class SplashScreen(tk.Toplevel):
     def _fade_tick(self) -> None:
         if self._closed:
             return
+        # D4-S4（v2.9.0）：root 已被 user ⌘Q 銷毀 → splash widget 也死了，
+        # winfo_exists 回 False，直接 mark closed return 不再排程下次 tick
+        # 也不呼叫 on_done（避免對已銷毀 root 跑 deiconify）。
+        try:
+            if not self.winfo_exists():
+                self._closed = True
+                return
+        except Exception:
+            self._closed = True
+            return
+
         steps = max(1, FADE_DUR_MS // FADE_STEP_MS)
         self._fade_step += 1
         alpha = max(0.0, 1.0 - self._fade_step / steps)
@@ -187,7 +198,12 @@ class SplashScreen(tk.Toplevel):
             self.after(FADE_STEP_MS, self._fade_tick)
 
     def _finish(self) -> None:
-        """銷毀視窗並觸發 on_done callback（兩段都包 try）。"""
+        """銷毀視窗並觸發 on_done callback（兩段都包 try）。
+
+        D4-S4（v2.9.0）：on_done callback 與 destroy 都已包 try/except，
+        但 on_done 內若對 root 做 deiconify 等操作可能拋 TclError；callback
+        作者需自己 winfo_exists 檢查（splash 不負責認得使用者 root）。
+        """
         if self._closed:
             return
         self._closed = True
