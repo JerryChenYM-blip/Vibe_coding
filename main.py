@@ -164,7 +164,7 @@ def main() -> None:
         SplashScreen(
             root,
             on_done=lambda: (root.deiconify(), root.lift()),
-            version="v2.2.0",
+            version="v2.4.1",
         )
     except Exception:
         log_error("splash_init_failed")
