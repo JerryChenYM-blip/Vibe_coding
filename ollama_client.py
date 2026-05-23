@@ -235,9 +235,8 @@ class OllamaClient:
                 log_error("format_polish_prompt_failed")
 
         prompt = prompt_template.format(text=text)
-        # v2.13.0：num_predict 自適應 — 輸出長度通常 ≈ 輸入（校正錯字 + 標點，不增刪內容）
-        # 預留 1.5x buffer 避免長句裁切；下限 64 tokens 給超短句留 headroom。
-        # 中文每字約 1 token，英文約 0.5 token；以輸入長度 × 1.5 上限估算最寬鬆值。
+        # v2.13.0：num_predict 自適應 — 校正輸出長度 ≈ 輸入（不增刪內容）
+        # 預留 2x buffer 避免長句裁切；下限 64 給超短句 headroom。
         adaptive_num_predict = max(64, int(len(text) * 2.0))
         options = {**_POLISH_OPTIONS_BASE, "num_predict": adaptive_num_predict}
         payload = {
@@ -248,6 +247,13 @@ class OllamaClient:
             # v2.13.0：縮短 VRAM keep_alive（避免 user 看到「不用也高負載」）
             "keep_alive": _OLLAMA_KEEP_ALIVE,
         }
+        # v2.13.0：instruct 模型加 system role 鎖定行為。
+        # qwen2.5:3b-instruct 對純 prompt 易過度發揮（擴寫、翻譯成英文）
+        # → 用 system 欄位明確 role。format_polish_prompt 已注入字典約束到 prompt
+        # 尾端，這裡只負責 role 鎖定。對不支援 system 的舊模型 Ollama 會忽略。
+        _system = getattr(prompts, "OLLAMA_POLISH_SYSTEM", None)
+        if _system:
+            payload["system"] = _system
 
         t0 = time.perf_counter()
         try:
