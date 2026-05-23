@@ -45,7 +45,7 @@ from tokens import (
     BG, SURF_1, SURF_4,
     TEXT_1, TEXT_3, TEXT_4,
     ACCENT,
-    FONT_FAMILY_UI, FONT_FAMILY_TEXT,
+    FONT_FAMILY_UI, FONT_FAMILY_TEXT, FONT_FAMILY_MONO,
 )
 
 
@@ -154,11 +154,11 @@ class SplashScreen(tk.Toplevel):
             fg=TEXT_3, bg=SURF_1,
         ).pack()
 
-        # 版本（右下）
+        # 版本（右下）— A2（v2.7.0）：版本號是純數字+點，改 mono 對齊感更好
         if version:
             tk.Label(
                 inner, text=version,
-                font=(FONT_FAMILY_TEXT, 11),
+                font=(FONT_FAMILY_MONO, 11),
                 fg=TEXT_4, bg=SURF_1,
             ).place(relx=1.0, rely=1.0, x=-16, y=-12, anchor="se")
 

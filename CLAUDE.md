@@ -240,6 +240,12 @@ class Config:
 
     # ── Phase 2 #3 Polish log ───────────────────────────────────
     polish_log_enabled: bool = True         # 每次潤飾落地一行 JSONL
+
+    # ── v2.6.0 主題 ─────────────────────────────────────────────
+    theme: str = "dark"                     # "dark" / "light"
+
+    # ── v2.7.0 動態效果偏好（A3）────────────────────────────────
+    reduce_motion_pref: str = "auto"        # "auto" / "always" / "never"
 ```
 
 - **原子性儲存**：先寫 `.tmp` 再用 `replace()`，防斷電毀檔
@@ -267,7 +273,11 @@ class Config:
 | `v2.0.0` | 2026-04-19 | Ambient Chamber 光場錄音鈕 + 穩定性修復 + Speakly 規劃書 |
 | `v2.1.0` | 2026-04-23 | Phase 1 Ollama 潤飾 + Phase 2 preset / 字典 / 熱重載 + 統一日誌 + 錄音完整性 |
 | `v2.2.0` | 2026-04-24 | Phase 3.1 Voice Shortcuts（3 action preset）+ Phase 3.2 SQLite 歷史紀錄 |
-| **`v2.3.0`** | 2026-04-28 | Phase 4.1 App Icon + Splash / 4.3 浮動 mini HUD / 4.4 設定匯入匯出 / 4.5 Ollama 環境診斷（4.2 menu bar 跳過待 PoC）|
+| `v2.3.0` | 2026-04-28 | Phase 4.1 App Icon + Splash / 4.3 浮動 mini HUD / 4.4 設定匯入匯出 / 4.5 Ollama 環境診斷（4.2 menu bar 跳過待 PoC）|
+| `v2.4.x` | 2026-05-22 | Fix 10/11/12/13/14/16/17（post-PR-13 穩定性 + 轉錄速度 + Dock click hotfixes）|
+| `v2.5.0` | 2026-05-23 | Fix 18+19（熱鍵閒置 resilience v2 + Path B Speakly-style UtteranceBlock 結果區）|
+| `v2.6.0` | 2026-05-23 | 淺色主題 + 外觀切換（Hybrid: Apple 結構 + Claude 溫度、自動重啟）|
+| **`v2.7.0`** | 2026-05-23 | UI 打磨（A1 間距 / A2 mono / A3 reduce-motion）+ P3/P4 cleanup（B1-B6）+ P1 cluster 50 情境 audit |
 
 ### v2.1.0 PR 歷史（全部已處理）
 | # | 內容 | 狀態 |
@@ -381,12 +391,17 @@ cat ~/.whisper_app/polish_log.jsonl | jq .         # 潤飾紀錄
 - [x] **Phase 4.5 Ollama 環境診斷**（`onboarding.py` 純函式，4 種狀態 + 一鍵複製建議命令；自動語言偵測在 v2.1.0 已就位）
 - [ ] **Phase 4.2 menu bar icon**：因 `rumps` + tkinter event loop 共存風險，刻意跳過。要做需先 PoC 30 min
 
-### 🟡 隨時可撿起（小打磨）
-- [ ] **間距統一** — 全面套用 `SPACE_*` 常數（目前還有裸數字）
-- [ ] **等寬數字** — 計時器、RMS 數值改用 `FONT_FAMILY_MONO`（部分已用）
-- [ ] **減少動態偏好** — 偵測系統 `prefers-reduced-motion`，關閉呼吸光圈
-- [ ] **舊 token 別名移除** — `SURF1..4`、`TEXT1..4`、`BLUE/GREEN/RED/ORANGE` 過渡期結束
-- [ ] **App Icon + 啟動畫面**（設計文件已寫在 `docs/superpowers/specs/2026-04-22-app-icon-splash-design.md`）
+### ✅ v2.7.0 完成項（2026-05-23）— UI 打磨 + P3/P4 cleanup（PR #17）
+- [x] **A1 間距統一** — 59/73 padx/pady 上 4pt grid（`SPACE_XS/SM/MD/LG/XL/2XL`），剩 ~14 非 grid 值（20/6/18/13/14/40）保留個別微調
+- [x] **A2 等寬數字** — splash 版本號改 `FONT_FAMILY_MONO`；計時器 / RMS / UtteranceBlock meta / HistoryWindow 時間戳已是 mono
+- [x] **A3 reduce-motion 偵測** — `system_reduce_motion()` + `resolve_reduce_motion(pref)` 3-way（auto / always / never）；SettingsWindow「外觀」加 chip + live-apply（4 regression tests）
+- [x] **A4 舊 token 別名移除** — v2.6.0 tokens 大改寫時已完成（grep 確認 0 references）
+- [x] **B1 `_on_dock_reopen` DRY** — delegate 給 `_restore_root_if_minimized` + focus_force
+- [x] **B2 `_processing_timeout_check` timer leak**（唯一真 bug）— 存 `_processing_timeout_id` + 三點 `after_cancel`（3 regression tests）
+- [x] **B3 `_restore_root_if_minimized` 補 `'icon'` legacy state** — Tk 文件列出值
+- [x] **B4 MiniHUD `show_*` re-apply NSWindow level** — 抽 `_apply_panel_level` helper + `_reapply_panel_level` 防 deiconify 後 styleMask 默默丟失
+- [x] **B5 MiniHUD `_upgrade_to_panel_level` 加 `withdraw + update_idletasks`** — 強制 Tk commit avoid deferred 蓋掉 setLevel
+- [x] **B6 MiniHUD 游標螢幕命中 closed-interval** — 右/上邊改 `<` 開區間
 
 ### 📌 剩餘 Phase 4 候選（短打磨輪）
 - [ ] **Phase 4.2 menu bar icon**（`rumps`，要先做 30 min PoC 確認與 tk event loop 不衝突）
