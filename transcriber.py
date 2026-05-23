@@ -545,8 +545,12 @@ class Transcriber:
 
         hf_repo  = _MLX_MODEL_MAP.get(model_size, _MLX_MODEL_MAP["large-v3-turbo"])
         duration = len(audio) / 16_000
-        # Fix 12b（v2.13.0）：邊界從 3s 拉到 30s，涵蓋日常單句 / 多句場景
-        is_short = duration < 30.0
+        # Fix 12b（v2.13.0）：邊界從 3s 拉到 30s
+        # Fix 12c（v2.13.0）：邊界再拉到 60s，覆蓋幾乎所有日常錄音場景
+        # 實機看 log：30.40s 走 fallback chain 跑 7.86s (RTF=0.259)，比 fast path 慢
+        # 5 倍；user 邊講邊累積場景常落在 30-60s 區間。60s 以上才走品質優先 path
+        # （此時 conversational context 開始有用、worth the time）。
+        is_short = duration < 60.0
 
         # 短/中音檔（< 30s）走 fast path；長音檔維持 mlx_whisper 預設（quality 優先）
         # Fix 14 / 2026-05-23：不要傳 beam_size（mlx_whisper 偵測 kwarg 就試

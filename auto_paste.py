@@ -124,26 +124,45 @@ def paste_to_app(
         # （~0.5s）；0.18s 太短，⌘V 還在原 Space 觸發 → 落到錯誤的 App。
         is_fullscreen = _is_app_fullscreen(app_name)
         delay = fullscreen_activate_delay if is_fullscreen else activate_delay
+        # v2.13.0 / 2026-05-24：activate 改 NSWorkspace 優先（osascript fallback）。
+        # NSWorkspace.runningApplications + activateWithOptions 比 osascript 快
+        # ~50 倍（<1ms vs 50ms），且跨 Space 行為更可靠。
+        activated_via_native = False
         try:
-            # D5-S10（v2.10.0 / 2026-05-23）：capture osascript stderr，timeout
-            # 從 3 降為 1.5（activate 不該等這麼久）；timeout / 非 0 returncode
-            # 都當 activate 失敗 log_error 帶 stderr，但仍繼續送 ⌘V。
-            # AppleScript 字串內必須 escape 雙引號和反斜線。
-            safe_name = app_name.replace("\\", "\\\\").replace('"', '\\"')
+            from AppKit import (  # type: ignore
+                NSWorkspace,
+                NSApplicationActivateIgnoringOtherApps,
+            )
+            ws = NSWorkspace.sharedWorkspace()
+            for running in ws.runningApplications():
+                if running.localizedName() == app_name:
+                    running.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+                    activated_via_native = True
+                    break
+        except Exception:
+            log_error("auto_paste_activate_nsworkspace_failed", app=app_name)
+
+        if not activated_via_native:
+            # Fallback：osascript（既有 D5-S10 容錯）
             try:
-                result = subprocess.run(
-                    ["osascript", "-e", f'tell application "{safe_name}" to activate'],
-                    capture_output=True, text=True, timeout=1.5,
-                )
-                if result.returncode != 0:
-                    log_error(
-                        "auto_paste_activate_nonzero",
-                        app=app_name,
-                        rc=result.returncode,
-                        stderr=(result.stderr or "")[:200],
+                safe_name = app_name.replace("\\", "\\\\").replace('"', '\\"')
+                try:
+                    result = subprocess.run(
+                        ["osascript", "-e", f'tell application "{safe_name}" to activate'],
+                        capture_output=True, text=True, timeout=1.5,
                     )
-            except subprocess.TimeoutExpired:
-                log_error("auto_paste_activate_timeout", app=app_name, timeout_s=1.5)
+                    if result.returncode != 0:
+                        log_error(
+                            "auto_paste_activate_nonzero",
+                            app=app_name,
+                            rc=result.returncode,
+                            stderr=(result.stderr or "")[:200],
+                        )
+                except subprocess.TimeoutExpired:
+                    log_error("auto_paste_activate_timeout", app=app_name, timeout_s=1.5)
+            except Exception:
+                log_error("auto_paste_activate_failed", app=app_name)
+        try:
             time.sleep(delay)
 
             # Bug 2：activate 後 poll frontmost 確認真的切過去（最多再等 max_wait）。

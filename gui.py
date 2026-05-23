@@ -1124,10 +1124,17 @@ class AppWindow(ctk.CTkFrame):
 
         # 決定路徑：能潤飾就走潤飾流程，失敗自動降級回原文。
         # 規劃書 6.4「策略 B」：等潤飾完再貼，因此 auto-paste 也延到潤飾後。
+        # v2.13.0 / 2026-05-24：修「Ollama 啟用但 health_ok=None 跳過 polish」。
+        # 根因：D5-S7 TTL 30s 過期會回 None；剛 enable Ollama health check 還沒
+        # 回來也是 None；舊邏輯 `is True` 排除 None → user 雖然開了 Ollama
+        # 但每次 cache 過期或剛啟用都不會 polish、直接貼 Whisper 原文（含「措置率」
+        # 這種同音錯字）。改用 `is not False` 放寬：None / True 都試一下；
+        # 真的 False（確定沒跑）才略過。process() 內部 ConnectionError fallback
+        # 自然會降級回原文，使用者不會卡住。
         take_polish_path = (
             valid
             and self.cfg.ollama_enabled
-            and self.ollama.health_ok is True
+            and self.ollama.health_ok is not False
         )
 
         if take_polish_path:
