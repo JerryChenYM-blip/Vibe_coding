@@ -3401,8 +3401,9 @@ class SettingsWindow(ctk.CTkToplevel):
         dict_btn_row = ctk.CTkFrame(dsec, fg_color="transparent", height=52)
         dict_btn_row.pack(fill="x", padx=SPACE_LG, pady=(4, 8))
         dict_btn_row.pack_propagate(False)
+        # v2.13.0：動態顯示「目前 N 個 term」讓 user 知道字典規模
         self._dict_status_label = ctk.CTkLabel(
-            dict_btn_row, text="", anchor="w",
+            dict_btn_row, text=self._compute_dict_status(), anchor="w",
             font=ctk.CTkFont("SF Pro Text", 12), text_color=TEXT_3,
         )
         self._dict_status_label.pack(side="left")
@@ -3413,6 +3414,17 @@ class SettingsWindow(ctk.CTkToplevel):
             font=ctk.CTkFont("SF Pro Text", 12),
             command=self._open_dictionary_file,
         ).pack(side="right")
+        # v2.13.0：說明常見同音字消歧使用方式
+        ctk.CTkLabel(
+            dsec,
+            text=(
+                "字典術語會注入 Whisper 與 Ollama prompt，提升專有名詞辨識率。\n"
+                "例：把「Claude」「Cloud」「Cursor」加進去，可避免同音字誤判（/klɔːd/ vs /klaʊd/）。"
+            ),
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
+            text_color=TEXT_3,
+            justify="left", anchor="w",
+        ).pack(anchor="w", padx=SPACE_LG, pady=(0, 10))
 
         # ── 介面 (Phase 4.3) ────────────────────────────────────────────
         ui_sec = section("介面")
@@ -3831,6 +3843,21 @@ class SettingsWindow(ctk.CTkToplevel):
                 text_color=DANGER,
             )
 
+    def _compute_dict_status(self) -> str:
+        """讀字典檔回傳「目前 N 個 term」狀態字串。"""
+        try:
+            path_str = (self.cfg.dictionary_path or "").strip() or str(_dictionary.DEFAULT_PATH)
+            from pathlib import Path as _P
+            path = _P(path_str).expanduser()
+            if not path.exists():
+                return "字典檔不存在（點按鈕建立）"
+            import json as _json
+            data = _json.loads(path.read_text(encoding="utf-8"))
+            n = len(data.get("terms", []))
+            return f"目前 {n} 個 term"
+        except Exception:
+            return "讀取字典失敗"
+
     def _open_dictionary_file(self) -> None:
         """在預設編輯器開啟字典 JSON。"""
         path_str = (self._dict_path_var.get().strip()
@@ -3841,7 +3868,7 @@ class SettingsWindow(ctk.CTkToplevel):
         try:
             subprocess.run(["open", str(path)])
             self._dict_status_label.configure(
-                text=f"已開啟 {path.name}", text_color=TEXT_3,
+                text=f"已開啟 {path.name}（編輯後存檔自動生效）", text_color=TEXT_3,
             )
         except Exception as e:
             self._dict_status_label.configure(
