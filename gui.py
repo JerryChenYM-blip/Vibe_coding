@@ -207,6 +207,16 @@ class AppWindow(ctk.CTkFrame):
 
         self.cfg = cfg
         self.recorder    = AudioRecorder()
+        # F1（v2.12.0）：啟動時依 cfg.input_device 設裝置；失敗回退系統預設
+        if cfg.input_device:
+            try:
+                if not self.recorder.set_device_by_name(cfg.input_device):
+                    log.warning(
+                        f"RECORD: startup input_device '{cfg.input_device}' "
+                        f"找不到，回退到系統預設"
+                    )
+            except Exception:
+                log_error("startup_set_device_failed", device=cfg.input_device)
         self.transcriber = Transcriber()
         self.ollama      = OllamaClient()
         # 用設定檔同步 Ollama 參數（base_url / model / enabled / timeout）
@@ -776,17 +786,26 @@ class AppWindow(ctk.CTkFrame):
         self._target_label.configure(text="")
 
         def _capture_frontmost():
+            # Bug B（v2.12.0）：擴大自我識別清單，避免把 Whisper Pro 自己當成貼上目標。
+            # NSWorkspace 在 .app bundle 模式下會回「Whisper Pro」；dev 模式回「Python」。
+            # 兩種情境都該排除，但**不要**直接 return（會錯過真實 frontmost）；
+            # 改成：只跳過「我自己」的判斷，仍把 frontmost 紀錄起來（_frontmost_app 用於 preset
+            # 路由），但不設 paste_target（避免貼到自己）。
+            SELF_APP_NAMES = {"Python", "python3", "WhisperPro", "Whisper Pro", "whisper_pro"}
             app = _ap.get_frontmost_app()
-            if not app or app in ("Python", "python3"):
+            if not app:
                 return
             def _apply():
                 if self._state != "recording":
                     return
-                self._frontmost_app = app
-                # 只有 auto_paste 開啟時才作為 ⌘V 目標 + 顯示提示
-                if self.cfg.auto_paste:
+                self._frontmost_app = app   # 永遠記錄（preset 路由用）
+                # paste_target 排除自我，避免貼到自己
+                if self.cfg.auto_paste and app not in SELF_APP_NAMES:
                     self._paste_target = app
                     self._target_label.configure(text=f"→ {app}")
+                elif app in SELF_APP_NAMES:
+                    # 自我前景時不顯示 → 標籤
+                    log.debug(f"AUTO-PASTE: frontmost is self ({app!r}), skip paste_target")
             self.after(0, _apply)
         threading.Thread(target=_capture_frontmost, daemon=True).start()
 
@@ -2251,11 +2270,20 @@ class AppWindow(ctk.CTkFrame):
     # ── Phase 4.3 mini 錄音窗 ──────────────────────────────────────────────
 
     def _ensure_mini_window(self) -> None:
-        """Lazy 建立 MiniRecordingWindow；toggle on 時呼叫。"""
+        """Lazy 建立 MiniRecordingWindow；toggle on 時呼叫。
+
+        Bug A（v2.12.0）：成功 / 失敗都 log 一行，方便 user log 回報時定位。
+        """
         if self._mini_window is not None:
             return
         try:
             self._mini_window = MiniRecordingWindow(self)
+            # log 是否升級成 NSPanel level（決定能否跨 Space 可見）
+            ns_ok = getattr(self._mini_window, "_ns_window", None) is not None
+            log.info(
+                f"MINI_HUD: instance created (panel_level_upgraded={ns_ok})。"
+                f"{'跨 Space / 全螢幕可見' if ns_ok else '退化模式，僅同 Space 可見'}"
+            )
         except Exception:
             log_error("mini_window_init_failed")
             self._mini_window = None
@@ -2309,6 +2337,23 @@ class AppWindow(ctk.CTkFrame):
         self._hotkey_status.configure(text=cfg.format_hotkey_display())
         self._model_var.set(cfg.model)
         self._lang_var.set(cfg.language)
+        # F1（v2.12.0）：麥克風來源變更 → 套到 recorder。下次 start() 時用新 device。
+        # 不需要 stream restart，因為當前若在錄音中、user 該手動停止再換。
+        try:
+            if cfg.input_device:
+                ok = self.recorder.set_device_by_name(cfg.input_device)
+                if not ok:
+                    log.warning(
+                        f"RECORD: input_device '{cfg.input_device}' 找不到、"
+                        f"回退到系統預設"
+                    )
+                log_settings("device_applied", device=cfg.input_device, found=ok)
+            else:
+                # input_device=None → 用系統預設
+                self.recorder._device_index = None
+                log_settings("device_applied", device="(system default)")
+        except Exception:
+            log_error("settings_apply_device_failed")
         on = cfg.auto_paste
         self._ap_btn.configure(
             fg_color=INDIGO if on else SURF_1,
@@ -2997,6 +3042,47 @@ class SettingsWindow(ctk.CTkToplevel):
             ).pack(side="right")
 
         row(stt, "辨識語言", lang_row)
+        sep_line(stt)
+
+        # ── 麥克風來源（F1 / v2.12.0）────────────────────────────────────
+        # 列出本機所有有輸入聲道的音訊裝置（含實體 + 虛擬如 BlackHole / Loopback 等）
+        # 第一筆固定為「（系統預設）」對應 input_device=None。
+        from recorder import AudioRecorder as _AR
+        try:
+            self._available_devices = _AR.list_devices()
+        except Exception:
+            self._available_devices = []
+            log_error("settings_list_devices_failed")
+        # dropdown 顯示清單：先放「系統預設」，後面是各裝置名
+        self._device_values = ["（系統預設）"] + [d["name"] for d in self._available_devices]
+        # 初始選擇：cfg.input_device 對應的 device 名（找不到就回預設）
+        _current_dev = self.cfg.input_device
+        if _current_dev and _current_dev in (d["name"] for d in self._available_devices):
+            initial = _current_dev
+        else:
+            initial = "（系統預設）"
+        self._device_var = ctk.StringVar(value=initial)
+
+        def device_row(r):
+            ctk.CTkOptionMenu(
+                r, values=self._device_values,
+                variable=self._device_var,
+                width=240, height=30, corner_radius=8,
+                fg_color=SURF_2, button_color=SURF_2,
+                button_hover_color=SURF_3,
+                dropdown_fg_color=SURF_1,
+                text_color=TEXT_1,
+                font=ctk.CTkFont("SF Pro Text", 13),
+            ).pack(side="right")
+
+        row(stt, "麥克風來源", device_row)
+        ctk.CTkLabel(
+            stt,
+            text=f"偵測到 {len(self._available_devices)} 個輸入裝置；「系統預設」會跟隨 macOS 設定。",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
+            text_color=TEXT_3,
+            justify="left", anchor="w",
+        ).pack(anchor="w", padx=SPACE_LG, pady=(0, 10))
 
         # ── 快捷鍵 ────────────────────────────────────────────────────────
         hk = section("快捷鍵")
@@ -3567,6 +3653,12 @@ class SettingsWindow(ctk.CTkToplevel):
         """從表單欄位蒐集所有值、呼叫 cfg.save() 並通知主視窗。"""
         self.cfg.model          = self._model_var.get()
         self.cfg.language       = self._lang_var.get()
+        # F1（v2.12.0）：麥克風來源 — 顯示「（系統預設）」對應 None
+        _dev_sel = self._device_var.get()
+        if _dev_sel == "（系統預設）":
+            self.cfg.input_device = None
+        else:
+            self.cfg.input_device = _dev_sel
         self.cfg.append_results = self._append_var.get()
         self.cfg.auto_copy      = self._autocopy_var.get()
         self.cfg.auto_paste     = self._autopaste_var.get()
@@ -4868,6 +4960,7 @@ class MiniRecordingWindow(tk.Toplevel):
         """把對應 NSWindow 升到 NSStatusWindowLevel + collectionBehavior。
 
         失敗時靜默 fallback；HUD 仍能用，只是缺「跨 Space / 全螢幕可見」。
+        Bug A（v2.12.0）：升級失敗時加 `-topmost` 兜底，至少同 Space 在最頂。
         """
         try:
             from AppKit import NSApp  # type: ignore
@@ -4884,14 +4977,28 @@ class MiniRecordingWindow(tk.Toplevel):
 
             if ns_window is None:
                 log_error("mini_hud_nswindow_not_found")
+                self._fallback_topmost()  # Bug A：找不到 NSWindow → topmost 兜底
                 return
 
             self._apply_panel_level(ns_window)
             self._ns_window = ns_window
             log_state("mini_hud_panel_level_upgraded")
         except Exception as e:
-            # PyObjC import 失敗或其他例外 → fallback 成普通 Toplevel
+            # PyObjC import 失敗或其他例外 → fallback 成普通 Toplevel + topmost
             log_error(f"mini_hud_panel_upgrade_failed: {e}")
+            self._fallback_topmost()
+
+    def _fallback_topmost(self) -> None:
+        """Bug A（v2.12.0）：NSPanel-level 升級失敗時的兜底措施。
+
+        無法跨 Space / 全螢幕可見，但至少在「同 Space」最頂端，使用者仍能
+        看到 mini HUD（總比完全看不見好）。Tk `-topmost` 跨平台、無 PyObjC 依賴。
+        """
+        try:
+            self.attributes("-topmost", True)
+            log.info("MINI_HUD: panel-level 升級失敗，啟用 Tk -topmost fallback")
+        except Exception:
+            log_error("mini_hud_topmost_fallback_failed")
 
     def _reapply_panel_level(self) -> None:
         """B4（v2.7.0）：每次 show_* 前 re-apply NSWindow level。
@@ -4913,8 +5020,10 @@ class MiniRecordingWindow(tk.Toplevel):
 
         每次顯示前重新定位到游標所在螢幕中下方（Speakly 風格）。
         B4（v2.7.0）：deiconify 後 re-apply panel level（cheap 保險）。
+        Bug A（v2.12.0）：加診斷 log（geometry + 視窗 state）+ topmost 重新確認。
         """
         if self._closed:
+            log.warning("MINI_HUD: show_recording on closed window, skip")
             return
         self._position_at_cursor_screen_bottom()
         self._dot.configure(fg=DANGER)
@@ -4922,6 +5031,16 @@ class MiniRecordingWindow(tk.Toplevel):
         self._timer.configure(text="00:00")
         self.deiconify()
         self._reapply_panel_level()
+        # Bug A：若 NSPanel 升級失敗（_ns_window=None），重新跑 topmost 保證可見
+        if self._ns_window is None:
+            self._fallback_topmost()
+        try:
+            log.info(
+                f"MINI_HUD: show_recording → geom={self.winfo_geometry()} "
+                f"state={self.state()} ns_panel={'on' if self._ns_window else 'fallback'}"
+            )
+        except Exception:
+            pass
 
     def show_processing(self) -> None:
         """進入處理中狀態 → 琥珀色 + 「轉錄中」。

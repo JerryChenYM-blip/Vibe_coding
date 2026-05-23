@@ -1010,18 +1010,34 @@ def test_d5s7_health_check_sync_stamps_cache_time():
 
 
 # D5-S10: get_frontmost_app 容錯
+#
+# Bug B（v2.12.0）：get_frontmost_app 現在優先用 NSWorkspace。osascript fallback
+# 路徑只在 NSWorkspace 失敗時 reach。下列測試需先 mock 掉 NSWorkspace import 才
+# 能驗證 osascript path 的容錯邏輯。helper：_force_osascript_path patches AppKit。
+
+import sys as _sys_for_d5s10
+from unittest.mock import patch as _patch_for_d5s10
+
+
+def _force_osascript_path():
+    """讓 get_frontmost_app 跳過 NSWorkspace、直接走 osascript fallback。
+
+    把 `AppKit` 從 sys.modules 暫時設成 None → `from AppKit import NSWorkspace`
+    會 raise ImportError → 進 except → fallback osascript path。
+    """
+    return _patch_for_d5s10.dict(_sys_for_d5s10.modules, {"AppKit": None})
+
 
 def test_d5s10_get_frontmost_app_multiline_takes_first():
     """D5-S10：osascript 偶發多行輸出 → 只取第一行非空字串。"""
     import auto_paste
     from unittest.mock import patch
-    # 模擬 osascript 多行輸出
     fake_result = types.SimpleNamespace(
         returncode=0,
         stdout="Notion\nstray line 2\n",
         stderr="",
     )
-    with patch("subprocess.run", return_value=fake_result):
+    with _force_osascript_path(), patch("subprocess.run", return_value=fake_result):
         name = auto_paste.get_frontmost_app()
     assert name == "Notion"
 
@@ -1031,7 +1047,8 @@ def test_d5s10_get_frontmost_app_timeout_returns_none():
     import auto_paste
     import subprocess as _sp
     from unittest.mock import patch
-    with patch("subprocess.run", side_effect=_sp.TimeoutExpired(cmd="osascript", timeout=1.2)):
+    with _force_osascript_path(), \
+         patch("subprocess.run", side_effect=_sp.TimeoutExpired(cmd="osascript", timeout=1.2)):
         name = auto_paste.get_frontmost_app()
     assert name is None
 
@@ -1041,7 +1058,7 @@ def test_d5s10_get_frontmost_app_nonzero_returns_none():
     import auto_paste
     from unittest.mock import patch
     fake_result = types.SimpleNamespace(returncode=1, stdout="", stderr="permission denied")
-    with patch("subprocess.run", return_value=fake_result):
+    with _force_osascript_path(), patch("subprocess.run", return_value=fake_result):
         name = auto_paste.get_frontmost_app()
     assert name is None
 
@@ -1051,9 +1068,29 @@ def test_d5s10_get_frontmost_app_empty_returns_none():
     import auto_paste
     from unittest.mock import patch
     fake_result = types.SimpleNamespace(returncode=0, stdout="   \n  \n", stderr="")
-    with patch("subprocess.run", return_value=fake_result):
+    with _force_osascript_path(), patch("subprocess.run", return_value=fake_result):
         name = auto_paste.get_frontmost_app()
     assert name is None
+
+
+# Bug B（v2.12.0）：新增 — NSWorkspace path 優先
+
+def test_bugb_get_frontmost_uses_nsworkspace_when_available():
+    """Bug B：NSWorkspace 可用時優先用它、不 fallback osascript。"""
+    import auto_paste
+    from unittest.mock import patch, MagicMock
+    fake_app = MagicMock()
+    fake_app.localizedName.return_value = "Claude"
+    fake_ws = MagicMock()
+    fake_ws.frontmostApplication.return_value = fake_app
+    fake_module = MagicMock()
+    fake_module.sharedWorkspace.return_value = fake_ws
+    # 不該 reach subprocess.run（osascript path）
+    with patch("AppKit.NSWorkspace", fake_module), \
+         patch("subprocess.run") as run_spy:
+        name = auto_paste.get_frontmost_app()
+    assert name == "Claude"
+    run_spy.assert_not_called()
 
 
 # D4-S6: hotkey restart() 重綁日誌

@@ -27,22 +27,33 @@ log = get_logger("auto_paste")
 def get_frontmost_app() -> Optional[str]:
     """取得目前最前景的 macOS 應用程式名稱。
 
-    透過 osascript 執行一小段 AppleScript，查詢 System Events
-    目前 frontmost=true 的 process 名稱。
+    Bug B（v2.12.0 / 2026-05-23）：優先用 NSWorkspace.frontmostApplication()
+    （Cocoa 原生 API，比 osascript 可靠 + 快 ~100x）。NSWorkspace 跨 Space /
+    全螢幕都能正確回應，不會被 osascript timeout 卡住。失敗時 fallback osascript。
 
-    D5-S10（v2.10.0 / 2026-05-23）：強化 timeout/格式處理
-      • osascript 可能回多行（罕見 race）→ 只取第一行非空字串
-      • timeout 從 2 降為 1.2（System Events 通常 <50ms）
-      • subprocess.TimeoutExpired 單獨分支，log 顯示原因
+    D5-S10（v2.10.0）：osascript 路徑保留 timeout / 多行容錯。
 
     Returns:
-        前景 App 的顯示名稱字串，失敗 / 空字串 / 超時都回 None。
+        前景 App 的 localized name（例如 "Claude"、"Notes"），失敗回 None。
     """
+    # 優先嘗試 NSWorkspace（Cocoa native，無 timeout 風險、不會回 'Python'）
+    try:
+        from AppKit import NSWorkspace  # type: ignore
+        ws = NSWorkspace.sharedWorkspace()
+        app = ws.frontmostApplication()
+        if app is not None:
+            name = app.localizedName()
+            if name:
+                log.debug(f"AUTO-PASTE: frontmost (NSWorkspace) = '{name}'")
+                return str(name)
+    except Exception:
+        log_error("get_frontmost_app_nsworkspace_failed")
+
+    # Fallback：osascript（保留 D5-S10 容錯處理）
     try:
         result = subprocess.run(
             [
                 "osascript", "-e",
-                # AppleScript：透過 System Events 查詢前景 process 名稱
                 'tell application "System Events" '
                 'to get name of first process whose frontmost is true',
             ],
@@ -57,12 +68,11 @@ def get_frontmost_app() -> Optional[str]:
                 stderr=(result.stderr or "")[:200],
             )
             return None
-        # D5-S10：取第一行非空字串（防 osascript 偶發多行輸出）
         raw = (result.stdout or "").strip()
         if not raw:
             return None
         first_line = raw.splitlines()[0].strip()
-        log.debug(f"AUTO-PASTE: frontmost app = '{first_line}'")
+        log.debug(f"AUTO-PASTE: frontmost (osascript) = '{first_line}'")
         return first_line or None
     except subprocess.TimeoutExpired:
         log_error("get_frontmost_app_timeout", timeout_s=1.2)
