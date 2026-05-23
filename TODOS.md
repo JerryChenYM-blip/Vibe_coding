@@ -58,16 +58,26 @@ P1（real bug）+ P2（worth fixing）共 4 個 bug 已在 Fix 9 修掉並補 7 
 Path B（完整 Speakly-style list-of-blocks UI 重構）延後到本條。先用一週判斷
 Path A 是否已足夠，再決定 Path B 是否真的要做。
 
-- [ ] **Path B：結果區重構為 Speakly-style UtteranceBlock list**
-  - 來源：Fix 19 範圍決議 C（2026-05-23），使用者要求最終 UI 對齊 Speakly 截圖
-  - 範疇估計：~300-400 LOC 新 widget + 重構：
-    - 新增 `UtteranceBlock(ctk.CTkFrame)`：timestamp + text + 個別 copy/polish icon
-    - `ScrollableFrame` 取代現有 `_textbox`
-    - 重寫 `_show_result` / `_apply_polish_to_textbox` / `_get_result_text`
-    - 移除 `latest_start..latest_end` Tk marks（改 list index）
-  - 阻塞：必須先走 `/plan-design-review` 釐清互動模型：
-    - 「原文/潤飾 toggle」per-block 還是 global
-    - 每 block 獨立按鈕還是 hover-only
-    - 主視窗結果區與歷史視窗的關係（合併 / 分開 / 雙視圖）
-  - 為什麼不在 Fix 19 一起做：UI 重設計風險高，使用者需要先用 Path A 一週判斷需求
+- [x] **Path B：結果區重構為 Speakly-style UtteranceBlock list** ✅ 2026-05-23 完成
+  - 落地版本：v2.5.0（PR #14）
+  - 實際 commit：`a102dc3 feat: Fix 19 Path B — Speakly-style 獨立 UtteranceBlock 結果區`
+  - 決議跳過 `/plan-design-review` 直接做（使用者要求保持節奏）。互動模型決策：
+    - 原文/潤飾 toggle：保持 global（操作最新 block；舊段落鎖在當時狀態）
+    - 每 block 動作圖示：always-visible（copy + delete）
+    - 主視窗 vs 歷史視窗：維持兩個獨立視圖（主視窗 = 當前 session）
+  - 落地範疇：gui.py +448/-122 行（含新 UtteranceBlock class、5 個方法重寫、
+    delete/copy per-block handler）
+  - 後續觀察：使用一週看看
+    - 多段超過 10 個之後的 scroll 體驗
+    - delete 圖示誤觸頻率
+    - wraplength=600 固定 vs 動態（視窗 resize 沒跟）
+    - 是否需要 per-block polish（重新潤飾舊段落）
+
+### Path B 後續可能的小改進（未排）
+
+- [ ] **UtteranceBlock 動態 wraplength**：視窗 resize 時 text label 沒跟著
+  reflow，永遠 wrap 在 600px。`<Configure>` event 綁定 → 更新 wraplength。
+- [ ] **per-block 潤飾按鈕**（hover-only）：目前只能對最新段潤飾，舊段沒辦法重新潤。
+  可加第三個 icon 跟 copy/delete 同一行。
+- [ ] **delete 動作的 undo toast**（5 秒內可救回）：避免誤刪整段語音內容無法挽回。
 
