@@ -3229,7 +3229,8 @@ class SettingsWindow(ctk.CTkToplevel):
         ).pack(anchor="w", padx=SPACE_LG, pady=(0, 10))
         sep_line(ai)
 
-        # 模型名稱（文字輸入；未來可改為動態 dropdown）
+        # v2.13.0：模型下拉選單（自動偵測本機 Ollama 已安裝模型，取代手動輸入）
+        # get_models() 有 3s timeout，Ollama 沒跑也不會卡太久。
         model_row = ctk.CTkFrame(ai, fg_color="transparent", height=52)
         model_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
         model_row.pack_propagate(False)
@@ -3237,14 +3238,11 @@ class SettingsWindow(ctk.CTkToplevel):
             model_row, text="模型名稱", anchor="w",
             font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
         ).pack(side="left")
+        # 偵測 + 選預設
         self._ollama_model_var = ctk.StringVar(value=self.cfg.ollama_model)
-        ctk.CTkEntry(
-            model_row, textvariable=self._ollama_model_var,
-            width=200, height=30, corner_radius=8,
-            fg_color=SURF_2, border_color=SURF_3,
-            text_color=TEXT_1,
-            font=ctk.CTkFont(FONT_FAMILY_MONO, 12),
-        ).pack(side="right")
+        self._ollama_model_menu_wrap = ctk.CTkFrame(model_row, fg_color="transparent")
+        self._ollama_model_menu_wrap.pack(side="right")
+        self._build_ollama_model_menu()  # 建 OptionMenu + 刷新按鈕（首次同步偵測）
         # v2.13.0：速度／品質提示（user 反映 12B 慢；3-4B 模型對純錯字校正夠用）
         ctk.CTkLabel(
             ai,
@@ -3253,7 +3251,7 @@ class SettingsWindow(ctk.CTkToplevel):
                 "• qwen2.5:3b-instruct — 1-2 秒（推薦，中文校正夠用）\n"
                 "• gemma3:4b — 1-3 秒（平衡）\n"
                 "• gemma3:12b — 3-6 秒（品質優、但體感較慢）\n"
-                "終端機跑 `ollama pull qwen2.5:3b-instruct` 安裝"
+                "找不到模型？終端機跑 `ollama pull <名稱>` 後按 ↻ 重新偵測"
             ),
             font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
             text_color=TEXT_3,
@@ -3825,6 +3823,70 @@ class SettingsWindow(ctk.CTkToplevel):
         self.cfg.reduce_motion_pref = self._reduce_motion_var.get()
         self.cfg.save()
         self._on_save_cb(self.cfg)   # 通知主視窗（destroy 由 _save 的 finally 負責）
+
+    # v2.13.0：Ollama 模型 dropdown ────────────────────────────────────────
+
+    def _build_ollama_model_menu(self) -> None:
+        """偵測本機 Ollama 模型、建立下拉選單（含刷新按鈕）。
+
+        - 開啟 Settings 時自動偵測一次（synchronous，3s timeout）
+        - 列表含「目前 cfg 值」即使本機沒這個模型也保留（避免清掉 user 設定）
+        - 點 ↻ 重新偵測（user `ollama pull` 後不用重開 Settings）
+        - Ollama 沒跑 → 列表只剩 cfg 值（避免 dropdown 變空）
+        """
+        # 清空現有 widget（refresh 用）
+        for w in self._ollama_model_menu_wrap.winfo_children():
+            w.destroy()
+
+        # 偵測模型清單
+        try:
+            installed = self._parent.ollama.get_models()
+        except Exception:
+            log_error("settings_get_ollama_models_failed")
+            installed = []
+
+        current = self._ollama_model_var.get().strip() or self.cfg.ollama_model
+        values = list(installed)
+        # 確保 current 值在列表內（即使本機沒裝、也讓 user 看到他選了什麼）
+        if current and current not in values:
+            values.append(current)
+        # 沒任何模型：顯示提示文字
+        if not values:
+            values = ["（Ollama 未啟動或無模型）"]
+            current = values[0]
+            self._ollama_model_var.set(current)
+
+        # OptionMenu 本體
+        ctk.CTkOptionMenu(
+            self._ollama_model_menu_wrap,
+            values=values,
+            variable=self._ollama_model_var,
+            width=200, height=30, corner_radius=8,
+            fg_color=SURF_2, button_color=SURF_2,
+            button_hover_color=SURF_3,
+            dropdown_fg_color=SURF_1,
+            text_color=TEXT_1,
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 12),
+        ).pack(side="left")
+        # 刷新按鈕（重新偵測 Ollama）
+        ctk.CTkButton(
+            self._ollama_model_menu_wrap,
+            text="↻", width=30, height=30, corner_radius=8,
+            fg_color=SURF_2, hover_color=SURF_3, border_width=1, border_color=SURF_3,
+            text_color=TEXT_2,
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 14),
+            command=self._refresh_ollama_model_list,
+        ).pack(side="left", padx=(4, 0))
+
+    def _refresh_ollama_model_list(self) -> None:
+        """重新偵測 Ollama 模型清單（不關閉 Settings）。"""
+        log_action("ollama_model_list_refresh")
+        # 先觸發 health check 同步（避免 stale）
+        try:
+            self._parent.ollama.health_check_sync()
+        except Exception:
+            pass
+        self._build_ollama_model_menu()
 
     def _reload_prompts_now(self) -> None:
         """立即觸發 PromptReloader.reload_now()，並以狀態標籤顯示結果。"""
