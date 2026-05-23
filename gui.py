@@ -700,10 +700,27 @@ class AppWindow(ctk.CTkFrame):
     # ═══════════════════════════════════════════════════════════════════════
 
     def _transition_to_recording(self) -> None:
-        """狀態機：idle → recording。啟動麥克風錄音並更新全部 UI。"""
+        """狀態機：idle → recording。啟動麥克風錄音並更新全部 UI。
+
+        Fix Cluster C / 2026-05-23：先 start recorder、失敗就不進 recording state。
+        之前 `self.recorder.start()` 在 UI / state 切換**之後**呼叫且不檢查回傳值
+        → 麥克風被別 App 占用 / 拔線 / 權限拒絕時 UI 卡 recording、按停止得到
+        「沒有偵測到音訊」、使用者以為麥克風壞了。改成 start-first guard + toast。
+        """
         if self._state != "idle":
             log.debug(f"_transition_to_recording ignored (state={self._state})")
             return
+
+        # Cluster C：先 start recorder（會 lazy-init device）、失敗就回退 idle
+        if not self.recorder.start():
+            log.warning("RECORD: start() failed; staying idle")
+            log_action("recording_start_failed_no_device")
+            try:
+                self._show_toast("⚠ 麥克風無法啟動（請確認權限或裝置）")
+            except Exception:
+                pass
+            return
+
         log_state(
             "idle->recording",
             model=self._model_var.get(),
@@ -739,8 +756,6 @@ class AppWindow(ctk.CTkFrame):
                     self._target_label.configure(text=f"→ {app}")
             self.after(0, _apply)
         threading.Thread(target=_capture_frontmost, daemon=True).start()
-
-        self.recorder.start()
 
         # UI：Chamber 渲染迴圈會在下次 tick 時自動依新狀態重繪，不需手動觸發
         self._timer_label.configure(text="00:00")
@@ -1076,7 +1091,14 @@ class AppWindow(ctk.CTkFrame):
     # ── 潤飾管線 ────────────────────────────────────────────────────────────
 
     def _start_polish(self, gen: int, raw_text: str, target: Optional[str]) -> None:
-        """啟動背景潤飾；完成時將於主執行緒回呼 _finish_polish。"""
+        """啟動背景潤飾；完成時將於主執行緒回呼 _finish_polish。
+
+        Fix Cluster B / 2026-05-23：抓 target_block ref 一起傳進 _finish_polish，
+        讓 _finish_polish 對齊「block identity」而非只判 generation。覆蓋三種 race：
+        (1) auto-polish 與手動 `_on_ollama` 並存寫進同一個 latest block
+        (2) `_repolish_from_history` 跑時使用者錄新音、polish 寫進新 block
+        (3) `_on_block_delete` 刪 latest 時 polish 仍跑、寫進倒數第二段
+        """
         self._polish_busy = True
 
         # A1：preset 路由一律用 _frontmost_app（不受 auto_paste 影響）
@@ -1099,6 +1121,11 @@ class AppWindow(ctk.CTkFrame):
         # C1：記錄實際送 LLM 的輸入但不汙染 _last_raw
         self._last_llm_input = llm_input
 
+        # Cluster B：抓「當下 latest」block ref 一起傳進 _finish_polish。
+        # polish 跑回來時這個 ref 可能已被 delete（不在 list 內）或不再是 latest，
+        # _finish_polish 用 identity 比對來決定是否安全 set_polished。
+        target_block = self._utterance_blocks[-1] if self._utterance_blocks else None
+
         # C2：三段式標題狀態（preset 名稱不會被後續 status 吃掉）
         self._title_preset = preset.display_name if preset_name != "default" else None
         self._title_status = "潤飾中…"
@@ -1113,9 +1140,8 @@ class AppWindow(ctk.CTkFrame):
                 dictionary_terms=dict_terms,
                 preset_name=preset_name,
             )
-            # 把 raw_text（= Whisper 原文）交給 _finish_polish 做 expect_current
-            # 比對，textbox 從頭到尾維持 Whisper 原文直到替換為潤飾版
-            self.after(0, self._finish_polish, gen, raw_text, target, resp)
+            # 把 raw_text（= Whisper 原文）+ target_block 交給 _finish_polish
+            self.after(0, self._finish_polish, gen, raw_text, target, resp, target_block)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -1125,8 +1151,13 @@ class AppWindow(ctk.CTkFrame):
         raw_text: str,
         target: Optional[str],
         resp,
+        target_block=None,
     ) -> None:
-        """主執行緒：套用潤飾結果（或降級回原文）+ 觸發自動貼上。"""
+        """主執行緒：套用潤飾結果（或降級回原文）+ 觸發自動貼上。
+
+        Fix Cluster B：target_block identity 比對 — 只在「block 仍在 list 內
+        且仍是 latest」時才 set_polished。否則 silently drop（避免寫進不相干 block）。
+        """
         # 若期間又開始新轉錄，這次結果直接丟棄，避免蓋到新內容
         if gen != self._polish_generation:
             self._polish_busy = False
@@ -1142,11 +1173,26 @@ class AppWindow(ctk.CTkFrame):
             self._show_toast(f"AI 潤飾失敗：{resp.error}")
             paste_text = raw_text
         else:
-            # 成功：把最新 block 切到潤飾版（block 自己存 raw + polished 兩份）
+            # 成功：把潤飾版寫進 target_block，但只在 block identity 仍成立時才寫
             polished = resp.text
-            self._last_polished = polished
-            if self._utterance_blocks:
-                self._utterance_blocks[-1].set_polished(polished)
+            # Cluster B：identity check — target_block 還在 list 內？還是 latest？
+            block_ok = (
+                target_block is not None
+                and target_block in self._utterance_blocks
+                and target_block is self._utterance_blocks[-1]
+            )
+            if block_ok:
+                target_block.set_polished(polished)
+                self._last_polished = polished
+            else:
+                # block 已被刪除 / 不再是 latest（user 又錄新音、又刪掉等）
+                # → 不寫進別人的 block；但仍把 paste_text 設成 polished 供 auto-paste
+                log_action(
+                    "polish_dropped_block_changed",
+                    target_alive=(target_block in self._utterance_blocks),
+                    is_latest=(target_block is self._utterance_blocks[-1]
+                               if self._utterance_blocks else False),
+                )
             self._showing_polished = True
             self._apply_toggle_style()          # 現在有潤飾版了 → 兩顆點亮
             self._title_status = f"已潤飾 · {resp.elapsed_seconds:.1f}s"
@@ -1788,6 +1834,12 @@ class AppWindow(ctk.CTkFrame):
             return
         log_action("ollama_clicked", text_len=len(text), scope="latest_block")
 
+        # Fix Cluster B：抓 target_block ref + 增 generation、讓「polish 跑時又錄新音 / 刪掉
+        # latest block」這類 race 跟自動 polish 用同一套 identity 保護。
+        self._polish_generation += 1
+        gen = self._polish_generation
+        target_block = latest
+
         self._ollama_btn.configure(state="disabled", text="處理中…")
         self._polish_busy = True
 
@@ -1802,16 +1854,25 @@ class AppWindow(ctk.CTkFrame):
                 enabled=self.cfg.ollama_enabled,
                 healthy=(self.ollama.health_ok is True),
             )
+            # Cluster B：generation 對齊（防新轉錄）+ block identity（防 delete / 不再 latest）
+            if gen != self._polish_generation:
+                log_action("manual_polish_dropped_gen_mismatch")
+                return
             if result.error:
                 self._show_toast(f"AI 潤飾失敗：{result.error}")
                 return
-            # 把潤飾版寫進最新 block；toggle chip 自動點亮
-            if self._utterance_blocks:
-                self._utterance_blocks[-1].set_polished(result.text)
+            block_ok = (
+                target_block in self._utterance_blocks
+                and target_block is self._utterance_blocks[-1]
+            )
+            if block_ok:
+                target_block.set_polished(result.text)
                 self._last_polished    = result.text
                 self._showing_polished = True
                 self._apply_toggle_style()
-            self._show_toast(f"AI 潤飾完成 · {result.elapsed_seconds:.1f}s")
+                self._show_toast(f"AI 潤飾完成 · {result.elapsed_seconds:.1f}s")
+            else:
+                log_action("manual_polish_dropped_block_changed")
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -1922,11 +1983,14 @@ class AppWindow(ctk.CTkFrame):
         log_action("settings_opened")
         SettingsWindow(self, self.cfg, self._on_settings_saved)
 
-    def _do_theme_relaunch(self) -> None:
+    def _do_theme_relaunch(self, on_failure=None) -> None:
         """v2.6.0 主題切換後執行：toast → 800ms → cleanup → spawn → exit。
 
         Eng Review Issue 1 / 2026-05-23：cleanup-first 順序避免新舊 process 共存
         race window（雙 NSEvent monitor / mic 衝突 / config.json race）。
+
+        Fix Cluster D-1 / 2026-05-23：spawn 失敗時呼叫 on_failure callback（讓
+        SettingsWindow rollback config.theme），避免使用者下次啟動莫名變新主題。
 
         SettingsWindow 已 save config + destroy 自己；本函式由 AppWindow 跑收尾。
         """
@@ -1959,9 +2023,14 @@ class AppWindow(ctk.CTkFrame):
                 log.info("THEME: cleanup done, new instance spawned, exiting")
                 sys.exit(0)
             else:
-                # 全部失敗 → 不 exit、讓使用者手動處理；toast 提示
+                # Cluster D-1：全部失敗 → 回滾 config.theme，不 exit、讓使用者手動處理
+                if on_failure is not None:
+                    try:
+                        on_failure()
+                    except Exception:
+                        log_error("theme_relaunch_on_failure_callback_failed")
                 try:
-                    self._show_toast("重啟失敗、請手動關閉並重啟 App")
+                    self._show_toast("重啟失敗、主題已回滾、請手動關閉並重啟 App")
                 except Exception:
                     pass
                 log_error("theme_relaunch_all_paths_failed")
@@ -2192,13 +2261,25 @@ class AppWindow(ctk.CTkFrame):
                     self._state == "idle"
                     and since_restart * 1000.0 > self.HOTKEY_FORCE_RESTART_INTERVAL_MS
                 ):
-                    log.info(
-                        f"HOTKEY: watchdog force-restart (reason=periodic, "
-                        f"since_last={since_restart:.0f}s)"
-                    )
-                    log_action("hotkey_listener_auto_restarted", reason="periodic")
-                    mgr.restart(self.cfg.hotkey)
-                    self._last_hotkey_force_restart = now
+                    # Fix Cluster G / 2026-05-23：force-restart 不撞使用者剛好按鍵的瞬間。
+                    # 若 mgr 內部 _pressed 不為空或 _combo_active=True，表示有 in-flight
+                    # press 還沒 release。restart 會清空 _pressed → 後續 release 不 fire。
+                    # 跳過本輪、下個 5s watchdog tick 再試（最多延 5 次 = +25s 可接受）。
+                    pressed_count = len(getattr(mgr, "_pressed", ()))
+                    combo_active  = getattr(mgr, "_combo_active", False)
+                    if pressed_count > 0 or combo_active:
+                        log.info(
+                            f"HOTKEY: watchdog deferring force-restart "
+                            f"(in-flight: pressed={pressed_count}, combo_active={combo_active})"
+                        )
+                    else:
+                        log.info(
+                            f"HOTKEY: watchdog force-restart (reason=periodic, "
+                            f"since_last={since_restart:.0f}s)"
+                        )
+                        log_action("hotkey_listener_auto_restarted", reason="periodic")
+                        mgr.restart(self.cfg.hotkey)
+                        self._last_hotkey_force_restart = now
 
                 # Fix 18 / 2026-05-23（Layer 3）：靜默偵測（純診斷 log）。
                 # monitor 物件還在但 5 分鐘沒任何事件 + idle → 嫌疑 H1/H2 發生中。
@@ -2539,7 +2620,15 @@ class AppWindow(ctk.CTkFrame):
         self.after(2800, toast.destroy)
 
     def on_close(self) -> None:
-        """視窗關閉時：停止 pynput 監聽器與進行中的錄音，避免資源洩漏。"""
+        """視窗關閉時：停止 pynput 監聽器、錄音、清 Cocoa observer，避免資源洩漏。
+
+        Fix Cluster A / 2026-05-23：之前完全沒呼叫 `removeObserver_` 或
+        `removeEventHandlerForEventClass_andEventID_`。theme switch 走 execv 路徑
+        relaunch 時、process image 雖然 replace、但同 PID 下 AppKit / NSAppleEventManager
+        留有 dangling block reference；連切 5 次主題後出現重複 Cocoa 事件 dispatch
+        + 緩慢記憶體 leak。此修法在 on_close 顯式撤除 4 個觀察者 + 1 個 AppleEvent
+        handler，配合 cleanup-first 順序確保 spawn 新 process 前完全乾淨。
+        """
         log.info("GUI: on_close")
         try:
             self.hotkey_mgr.stop()
@@ -2553,6 +2642,33 @@ class AppWindow(ctk.CTkFrame):
                 log_error("recorder_stop_on_close_failed")
         # Phase 4.3 mini 視窗也要 destroy，避免主視窗關了 HUD 還浮著
         self._destroy_mini_window()
+
+        # Fix Cluster A：撤除 Cocoa NSNotification observer（3 個：Did/Will BecomeActive + WillHide）
+        try:
+            obs = getattr(self, "_cocoa_activation_observer", None)
+            if obs is not None:
+                from Foundation import NSNotificationCenter
+                NSNotificationCenter.defaultCenter().removeObserver_(obs)
+                self._cocoa_activation_observer = None
+                log.info("COCOA: NSNotification observer removed on close")
+        except Exception:
+            log_error("cocoa_observer_remove_on_close_failed")
+
+        # Fix Cluster A：撤除 NSAppleEventManager kAEReopenApplication handler
+        try:
+            reopen_handler = getattr(self, "_cocoa_reopen_handler", None)
+            if reopen_handler is not None:
+                from Foundation import NSAppleEventManager
+                _kCoreEventClass      = 0x61657674   # 'aevt'
+                _kAEReopenApplication = 0x72617070   # 'rapp'
+                NSAppleEventManager.sharedAppleEventManager() \
+                    .removeEventHandlerForEventClass_andEventID_(
+                        _kCoreEventClass, _kAEReopenApplication,
+                    )
+                self._cocoa_reopen_handler = None
+                log.info("COCOA: kAEReopenApplication handler removed on close")
+        except Exception:
+            log_error("cocoa_reopen_handler_remove_on_close_failed")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3171,6 +3287,11 @@ class SettingsWindow(ctk.CTkToplevel):
 
         Eng Review Issue 1 順序：confirm 立刻 save、AppWindow 在 toast 後依
         cleanup → spawn → exit 順序執行，避免雙 instance 共存。
+
+        Fix Cluster D-1 / 2026-05-23：relaunch 全部失敗時把 config.theme 回滾。
+        原本 save 落地後 relaunch fail 只 log_error、config 已寫入磁碟回不去 →
+        使用者下次啟動莫名變新主題。AppWindow `_do_theme_relaunch` 改成同步檢查
+        spawn 是否成功，失敗時回呼此處 rollback。
         """
         old_theme = self.cfg.theme
         self.cfg.theme = new_theme
@@ -3184,11 +3305,21 @@ class SettingsWindow(ctk.CTkToplevel):
 
         log_action("theme_switched", **{"from": old_theme, "to": new_theme})
 
-        # 委派 AppWindow 跑 cleanup → spawn → exit
+        # 設 rollback callback：AppWindow 800ms 後 cleanup + spawn 若失敗、把 config 回滾。
+        def _rollback():
+            try:
+                self.cfg.theme = old_theme
+                self.cfg.save()
+                log_action("theme_rollback_after_relaunch_fail",
+                           **{"attempted": new_theme, "rolled_back_to": old_theme})
+            except Exception:
+                log_error("theme_rollback_save_failed")
+
         try:
-            self._parent._do_theme_relaunch()
+            self._parent._do_theme_relaunch(on_failure=_rollback)
         except Exception:
             log_error("theme_trigger_relaunch_failed")
+            _rollback()
             return
 
         # 關閉 SettingsWindow，AppWindow 會在 800ms 後正式進入 relaunch 流程
@@ -3405,10 +3536,13 @@ class SettingsWindow(ctk.CTkToplevel):
             return
 
         whisper_dir = os.path.expanduser("~/.whisper_app")
+        # Fix Cluster D-2 / 2026-05-23：app_version 從 _version.py SSoT 讀；
+        # 之前 hard-coded "v2.2.0" 從 v2.2.0 之後 6 次發版都沒同步。
+        from _version import __version__ as _app_ver
         manifest = {
             "schema_version": self._EXPORT_SCHEMA_VERSION,
             "exported_at":    datetime.datetime.now().isoformat(timespec="seconds"),
-            "app_version":    "v2.2.0",
+            "app_version":    f"v{_app_ver}",
             "files":          [],
             "excluded":       self._EXPORT_EXCLUDED_REASON,
         }
@@ -3501,15 +3635,32 @@ class HotkeyBindDialog(ctk.CTkToplevel):
     """
 
     def __init__(self, parent, current_combo: str, on_apply_cb) -> None:
-        """初始化對話框並立即開始擷取按鍵。current_combo 目前未使用，保留供未來顯示用。"""
+        """初始化對話框並立即開始擷取按鍵。current_combo 目前未使用，保留供未來顯示用。
+
+        Fix Cluster H / 2026-05-23：dialog 開啟期間先暫停 NSEvent global monitor，
+        避免使用者試按新 hotkey 時 hotkey_mgr 同時也接到 → 觸發背景錄音 / mini HUD
+        跳出 / 結果區多一段空錄音。`destroy()` 時 restart 回來。
+        """
         super().__init__(parent)
         self._on_apply_cb = on_apply_cb
         self._captured: Optional[str] = None
+        # 取 AppWindow ref（CTkToplevel 的 parent 是 SettingsWindow、再上層才是 AppWindow）
+        self._app_window = getattr(parent, "_parent", None)
+        # Cluster H：開 dialog 期間暫停 NSEvent monitor、不讓試按誤觸錄音
+        if self._app_window is not None:
+            try:
+                self._app_window.hotkey_mgr.stop()
+                log.info("HOTKEY: monitor paused during HotkeyBindDialog")
+            except Exception:
+                log_error("hotkey_mgr_pause_for_dialog_failed")
         self.title("設定快捷鍵")
         self.geometry("340x220")
         self.resizable(False, False)
         self.configure(fg_color=BG)
         self.grab_set()
+        # WM_DELETE_WINDOW / 取消 / _apply / 紅× 都走同個 destroy() —
+        # destroy() 內 Cluster H 補 restart logic（單一 source of truth）。
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
         self._build()
         self._start_capture()
 
@@ -3540,7 +3691,7 @@ class HotkeyBindDialog(ctk.CTkToplevel):
             hover_color=SURF_3,
             border_width=1, border_color=SURF_3,
             font=ctk.CTkFont("SF Pro Text", 13),
-            command=self.destroy,
+            command=self.destroy,   # Cluster H：destroy() 統一 restart hotkey monitor
         ).pack(side="left", padx=6)
 
         self._apply_btn = ctk.CTkButton(
@@ -3715,9 +3866,21 @@ class HotkeyBindDialog(ctk.CTkToplevel):
         self.destroy()
 
     def destroy(self) -> None:
-        """覆寫 destroy：先解除 Tk 鍵盤綁定，再呼叫 super().destroy()。"""
+        """覆寫 destroy：先解除 Tk 鍵盤綁定 + Cluster H restart hotkey monitor，再 super.destroy。"""
         # 確保對話框關閉時解除綁定，避免 Tcl 錯誤訊息
-        self._unbind_capture()
+        try:
+            self._unbind_capture()
+        except Exception:
+            pass
+        # Cluster H：dialog 關閉時 restart hotkey monitor 回來（無論走 _apply / 取消 / 紅×）
+        if getattr(self, "_app_window", None) is not None:
+            try:
+                aw = self._app_window
+                aw.hotkey_mgr.restart(aw.cfg.hotkey)
+                log.info("HOTKEY: monitor resumed after HotkeyBindDialog")
+                self._app_window = None   # 防止重複 restart
+            except Exception:
+                log_error("hotkey_mgr_resume_after_dialog_failed")
         super().destroy()
 
 
