@@ -37,7 +37,7 @@ import customtkinter as ctk
 from config import MODEL_INFO, LANGUAGE_OPTIONS, Config
 from logger import get_logger, log_action, log_error, log_settings, log_state
 from hotkey_manager import (
-    HotkeyManager, capture_hotkey, format_hotkey,
+    HotkeyManager, format_hotkey,
     is_pynput_available, check_accessibility,
 )
 from ollama_client import OllamaClient, OllamaConfig
