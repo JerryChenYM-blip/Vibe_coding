@@ -52,6 +52,7 @@ log.debug(f"DIAG: Python executable: {sys.executable}")
 
 from config import Config
 from gui import WIN_W, WIN_H, AppWindow, AccessibilityDialog
+from _version import __version__
 from hotkey_manager import check_accessibility, is_pynput_available
 
 
@@ -164,7 +165,7 @@ def main() -> None:
         SplashScreen(
             root,
             on_done=lambda: (root.deiconify(), root.lift()),
-            version="v2.4.1",
+            version=f"v{__version__}",
         )
     except Exception:
         log_error("splash_init_failed")

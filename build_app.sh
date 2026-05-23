@@ -24,6 +24,15 @@ set -euo pipefail
 
 # ─── 設定 ────────────────────────────────────────────────────────────
 PROJECT_DIR="/Users/jerrychen/project/Claude_code"
+
+# 從 _version.py 讀單一真相版本字串。發版流程：改 _version.py → 跑本 script。
+VERSION=$(grep -E '^__version__\s*=' "$PROJECT_DIR/_version.py" | sed -E 's/.*"([^"]+)".*/\1/')
+if [ -z "$VERSION" ]; then
+    echo "ERROR: cannot parse __version__ from $PROJECT_DIR/_version.py" >&2
+    exit 1
+fi
+echo "BUILD: Whisper Pro v$VERSION"
+
 APP_ROOT="$HOME/Applications/WhisperPro.app"
 CONTENTS_DIR="$APP_ROOT/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
@@ -44,7 +53,7 @@ mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" "$FRAMEWORKS_DIR"
 # ─── Step 2：寫主 Info.plist ─────────────────────────────────────────
 # LSArchitecturePriority=arm64 讓 launchd 一開始就以 arm64 啟動 launcher，
 # 不需要 arch -arm64 包裝（避免弄壞 responsibility chain）。
-cat > "$PLIST" <<'PLIST_EOF'
+cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -58,9 +67,9 @@ cat > "$PLIST" <<'PLIST_EOF'
     <key>CFBundleIdentifier</key>
     <string>com.jerrychen.whisperpro</string>
     <key>CFBundleVersion</key>
-    <string>2.3.0</string>
+    <string>${VERSION}</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.3.0</string>
+    <string>${VERSION}</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleIconFile</key>
