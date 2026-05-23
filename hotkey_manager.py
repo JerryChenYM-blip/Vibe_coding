@@ -767,8 +767,21 @@ class HotkeyManager:
                 self._last_event_at = now
 
                 if is_target:
-                    # 目標 modifier press —— 只在當下沒有其他鍵按住時才 armed
-                    if not self._combo_active and len(self._pressed) == 0:
+                    # 目標 modifier press —— 只在當下沒有其他 modifier 按住時才 armed。
+                    # Fix Cluster F / 2026-05-23：原本「_pressed 為空」太嚴，dead-key
+                    # 組合（Right Option + e 打 é）macOS 偶爾不送對應 KeyUp 事件
+                    # （字元已組合完成）→ _pressed 殘留 'e' → 後續單按 R-Opt 不 fire。
+                    # 改寬鬆為「無其他 sided modifier」── 字母 / 數字殘留不影響 arm。
+                    _other_sided = any(
+                        isinstance(k, str) is False and (
+                            str(k).endswith("_l") or str(k).endswith("_r")
+                            or "cmd_" in str(k) or "alt_" in str(k)
+                            or "ctrl_" in str(k) or "shift_" in str(k)
+                        )
+                        for k in self._pressed
+                        if k != nk_sided   # 自己不算
+                    )
+                    if not self._combo_active and not _other_sided:
                         self._combo_active = True
                         self._combo_active_at = now
                         self._other_key_during_press = False
