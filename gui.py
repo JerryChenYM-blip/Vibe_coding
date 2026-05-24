@@ -2145,10 +2145,14 @@ class AppWindow(ctk.CTkFrame):
         self.cfg.model = value
         self.cfg.save()
         log_settings("changed", field="model", old=old, new=value, source="dropdown")
-        self._status_label.configure(text=f"  就緒 ({value})")
         if value != old:
+            # 顯示「暖機中」直到 _warmup_model 完成才改回「就緒」
+            # （避免 user 在 1.7B 下載 3.4GB 期間誤以為已 ready、按熱鍵卡 60s timeout）
+            self._status_label.configure(text=f"  暖機中 ({value})...")
             log.info(f"WARMUP: model changed ({old} → {value}) via top dropdown, scheduling warmup")
             self.after(1500, self._warmup_model)
+        else:
+            self._status_label.configure(text=f"  就緒 ({value})")
 
     def _on_language_change(self, value: str) -> None:
         """頂部語言選單變更時：更新 cfg 儲存（下次錄音生效）。"""
