@@ -36,14 +36,15 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 #         model.safetensors 命名不相容、ValueError [load_npz]、CPU fallback
 #         又超過 60s timeout——詳見 docs/changelog/v2.13.x.md）
 MODEL_INFO: dict[str, str] = {
-    "tiny":           "速度最快，適合英文速記（39M 參數）",
-    "base":           "速度與精準度平衡，推薦入門（74M 參數）",
-    "small":          "較高精準度，中文效果更佳（244M 參數，GPU 4bit 量化）",
-    "medium":         "高精準度，需較多記憶體（769M 參數，GPU 4bit 量化）",
-    "large-v3-turbo": "★ Whisper 推薦：中英混合最佳，Metal GPU 加速（809M）",
+    "large-v3-turbo": "Whisper Large V3 Turbo：中英混合穩定後備、Metal GPU（809M）",
     "qwen3-asr":      "★ Qwen3-ASR 0.6B：速度優先、中文 acoustic 強、繁體輸出（~1.2GB RAM）",
     "qwen3-asr-large":"★★ Qwen3-ASR 1.7B：SOTA 開源、競爭商用 API（~3.4GB RAM、慢 2-3x）",
 }
+# v2.15.0：移除 tiny / base / small / medium。理由：
+#   • 中文準確度遠遜於 large-v3-turbo（同樣 MLX GPU、體感無感）
+#   • 沒人會選、純占下拉選單高度
+#   • transcribe_fast 內部仍用 "small"（已停用、但保留 fallback 路徑）
+#     對應 _MLX_MODEL_MAP 條目仍在 transcriber.py 不動、避免 dead code regression
 
 # 語言顯示名稱 → Whisper 語言代碼（None 代表自動偵測）
 LANGUAGE_OPTIONS: dict[str, str | None] = {
