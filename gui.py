@@ -201,6 +201,14 @@ class AppWindow(ctk.CTkFrame):
     PROCESSING_TIMEOUT_BASE_MS = 60_000
     PROCESSING_TIMEOUT_RTF_BUDGET = 1.0
 
+    # v2.16.0 Streaming 轉錄常數（chunk 邊講邊轉、放開後接 tail 立即出結果）
+    STREAM_TICK_MS = 1000               # 每秒檢查 buffer 是否有新 chunk
+    STREAM_CHUNK_SAMPLES = 10 * 16_000  # 10s × 16kHz = 一個 chunk 的 sample 數
+    # 短於這個 threshold 不啟動 streaming（chunk 開銷 > 收益）
+    STREAM_MIN_ENABLE_SAMPLES = 12 * 16_000   # 12 秒
+    # _run_transcription 等所有 pending chunks 完成的最大時間
+    STREAM_CHUNK_JOIN_TIMEOUT_S = 30.0
+
     def __init__(self, master: ctk.CTk, cfg: Config) -> None:
         super().__init__(master, fg_color=BG, corner_radius=0)
         self.pack(fill="both", expand=True)
@@ -261,8 +269,17 @@ class AppWindow(ctk.CTkFrame):
 
         # Streaming
         self._stream_samples: int       = 0
-        self._stream_chunks:  list[str] = []
+        self._stream_chunks:  list[str] = []   # 按 chunk index 排序、placeholder "" 占位
         self._stream_tick_id            = None
+        # v2.16.0 streaming：dispatch / complete 計數、_run_transcription 用來等
+        # 所有背景 chunk 推論完成才合併。Index-based 寫進 _stream_chunks 確保順序。
+        self._stream_dispatched: int    = 0
+        self._stream_completed:  int    = 0
+        # Generation tag：防快速連續錄音時、前一輪未完成 chunk 污染新輪 counter。
+        # _transition_to_recording += 1；chunk thread 只在 generation 還匹配時
+        # 寫結果 / 增 _completed、否則 silent drop（資料來自上一輪 recording、
+        # 對新輪無意義）。
+        self._stream_generation: int    = 0
 
         # B2（v2.7.0）：processing timeout self-heal 的 after id；快速連續錄音
         # 避免 N 個 pending callback 並存（之前每次 _transition_to_processing
@@ -830,10 +847,13 @@ class AppWindow(ctk.CTkFrame):
         self._status_label.configure(text="  錄音中")
 
         self._update_timer()
-        # 中段串流轉錄目前暫停使用：實測 small 模型的中段結果品質拖累
-        # 最終主模型輸出，等 Ollama 整合穩定後再評估是否重啟。
-        # _stream_tick 方法已保留，未來啟用時直接排程即可。
-        self._stream_tick_id = None
+        # v2.16.0：streaming 轉錄啟用（邊講邊轉、長段語音放開後幾乎立即出結果）
+        # 重置計數器、generation 自增、排程第一次 tick。短錄音
+        # (< STREAM_MIN_ENABLE_SAMPLES) _stream_tick 內部會自動跳過 dispatch。
+        self._stream_dispatched = 0
+        self._stream_completed  = 0
+        self._stream_generation += 1
+        self._stream_tick_id = self.after(self.STREAM_TICK_MS, self._stream_tick)
 
         # Phase 4.3 mini 視窗：開啟錄音 HUD
         if self._mini_window is not None:
@@ -958,35 +978,98 @@ class AppWindow(ctk.CTkFrame):
     #  STREAMING
     # ═══════════════════════════════════════════════════════════════════════
 
-    _STREAM_CHUNK_SAMPLES = 5 * 16_000
-
     def _stream_tick(self) -> None:
-        """中段串流轉錄（目前暫停使用）：每秒取最新 chunk 送 transcribe_fast。
+        """v2.16.0 Streaming 中段轉錄：每秒檢查 recorder buffer，累積夠
+        STREAM_CHUNK_SAMPLES（10s）就 dispatch 一個 chunk 到背景 thread
+        跑 user 選的主模型（不再是 small）。結果 index-based 寫進
+        _stream_chunks 維持順序。
 
-        保留此方法以備 Phase 3 啟用；主迴圈不再排程此函式。
+        關鍵設計：
+          • Index-based slots：dispatch 時先 append placeholder ""，背景
+            thread 完成寫進指定 index、避免 race。
+          • _transcription_lock 在 transcribe() 內、序列化所有 chunks
+            （Qwen3-ASR Session 不支援並發、序列化是 must）。10s chunk
+            推論 ~5s < 10s 間隔、不會塞車。
+          • dispatched / completed 計數：_run_transcription 用 deadline
+            wait 確保最終合併前所有 chunks 完成。
+          • 短錄音 (< STREAM_MIN_ENABLE_SAMPLES = 12s) 完全不 dispatch、
+            直接走原 end-to-end 路徑（streaming overhead > 收益）。
         """
         self._stream_tick_id = None
         if self._state != "recording":
             return
-        snap = self.recorder.get_buffer_snapshot()
-        new  = len(snap) - self._stream_samples
-        if new < 4 * 16_000:
-            self._stream_tick_id = self.after(1000, self._stream_tick)
-            return
-        chunk = snap[self._stream_samples:]
-        self._stream_samples = len(snap)
-        lang = self.cfg.get_whisper_language()
 
-        def _process(audio=chunk):
-            r = self.transcriber.transcribe_fast(audio, language=lang)
-            if r.text and r.text not in (
-                "（未偵測到語音內容）", "（沒有偵測到音訊，請確認麥克風是否正常運作）"
-            ):
-                self._stream_chunks.append(r.text)
+        snap = self.recorder.get_buffer_snapshot()
+        available = len(snap) - self._stream_samples
+
+        # 短錄音門檻：buffer 還沒到 12s 就先不 streaming
+        # （即使現在到 10s、user 馬上停的話、整段只 ~11s、走端到端比較合算）
+        # 但若已開始 streaming 就繼續（_stream_dispatched > 0）
+        if (
+            self._stream_dispatched == 0
+            and len(snap) < self.STREAM_MIN_ENABLE_SAMPLES
+        ):
+            # 排下一輪 tick、繼續累積
+            self._stream_tick_id = self.after(
+                self.STREAM_TICK_MS, self._stream_tick
+            )
+            return
+
+        # 累積 ≥ 10s 新 audio？ → dispatch chunk
+        if available >= self.STREAM_CHUNK_SAMPLES:
+            chunk_end = self._stream_samples + self.STREAM_CHUNK_SAMPLES
+            chunk = snap[self._stream_samples:chunk_end]
+            self._stream_samples = chunk_end
+            self._dispatch_stream_chunk(chunk)
+
+        # 排下次 tick
+        if self._state == "recording":
+            self._stream_tick_id = self.after(
+                self.STREAM_TICK_MS, self._stream_tick
+            )
+
+    def _dispatch_stream_chunk(self, audio) -> None:
+        """送一個 chunk 到背景 thread 跑 transcribe，結果寫進 _stream_chunks[idx]。
+
+        Index-based slot pattern：避免完成順序不一致引發的 race。實際上
+        transcribe() 內 _transcription_lock 已序列化、但這個 pattern 更穩。
+        """
+        idx = len(self._stream_chunks)
+        self._stream_chunks.append("")   # placeholder 占位、保順序
+        self._stream_dispatched += 1
+
+        model = self.cfg.model
+        lang = self.cfg.get_whisper_language()
+        cv = getattr(self.cfg, "chinese_variant", "off")
+
+        gen = self._stream_generation   # 捕捉 dispatch 當下的 generation
+
+        def _process(audio=audio, idx=idx, gen=gen):
+            try:
+                r = self.transcriber.transcribe(
+                    audio, model_size=model, language=lang, chinese_variant=cv,
+                )
+                text = r.text if (
+                    r.text and not r.text.startswith("（")
+                ) else ""
+                # Generation guard：若 user 已開新 recording、上輪 chunk 結果丟棄
+                # 否則寫進 index（單一 writer per slot、不需鎖）
+                if self._stream_generation == gen:
+                    self._stream_chunks[idx] = text
+                    log.info(
+                        f"STREAMING: chunk[{idx}] done "
+                        f"({len(text)} chars, RTF={(r.elapsed_seconds or 0)/(r.duration_seconds or 1):.2f})"
+                    )
+                else:
+                    log.info(f"STREAMING: chunk[{idx}] dropped (generation mismatch)")
+            except Exception:
+                log_error("stream_chunk_failed", idx=idx)
+            finally:
+                # Generation guard 同樣套用 counter
+                if self._stream_generation == gen:
+                    self._stream_completed += 1
 
         threading.Thread(target=_process, daemon=True).start()
-        if self._state == "recording":
-            self._stream_tick_id = self.after(1000, self._stream_tick)
 
     # ═══════════════════════════════════════════════════════════════════════
     #  TRANSCRIPTION
@@ -1006,12 +1089,33 @@ class AppWindow(ctk.CTkFrame):
             # 一律用使用者選的模型做最終轉錄，不再因短音檔退化到 transcribe_fast
             # （那條路徑寫死 small，會嚴重拖垮品質）。
             # v2.14.0：傳 chinese_variant 給 Qwen3-ASR 用（Whisper backend ignore）
+            # tail audio：_transition_to_processing 已把 _stream_samples 後的尾段
+            # 取出來；若無 streaming 就是整段 full_audio
             result = self.transcriber.transcribe(
                 audio,
                 model_size=model,
                 language=lang,
                 chinese_variant=getattr(self.cfg, "chinese_variant", "off"),
             )
+
+            # v2.16.0：等所有背景 streaming chunks 完成寫入 _stream_chunks
+            # 才合併。transcribe() 已序列化（_transcription_lock）、tail 完成
+            # 表示鎖剛被釋放、之前 chunks 已寫完；但 _stream_completed 計數
+            # 在 transcribe 之外才 +=、最壞情況差一個 chunk、deadline wait 保險。
+            if self._stream_dispatched > 0:
+                deadline = time.time() + self.STREAM_CHUNK_JOIN_TIMEOUT_S
+                while self._stream_completed < self._stream_dispatched:
+                    if time.time() > deadline:
+                        log.warning(
+                            f"STREAMING: timeout waiting for chunks "
+                            f"(done={self._stream_completed}/{self._stream_dispatched})"
+                        )
+                        break
+                    time.sleep(0.05)
+                log.info(
+                    f"STREAMING: merged {self._stream_dispatched} chunks "
+                    f"+ tail (tail len={len(result.text)})"
+                )
 
             prior = list(self._stream_chunks)
             if prior:
