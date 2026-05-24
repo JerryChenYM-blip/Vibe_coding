@@ -41,7 +41,8 @@ MODEL_INFO: dict[str, str] = {
     "small":          "較高精準度，中文效果更佳（244M 參數，GPU 4bit 量化）",
     "medium":         "高精準度，需較多記憶體（769M 參數，GPU 4bit 量化）",
     "large-v3-turbo": "★ Whisper 推薦：中英混合最佳，Metal GPU 加速（809M）",
-    "qwen3-asr":      "★ Qwen3-ASR：中文 acoustic 強、繁體輸出（600M、Metal GPU）",
+    "qwen3-asr":      "★ Qwen3-ASR 0.6B：速度優先、中文 acoustic 強、繁體輸出（~1.2GB RAM）",
+    "qwen3-asr-large":"★★ Qwen3-ASR 1.7B：SOTA 開源、競爭商用 API（~3.4GB RAM、慢 2-3x）",
 }
 
 # 語言顯示名稱 → Whisper 語言代碼（None 代表自動偵測）

@@ -82,12 +82,24 @@ _MLX_MODEL_MAP: dict[str, str] = {
 #   • 預設輸出簡體中文（要靠 opencc s2twp 後處理轉繁體）
 #   • 新套件（mlx-qwen3-asr v0.3.5）可能有未知 edge cases
 #   • 不能 fallback 到 CPU（CTranslate2 沒對應實作、純 MLX-only）
-_QWEN3_ASR_MODEL_NAME = "Qwen/Qwen3-ASR-0.6B"
+# v2.15.0：兩個 Qwen3-ASR 變體並存
+#   • qwen3-asr       = 0.6B（速度優先、預設、官方 DEFAULT_MODEL_ID）
+#   • qwen3-asr-large = 1.7B（準度優先、官方 ACCURACY_MODEL_ID）
+# 切換時 _ensure_qwen3_session 會卸載舊 model 再載新的（單 slot、避免 RAM 翻倍）
+_QWEN3_ASR_MODELS: dict[str, str] = {
+    "qwen3-asr":       "Qwen/Qwen3-ASR-0.6B",   # ~600 MB、~1.2 GB RAM、推論 0.85-1.6s
+    "qwen3-asr-large": "Qwen/Qwen3-ASR-1.7B",   # ~3.4 GB、~3.4 GB RAM、推論 2-4s
+}
 
 
 def _is_qwen3_model(model_size: str) -> bool:
     """判斷 model_size 是不是 Qwen3-ASR 系列（與 Whisper 走完全不同 backend）。"""
-    return model_size.lower().startswith("qwen3-asr")
+    return model_size.lower() in _QWEN3_ASR_MODELS
+
+
+def _qwen3_hf_repo(model_size: str) -> str:
+    """model_size → HuggingFace repo ID；未知名稱 fallback 到 0.6B。"""
+    return _QWEN3_ASR_MODELS.get(model_size.lower(), _QWEN3_ASR_MODELS["qwen3-asr"])
 
 
 # OpenCC 簡↔繁轉換器 lazy cache：variant → OpenCC 實例（或 None=載入失敗）
@@ -262,7 +274,10 @@ class Transcriber:
         # 第二次讀 `self._dictionary_terms` 拿到不一致的狀態。
         self._dictionary_lock    = threading.Lock()
         # v2.14.0 Qwen3-ASR Session（lazy load、第一次 transcribe qwen3 時建）
+        # v2.15.0：加 _qwen3_loaded_model 追蹤目前載入哪個變體（0.6B / 1.7B）；
+        #         切換時 _ensure_qwen3_session 會卸載舊的、避免 RAM 翻倍
         self._qwen3_session = None
+        self._qwen3_loaded_model: Optional[str] = None
 
     def set_dictionary_terms(self, terms: list[str]) -> None:
         """更新個人字典術語列表，下次 transcribe() 時注入 initial_prompt。
@@ -385,7 +400,7 @@ class Transcriber:
                 )
             try:
                 result = self._transcribe_qwen3(
-                    audio, language, dict_terms_snapshot, chinese_variant
+                    audio, model_size, language, dict_terms_snapshot, chinese_variant
                 )
             except Exception:
                 # Qwen3 無 fallback path、user 重試或切回 Whisper
@@ -558,7 +573,7 @@ class Transcriber:
         """
         # v2.14.0：Qwen3-ASR 走獨立 backend
         if _is_qwen3_model(model_size):
-            self._warmup_qwen3()
+            self._warmup_qwen3(model_size)
         elif BACKEND == "mlx":
             self._warmup_mlx(model_size)
         else:
@@ -575,6 +590,7 @@ class Transcriber:
             if self._qwen3_session is not None:
                 del self._qwen3_session
                 self._qwen3_session = None
+                self._qwen3_loaded_model = None   # v2.15.0：清變體追蹤
 
         # MLX 後端需要手動清除 Metal GPU 快取
         if BACKEND == "mlx":
@@ -810,31 +826,54 @@ class Transcriber:
 
     # ── v2.14.0 Qwen3-ASR backend（MLX-only、無 CPU fallback）─────────────────
 
-    def _ensure_qwen3_session(self):
+    def _ensure_qwen3_session(self, model_size: str):
         """Lazy-load mlx-qwen3-asr Session、快取在 self._qwen3_session。
 
-        Session 持有模型 weights + tokenizer，第一次建構時會下載模型
-        （~600MB、cache 在 ~/.cache/huggingface/hub/）。後續同 session
-        重複用、避免 reload 成本。
+        v2.15.0：支援 0.6B / 1.7B 兩個變體。切換時卸載舊 Session、清 Metal
+        cache、重 GC、再載新的——避免兩個 session 同時佔 RAM（1.7B 是 3.4 GB）。
+
+        Session 持有模型 weights + tokenizer，第一次建構時會下載模型（cache 在
+        ~/.cache/huggingface/hub/）。後續同 model_size 重複用、避免 reload 成本。
 
         執行緒安全：用 self._lock（跟 Whisper model 共用）保護建構。
         """
+        hf_repo = _qwen3_hf_repo(model_size)
         with self._lock:
-            if self._qwen3_session is not None:
+            # 已載且同變體 → 直接回快取
+            if self._qwen3_session is not None and self._qwen3_loaded_model == model_size:
                 return self._qwen3_session
+            # 變體不同 → 卸載舊的
+            if self._qwen3_session is not None:
+                old = self._qwen3_loaded_model
+                log.info(f"WHISPER: Unloading Qwen3-ASR '{old}' to switch to '{model_size}'...")
+                try:
+                    del self._qwen3_session
+                except Exception:
+                    log_error("qwen3_session_del_failed", model=old)
+                self._qwen3_session = None
+                self._qwen3_loaded_model = None
+                # 清 Metal GPU cache（避免 1.7B 載入失敗 OOM）
+                try:
+                    import mlx.core as mx
+                    mx.metal.clear_cache()
+                except Exception:
+                    pass
+                gc.collect()
+
             t_start = time.perf_counter()
-            log.info(f"WHISPER: Loading Qwen3-ASR session ({_QWEN3_ASR_MODEL_NAME})...")
+            log.info(f"WHISPER: Loading Qwen3-ASR session ({hf_repo})...")
             try:
                 from mlx_qwen3_asr import Session
-                self._qwen3_session = Session(model=_QWEN3_ASR_MODEL_NAME)
+                self._qwen3_session = Session(model=hf_repo)
+                self._qwen3_loaded_model = model_size
                 elapsed = time.perf_counter() - t_start
                 log.info(f"WHISPER: Qwen3-ASR session loaded in {elapsed:.2f}s.")
                 return self._qwen3_session
             except Exception as e:
-                log_error("qwen3_session_load_failed", model=_QWEN3_ASR_MODEL_NAME)
-                raise RuntimeError(f"無法載入 Qwen3-ASR session: {e}")
+                log_error("qwen3_session_load_failed", model=hf_repo)
+                raise RuntimeError(f"無法載入 Qwen3-ASR session ({hf_repo}): {e}")
 
-    def _warmup_qwen3(self) -> None:
+    def _warmup_qwen3(self, model_size: str) -> None:
         """Qwen3-ASR 暖機：載入 session + 跑 1.5s sine wave 編譯 Metal shader。
 
         類似 _warmup_mlx 的策略——用 sine wave 而非 silence、強制走完整
@@ -844,17 +883,19 @@ class Transcriber:
         sr = 16_000
         t_axis = np.arange(int(sr * 1.5), dtype=np.float32) / sr
         audio = (0.1 * np.sin(2 * np.pi * 440.0 * t_axis)).astype(np.float32)
+        hf_repo = _qwen3_hf_repo(model_size)
         with self._transcription_lock:
             try:
-                session = self._ensure_qwen3_session()
+                session = self._ensure_qwen3_session(model_size)
                 session.transcribe(audio, language="Chinese", context="")
-                log.info("WHISPER: Warmup Qwen3-ASR complete (sine-wave 1.5s)")
+                log.info(f"WHISPER: Warmup Qwen3-ASR complete ({model_size}, sine-wave 1.5s)")
             except Exception:
-                log_error("warmup_qwen3_failed", model=_QWEN3_ASR_MODEL_NAME)
+                log_error("warmup_qwen3_failed", model=hf_repo)
 
     def _transcribe_qwen3(
         self,
         audio,
+        model_size: str,
         language: Optional[str],
         dict_terms: Optional[list[str]] = None,
         chinese_variant: str = "off",
@@ -888,7 +929,7 @@ class Transcriber:
                 qwen3_lang = language  # 直接 pass 過去、不認得會 fallback 到 auto
 
         with self._transcription_lock:
-            session = self._ensure_qwen3_session()
+            session = self._ensure_qwen3_session(model_size)
             try:
                 output = session.transcribe(
                     audio,
