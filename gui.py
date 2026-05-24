@@ -241,6 +241,13 @@ class AppWindow(ctk.CTkFrame):
         # 詳見 HOTKEY_FORCE_RESTART_INTERVAL_MS 與 _hotkey_watchdog。
         self._last_hotkey_force_restart: float = time.monotonic()
 
+        # v2.14.1 — 自動 restore 抑制旗標（epoch seconds、>now() = 抑制中）
+        # 按熱鍵時設成 now+1.5s；期間 Cocoa BecomeActive / WillBecomeActive / Poll
+        # 等「app 變 active」事件不會把 minimized 視窗 deiconify 拉回前景，
+        # 讓「最小化 + 熱鍵錄音」可以真的背景跑、不打擾 user。
+        # Dock icon 點擊走 AppleEventReopen 路徑、不受此影響、永遠正常 restore。
+        self._suppress_auto_restore_until: float = 0.0
+
         # State
         self._state:       str   = "idle"
         self._rec_start:   float = 0.0
@@ -1745,6 +1752,10 @@ class AppWindow(ctk.CTkFrame):
         """
         # 純 Python int 遞增；不呼叫任何 Tk / PyObjC bridge / threading 同步原語
         self._pending_tap_count += 1
+        # v2.14.1：標記「熱鍵剛剛按過」、抑制接下來 1.5s 內的 Cocoa BecomeActive
+        # 自動 restore（避免按熱鍵時 minimized 視窗跳出來打擾 user）。
+        # time.time() 是純 CPython 內部呼叫，無 Tk/PyObjC bridge，PyGIL context 安全。
+        self._suppress_auto_restore_until = time.time() + 1.5
 
     def _poll_pending_tap(self) -> None:
         """Tk-side poller：在 mainloop iteration 中安全地把 NSEvent handler
@@ -2557,6 +2568,25 @@ class AppWindow(ctk.CTkFrame):
     # 根因：AppWindow 是 CTkFrame，不是 Toplevel。所有 wm_state/deiconify/iconify
     # 方法必須在 self.winfo_toplevel()（真正的 Tk root）上呼叫，不能在 self 上。
     # 之前 5 層保險絲全部在 self 呼叫 → 全部 AttributeError silent crash。
+    def _is_auto_restore_suppressed(self) -> bool:
+        """判斷現在該不該抑制「app active → 自動 deiconify 視窗」的反射動作。
+
+        v2.14.1 新增。理由：按熱鍵會讓 macOS 把 app 變 active（NSEvent monitor
+        受理 event 的副作用），原本 Cocoa observer 會把 minimized 視窗拉回前景
+        ——這跟 user「最小化背景錄音」的意圖相反。
+
+        抑制條件（任一）：
+          • 1.5s 內按過熱鍵（_hotkey_tap 標記）
+          • 當前 state 為 recording / processing（明示背景處理中）
+
+        Dock icon 點擊走 AppleEventReopen 路徑、**不**經過此判斷、永遠 restore。
+        """
+        if time.time() < self._suppress_auto_restore_until:
+            return True
+        if self._state in ("recording", "processing"):
+            return True
+        return False
+
     def _restore_root_if_minimized(self, source: str) -> None:
         """共用 helper：根視窗若在 iconic/icon/withdrawn 狀態 → 強制 deiconify + lift。
 
@@ -2589,7 +2619,12 @@ class AppWindow(ctk.CTkFrame):
             log_error("dock_reopen_focus_failed", error=str(e))
 
     def _on_app_activate(self, event=None) -> None:
-        """macOS Fix 5b：App 取得焦點時若視窗是最小化狀態，自動 deiconify。"""
+        """macOS Fix 5b：App 取得焦點時若視窗是最小化狀態，自動 deiconify。
+
+        v2.14.1：熱鍵剛按過 / 錄音中 → 抑制（user 要背景錄音、不要視窗跳出）。
+        """
+        if self._is_auto_restore_suppressed():
+            return
         self._restore_root_if_minimized("Activate")
 
     def _install_cocoa_activation_observer(self) -> None:
@@ -2741,10 +2776,17 @@ class AppWindow(ctk.CTkFrame):
                         continue
                     seen.add(action)
                     if action == "BecomeActive":
+                        # v2.14.1：抑制熱鍵 / 錄音中的 active → restore 反射
+                        # AppleEventReopen（Dock 點擊）不受影響、見下方分支
+                        if self._is_auto_restore_suppressed():
+                            continue
                         self._restore_root_if_minimized("CocoaActive")
                     elif action == "WillBecomeActive":
+                        if self._is_auto_restore_suppressed():
+                            continue
                         self._restore_root_if_minimized("CocoaWillActive")
                     elif action == "AppleEventReopen":
+                        # Dock icon 點擊明確路徑、永遠 restore（user 主動要視窗）
                         self._restore_root_if_minimized("AppleEventReopen")
                     elif action == "WillHide":
                         self._handle_cocoa_will_hide()
@@ -2797,7 +2839,9 @@ class AppWindow(ctk.CTkFrame):
             self._last_nsapp_active = now_active
 
             if transitioned_to_active:
-                self._restore_root_if_minimized("Poll")
+                # v2.14.1：熱鍵 / 錄音中抑制（與 Cocoa observer 路徑一致）
+                if not self._is_auto_restore_suppressed():
+                    self._restore_root_if_minimized("Poll")
         except Exception as e:
             log_error("poll_visibility_failed", error=str(e))
         finally:
