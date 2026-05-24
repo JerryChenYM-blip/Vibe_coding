@@ -69,10 +69,12 @@ class Config:
     # ── 基本操作設定 ──────────────────────────────────────────────────────────
 
     hotkey:       str           = "right_cmd"        # 全域錄音快捷鍵（單按右 Cmd）
-    # v2.14.0：預設改 qwen3-asr（中文 acoustic 強於 turbo、原生繁體輸出）
-    # 舊版 default "large-v3-turbo" 仍可在設定切回；qwen3 不可用時 transcriber
-    # 會自動回錯誤訊息提示用戶切回 turbo
-    model:        str           = "qwen3-asr"        # ASR 模型（qwen3-asr / large-v3-turbo / ...）
+    # v2.15.1：預設改 qwen3-asr-large（SOTA 開源、競爭商用 API、中文最強）
+    # 舊使用者既有 config.json 不受影響；只影響新使用者首次啟動。
+    # 首次啟動會自動下載 ~3.4GB（splash 顯示「暖機中」、約 2-8 分鐘看網速）。
+    # 想要速度優先可在設定切回 qwen3-asr（0.6B）；想要 Whisper fallback 切
+    # large-v3-turbo。Dropdown 切換會自動 save、下次啟動沿用。
+    model:        str           = "qwen3-asr-large"  # ASR 模型（qwen3-asr-large / qwen3-asr / large-v3-turbo）
     language:     str           = "自動偵測"          # 轉錄語言
     input_device: Optional[str] = None               # 麥克風裝置名稱（None = 系統預設）
     append_results: bool        = True               # 是否追加結果（vs. 覆蓋）
