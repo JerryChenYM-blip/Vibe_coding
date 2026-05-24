@@ -998,7 +998,13 @@ class AppWindow(ctk.CTkFrame):
         try:
             # 一律用使用者選的模型做最終轉錄，不再因短音檔退化到 transcribe_fast
             # （那條路徑寫死 small，會嚴重拖垮品質）。
-            result = self.transcriber.transcribe(audio, model_size=model, language=lang)
+            # v2.14.0：傳 chinese_variant 給 Qwen3-ASR 用（Whisper backend ignore）
+            result = self.transcriber.transcribe(
+                audio,
+                model_size=model,
+                language=lang,
+                chinese_variant=getattr(self.cfg, "chinese_variant", "off"),
+            )
 
             prior = list(self._stream_chunks)
             if prior:
@@ -2360,6 +2366,7 @@ class AppWindow(ctk.CTkFrame):
     def _on_settings_saved(self, cfg: Config) -> None:
         """設定視窗儲存後：同步 cfg、重啟 listener（若 hotkey 有變），刷新所有 UI。"""
         old_hotkey = self.cfg.hotkey
+        old_model  = self.cfg.model   # v2.14.0：模型切換要重 warmup（見下方）
         # 逐欄位紀錄變動
         for field_name in ("model", "language", "hotkey", "auto_copy",
                            "auto_paste", "append_results", "ollama_enabled"):
@@ -2377,6 +2384,12 @@ class AppWindow(ctk.CTkFrame):
         self._hotkey_hint.configure(text=f"按下 {cfg.format_hotkey_display()} 即時錄音")
         self._hotkey_status.configure(text=cfg.format_hotkey_display())
         self._model_var.set(cfg.model)
+        # v2.14.0：模型切換 → 背景 warmup，避免下次按錄音 cold start ~7-8s
+        # （Qwen3-ASR 第一次跑要 1.87s session load + ~5s Metal shader 編譯；
+        # 跟 App 啟動時的 self.after(1500, self._warmup_model) 同 delay）
+        if cfg.model != old_model:
+            log.info(f"WARMUP: model changed ({old_model} → {cfg.model}), scheduling warmup")
+            self.after(1500, self._warmup_model)
         self._lang_var.set(cfg.language)
         # F1（v2.12.0）：麥克風來源變更 → 套到 recorder。下次 start() 時用新 device。
         # 不需要 stream restart，因為當前若在錄音中、user 該手動停止再換。

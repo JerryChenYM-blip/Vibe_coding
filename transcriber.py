@@ -53,6 +53,13 @@ BACKEND = _detect_backend()
 # 注意：tiny/base 的 `mlx-community/whisper-tiny`、`whisper-base` repo 已於
 # 2026 年改名/下架，會回 401。全部統一使用 `-mlx-4bit` 量化版本；若 MLX 載入
 # 失敗，transcribe() 會自動 fallback 到 CTranslate2 CPU。
+#
+# large-v3 fp16 嘗試紀錄（2026-05-24 / v2.13.x）：
+#   試過 `mlx-community/whisper-large-v3-fp16`、ValueError「load_npz Input
+#   must be a zip file」。原因：該 repo 用檔名 `model.safetensors`，但
+#   mlx_whisper/load_models.py 只認 `weights.safetensors`（turbo repo 用
+#   這個命名），對 HF 標準命名不相容 → fallback 誤走 .npz loader 炸。
+#   暫退回 `-mlx-4bit`（雖準確度較差）等 mlx_whisper 升級或找到相容 fp16 repo。
 _MLX_MODEL_MAP: dict[str, str] = {
     "tiny":           "mlx-community/whisper-tiny-mlx-4bit",
     "base":           "mlx-community/whisper-base-mlx-4bit",
@@ -61,6 +68,69 @@ _MLX_MODEL_MAP: dict[str, str] = {
     "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
     "large-v3":       "mlx-community/whisper-large-v3-mlx-4bit",
 }
+
+# ── v2.14.0 Qwen3-ASR 整合 ──────────────────────────────────────────────────
+#
+# Qwen3-ASR-0.6B：阿里 2026 年新出的 ASR 模型，本質是 Qwen LLM tuned for ASR。
+# 跟 Whisper 比的優勢：
+#   • 中文 acoustic 層更強（實測「潤」字 turbo 聽成「論」、Qwen3 正確）
+#   • Biasing 用真正的 LLM system prompt（context= 參數），比 Whisper 的
+#     initial_prompt decoder prefix 強度高
+#   • 原生 MLX 寫、GPU + Neural Engine
+#   • 模型更小（0.6B vs turbo 的 0.8B）、暖機後推論更快
+# 缺點：
+#   • 預設輸出簡體中文（要靠 opencc s2twp 後處理轉繁體）
+#   • 新套件（mlx-qwen3-asr v0.3.5）可能有未知 edge cases
+#   • 不能 fallback 到 CPU（CTranslate2 沒對應實作、純 MLX-only）
+_QWEN3_ASR_MODEL_NAME = "Qwen/Qwen3-ASR-0.6B"
+
+
+def _is_qwen3_model(model_size: str) -> bool:
+    """判斷 model_size 是不是 Qwen3-ASR 系列（與 Whisper 走完全不同 backend）。"""
+    return model_size.lower().startswith("qwen3-asr")
+
+
+# OpenCC 簡↔繁轉換器 lazy cache：variant → OpenCC 實例（或 None=載入失敗）
+# 第一次使用時 lazy 載 opencc 套件，避免無此需求的使用者付 import 成本
+_opencc_converters: dict[str, object] = {}
+
+# variant 字串 → opencc config 名稱對應
+_OPENCC_VARIANT_MAP: dict[str, str] = {
+    "traditional_tw": "s2twp",   # 簡 → 繁 + 台灣慣用語（软件→軟體、视频→影片）
+    "traditional":    "s2t",     # 純字體轉換（不轉地區用語）
+}
+
+
+def _get_opencc_converter(variant: str):
+    """Lazy 載 opencc + 快取；回 None 代表「不用轉」（off 或載入失敗）。"""
+    if variant == "off" or not variant:
+        return None
+    if variant in _opencc_converters:
+        return _opencc_converters[variant]
+    cfg_name = _OPENCC_VARIANT_MAP.get(variant, "s2twp")
+    try:
+        from opencc import OpenCC
+        cc = OpenCC(cfg_name)
+        _opencc_converters[variant] = cc
+        return cc
+    except Exception:
+        log_error("opencc_init_failed", variant=variant, cfg=cfg_name)
+        _opencc_converters[variant] = None
+        return None
+
+
+def _apply_opencc(text: str, variant: str) -> str:
+    """套用 opencc 轉換到 text；任何失敗回原文不拋例外。"""
+    if not text or variant == "off" or not variant:
+        return text
+    cc = _get_opencc_converter(variant)
+    if cc is None:
+        return text
+    try:
+        return cc.convert(text)
+    except Exception:
+        log_error("opencc_convert_failed", variant=variant)
+        return text
 
 
 # ── 靜音偵測與幻覺防護 ────────────────────────────────────────────────────────
@@ -191,6 +261,8 @@ class Transcriber:
         # 推論跑時 user 改字典 + hot reload 觸發、TypeError fallback path
         # 第二次讀 `self._dictionary_terms` 拿到不一致的狀態。
         self._dictionary_lock    = threading.Lock()
+        # v2.14.0 Qwen3-ASR Session（lazy load、第一次 transcribe qwen3 時建）
+        self._qwen3_session = None
 
     def set_dictionary_terms(self, terms: list[str]) -> None:
         """更新個人字典術語列表，下次 transcribe() 時注入 initial_prompt。
@@ -236,6 +308,7 @@ class Transcriber:
         audio,                     # np.ndarray float32，16 kHz
         model_size: str = "base",
         language: Optional[str] = None,
+        chinese_variant: str = "off",   # v2.14.0：Qwen3-ASR 配套（Whisper 不受影響）
     ) -> TranscriptionResult:
         """執行完整轉錄（阻塞呼叫，應在背景執行緒執行）。
 
@@ -297,8 +370,37 @@ class Transcriber:
         # 拿到不一致字典，或 MLX → CTranslate fallback 時兩個後端用不同字典。
         dict_terms_snapshot = self._snapshot_dictionary_terms()
 
-        # 依後端分發推論
-        if BACKEND == "mlx":
+        # v2.14.0：Qwen3-ASR 走獨立 backend（與 Whisper 不同套件、無 CTranslate fallback）
+        if _is_qwen3_model(model_size):
+            if BACKEND != "mlx":
+                # Qwen3-ASR 只有 MLX 實作、非 Apple Silicon 直接擋
+                log.warning(
+                    "WHISPER: Qwen3-ASR 需要 Apple Silicon MLX；"
+                    f"當前 backend={BACKEND}、無法執行"
+                )
+                return TranscriptionResult(
+                    text="（Qwen3-ASR 需要 Apple Silicon MLX、請於設定切回 large-v3-turbo）",
+                    language="", duration_seconds=duration,
+                    elapsed_seconds=time.perf_counter() - t0,
+                )
+            try:
+                result = self._transcribe_qwen3(
+                    audio, language, dict_terms_snapshot, chinese_variant
+                )
+            except Exception:
+                # Qwen3 無 fallback path、user 重試或切回 Whisper
+                log_error("qwen3_backend_failed", model=model_size)
+                log.error(
+                    "WHISPER: Qwen3-ASR 失敗、無 fallback；"
+                    "user 須重試或於設定切回 large-v3-turbo"
+                )
+                return TranscriptionResult(
+                    text="（Qwen3-ASR 轉錄失敗、請重試或於設定切回 large-v3-turbo）",
+                    language="", duration_seconds=duration,
+                    elapsed_seconds=time.perf_counter() - t0,
+                )
+        # 依後端分發推論（Whisper backend）
+        elif BACKEND == "mlx":
             try:
                 result = self._transcribe_mlx(audio, model_size, language, dict_terms_snapshot)
             except Exception:
@@ -454,7 +556,10 @@ class Transcriber:
         Args:
             model_size: 要預熱的模型大小。
         """
-        if BACKEND == "mlx":
+        # v2.14.0：Qwen3-ASR 走獨立 backend
+        if _is_qwen3_model(model_size):
+            self._warmup_qwen3()
+        elif BACKEND == "mlx":
             self._warmup_mlx(model_size)
         else:
             self._warmup_ctranslate(model_size)
@@ -466,6 +571,10 @@ class Transcriber:
                 del self._model
                 self._model = None
             self._loaded_model_size = None
+            # v2.14.0：釋放 Qwen3-ASR Session（模型權重在 Session 內）
+            if self._qwen3_session is not None:
+                del self._qwen3_session
+                self._qwen3_session = None
 
         # MLX 後端需要手動清除 Metal GPU 快取
         if BACKEND == "mlx":
@@ -694,6 +803,139 @@ class Transcriber:
         return TranscriptionResult(
             text=text,
             language=info.language,
+            duration_seconds=0.0,   # 由呼叫端 transcribe() 填入
+            elapsed_seconds=0.0,
+            segments=segments,
+        )
+
+    # ── v2.14.0 Qwen3-ASR backend（MLX-only、無 CPU fallback）─────────────────
+
+    def _ensure_qwen3_session(self):
+        """Lazy-load mlx-qwen3-asr Session、快取在 self._qwen3_session。
+
+        Session 持有模型 weights + tokenizer，第一次建構時會下載模型
+        （~600MB、cache 在 ~/.cache/huggingface/hub/）。後續同 session
+        重複用、避免 reload 成本。
+
+        執行緒安全：用 self._lock（跟 Whisper model 共用）保護建構。
+        """
+        with self._lock:
+            if self._qwen3_session is not None:
+                return self._qwen3_session
+            t_start = time.perf_counter()
+            log.info(f"WHISPER: Loading Qwen3-ASR session ({_QWEN3_ASR_MODEL_NAME})...")
+            try:
+                from mlx_qwen3_asr import Session
+                self._qwen3_session = Session(model=_QWEN3_ASR_MODEL_NAME)
+                elapsed = time.perf_counter() - t_start
+                log.info(f"WHISPER: Qwen3-ASR session loaded in {elapsed:.2f}s.")
+                return self._qwen3_session
+            except Exception as e:
+                log_error("qwen3_session_load_failed", model=_QWEN3_ASR_MODEL_NAME)
+                raise RuntimeError(f"無法載入 Qwen3-ASR session: {e}")
+
+    def _warmup_qwen3(self) -> None:
+        """Qwen3-ASR 暖機：載入 session + 跑 1.5s sine wave 編譯 Metal shader。
+
+        類似 _warmup_mlx 的策略——用 sine wave 而非 silence、強制走完整
+        encoder + decoder pipeline 把 Metal shader 全部編譯起來。
+        """
+        import numpy as np
+        sr = 16_000
+        t_axis = np.arange(int(sr * 1.5), dtype=np.float32) / sr
+        audio = (0.1 * np.sin(2 * np.pi * 440.0 * t_axis)).astype(np.float32)
+        with self._transcription_lock:
+            try:
+                session = self._ensure_qwen3_session()
+                session.transcribe(audio, language="Chinese", context="")
+                log.info("WHISPER: Warmup Qwen3-ASR complete (sine-wave 1.5s)")
+            except Exception:
+                log_error("warmup_qwen3_failed", model=_QWEN3_ASR_MODEL_NAME)
+
+    def _transcribe_qwen3(
+        self,
+        audio,
+        language: Optional[str],
+        dict_terms: Optional[list[str]] = None,
+        chinese_variant: str = "off",
+    ) -> TranscriptionResult:
+        """使用 Qwen3-ASR-0.6B 進行 ASR 推論（MLX GPU + Neural Engine）。
+
+        差異於 Whisper：
+          • biasing 用 `context=` 參數（真正的 Qwen LLM system prompt、強度高）
+          • 預設輸出簡體；config.chinese_variant 控制 opencc 後處理
+          • language 接受 "zh"/"zh-tw"/None；內部 normalize 成 "Chinese"
+
+        D2-S3 一致：dict_terms 是入口 snapshot、整次推論用同一份。
+        """
+        # 字典術語 → Qwen3-ASR context（空白分隔的純詞表）
+        context_str = prompts.format_qwen3_context(dict_terms)
+
+        # language normalize：Qwen3-ASR 用「Chinese」/「English」等英文 label
+        # Whisper 用「zh」/「en」等代碼。對應一下、None 保留（自動偵測）
+        qwen3_lang = None
+        if language:
+            lang_lower = language.lower()
+            if lang_lower in ("zh", "zh-tw", "zh-cn", "cmn", "mandarin"):
+                qwen3_lang = "Chinese"
+            elif lang_lower in ("en", "english"):
+                qwen3_lang = "English"
+            elif lang_lower in ("ja", "japanese"):
+                qwen3_lang = "Japanese"
+            elif lang_lower in ("ko", "korean"):
+                qwen3_lang = "Korean"
+            else:
+                qwen3_lang = language  # 直接 pass 過去、不認得會 fallback 到 auto
+
+        with self._transcription_lock:
+            session = self._ensure_qwen3_session()
+            try:
+                output = session.transcribe(
+                    audio,
+                    language=qwen3_lang,
+                    context=context_str,
+                    return_timestamps=True,   # 要 segments 給 hallucination filter 用
+                )
+            except Exception as e:
+                raise RuntimeError(f"Qwen3-ASR transcription failed: {e}")
+
+        # 從 Qwen3-ASR output 提取 text + segments + language
+        raw_text = (output.text or "").strip()
+        detected_lang = (output.language or "") if hasattr(output, "language") else ""
+
+        # opencc 簡 → 繁（只在中文場景套用、純詞 segments 也要轉）
+        is_chinese = detected_lang and "chinese" in detected_lang.lower()
+        # 即使 detected_lang 不明、只要 chinese_variant != off 就嘗試套
+        # （Qwen3-ASR 對 detected_lang 的回填不一定完整）
+        if chinese_variant and chinese_variant != "off":
+            raw_text = _apply_opencc(raw_text, chinese_variant)
+
+        # segments：mlx-qwen3-asr 回的 segments 結構可能不同、用 getattr 安全取
+        segments: list[dict] = []
+        try:
+            for seg in (output.segments or []):
+                seg_text = getattr(seg, "text", None) or seg.get("text", "")
+                seg_start = getattr(seg, "start", None)
+                if seg_start is None and isinstance(seg, dict):
+                    seg_start = seg.get("start", 0.0)
+                seg_end = getattr(seg, "end", None)
+                if seg_end is None and isinstance(seg, dict):
+                    seg_end = seg.get("end", 0.0)
+                # segments text 也套 opencc 保持一致
+                if chinese_variant and chinese_variant != "off":
+                    seg_text = _apply_opencc(seg_text, chinese_variant)
+                segments.append({
+                    "start": float(seg_start or 0.0),
+                    "end":   float(seg_end or 0.0),
+                    "text":  seg_text,
+                })
+        except Exception:
+            log_error("qwen3_segments_parse_failed")
+            segments = []
+
+        return TranscriptionResult(
+            text=raw_text,
+            language=detected_lang or (qwen3_lang or ""),
             duration_seconds=0.0,   # 由呼叫端 transcribe() 填入
             elapsed_seconds=0.0,
             segments=segments,

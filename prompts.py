@@ -33,29 +33,25 @@ WHISPER_INITIAL_PROMPT = (
 # 嚴格版：正面清單 + 負面清單 + 固定結尾「只輸出修正後的文字」收斂 LLM 行為。
 OLLAMA_POLISH_PROMPT = (
     "你是繁體中文校對員。**最小修改原則：能不改就不改、不重組句子、不替換同義詞**。\n\n"
-    "**只做以下四類修改**（其他一律保留原樣）：\n"
-    "1. 同音錯字：在/再、的/得/地、措置率→錯字率\n"
-    "2. 補標點：逗號、句號、問號（**只在缺漏處補**、原有的不動）\n"
-    "3. 刪贅詞：嗯、啊、那個、um、uh（**只刪純語助詞、不刪實詞**）\n"
-    "4. **Whisper 系統性誤辨識：Cloud → Claude（必做）**：\n"
-    "   * Cloud Code → **Claude Code**（Anthropic CLI、必改）\n"
-    "   * Cloud AI / Cloud Sonnet / Cloud Opus → Claude AI/Sonnet/Opus（必改）\n"
-    "   * 跟 Cloud 講話/對話、問 Cloud、Cloud 回答 → Claude（必改）\n"
-    "   * 但保留：Google Cloud、AWS Cloud、Cloud Run、Cloud Storage、部署到 Cloud\n\n"
+    "**只做以下三件事**（其他一律保留原樣）：\n"
+    "1. 修同音錯字（例：在/再、的/得/地、措置率→錯字率）\n"
+    "2. 補缺漏的標點（逗號、句號、問號；**原有的標點不動**）\n"
+    "3. 刪純語助詞（嗯、啊、那個、um、uh；**只刪純語助詞、不刪實詞**）\n\n"
     "**絕對禁止（最重要）**：\n"
     "- ❌ 不要改寫、不要重新表達、不要換句話說（即使覺得原文不通順）\n"
     "- ❌ 不要替換同義詞（例：「不知道」絕對不能改成「搞不清楚」、「賣得好」不能改成「賣得不錯」）\n"
     "- ❌ 不要改變語氣（「想要做」不能改成「想過要做」、「需求」不能加「了」）\n"
     "- ❌ 不要重組句子結構、不要合併或拆解句子\n"
+    "- ❌ 不要翻譯英文詞（roadmap 不能變「路線圖」、code 不能變「程式碼」）\n"
     "- ❌ 不要翻譯、不要輸出簡體字（一律繁體中文台灣用語）\n"
     "- ❌ 不要加任何說明或前綴\n\n"
     "**示範**（注意保留原文每個字、每個結構）：\n"
     "  原：「我還不知道這件事情。」\n"
     "  ✓ 對：「我還不知道這件事情。」（無錯字、無贅詞 → 完全不動）\n"
     "  ✗ 錯：「我還在搞不清楚這件事呢。」（替換同義詞、改語氣）\n\n"
-    "  原：「我用Cloud Code寫code」\n"
-    "  ✓ 對：「我用 Claude Code 寫 code」（只修 Cloud→Claude + 補空格）\n"
-    "  ✗ 錯：「我使用 Claude Code 來撰寫程式」（改寫了）\n\n"
+    "  原：「嗯我今天要去開會然後討論 Q2 roadmap」\n"
+    "  ✓ 對：「我今天要去開會，然後討論 Q2 roadmap。」（刪嗯、補逗號和句號）\n"
+    "  ✗ 錯：「我今天要參加會議，討論 Q2 路線圖。」（改寫、翻譯了 roadmap）\n\n"
     "原文：\n{text}\n\n"
     "修正後（最小修改、保留原句結構與用詞、繁體中文）："
 )
@@ -220,6 +216,27 @@ def format_whisper_prompt(dictionary_terms: Optional[Iterable[str]] = None) -> s
         return base
     snippet = "、".join(terms[:30])
     return f"{base} 常用詞彙：{snippet}。"
+
+
+def format_qwen3_context(dictionary_terms: Optional[Iterable[str]] = None) -> str:
+    """拼出傳給 Qwen3-ASR 的 `context` 字串（system prompt biasing 用）。
+
+    v2.14.0 新增。Qwen3-ASR 用 `context` 取代 Whisper 的 `initial_prompt`：
+      • Qwen3-ASR: `<|im_start|>system\n{context}<|im_end|>` 真正的 LLM
+        system message，整個 generation 過程都看得到、biasing 強度比 Whisper
+        的 decoder prefix 高
+      • 官方建議格式：**空白分隔的純詞表**（不要塞句子或自然語指令、會干擾）
+      • 上限沒明確規定，這裡仍取前 50 個（跟 polish 上限同步）
+
+    dictionary_terms 空時回空字串（Qwen3-ASR transcribe(context="") 是合法的）。
+    """
+    if not dictionary_terms:
+        return ""
+    terms = [t.strip() for t in dictionary_terms if t and t.strip()]
+    if not terms:
+        return ""
+    # 空白分隔（官方範例：「交易 停滞」）
+    return " ".join(terms[:50])
 
 
 def format_polish_prompt(

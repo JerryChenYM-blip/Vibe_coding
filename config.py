@@ -30,14 +30,18 @@ log = get_logger("config")
 CONFIG_DIR  = Path.home() / ".whisper_app"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
-# 每個 Whisper 模型的說明文字，顯示在 UI 的模型選單中
+# 每個轉錄模型的說明文字，顯示在 UI 的模型選單中
+# v2.14.0：加 qwen3-asr（阿里 Qwen 系列、acoustic 強於 turbo、原生 MLX GPU）
+# v2.14.0：移除 large-v3（mlx_whisper 套件對 mlx-community 非-turbo repo 的
+#         model.safetensors 命名不相容、ValueError [load_npz]、CPU fallback
+#         又超過 60s timeout——詳見 docs/changelog/v2.13.x.md）
 MODEL_INFO: dict[str, str] = {
     "tiny":           "速度最快，適合英文速記（39M 參數）",
     "base":           "速度與精準度平衡，推薦入門（74M 參數）",
     "small":          "較高精準度，中文效果更佳（244M 參數，GPU 4bit 量化）",
     "medium":         "高精準度，需較多記憶體（769M 參數，GPU 4bit 量化）",
-    "large-v3-turbo": "★ 推薦：中英混合最佳，Metal GPU 加速（809M 參數）",
-    "large-v3":       "最高精準度，Metal GPU 加速（1550M 參數，4bit 量化）",
+    "large-v3-turbo": "★ Whisper 推薦：中英混合最佳，Metal GPU 加速（809M）",
+    "qwen3-asr":      "★ Qwen3-ASR：中文 acoustic 強、繁體輸出（600M、Metal GPU）",
 }
 
 # 語言顯示名稱 → Whisper 語言代碼（None 代表自動偵測）
@@ -63,7 +67,10 @@ class Config:
     # ── 基本操作設定 ──────────────────────────────────────────────────────────
 
     hotkey:       str           = "right_cmd"        # 全域錄音快捷鍵（單按右 Cmd）
-    model:        str           = "large-v3-turbo"   # Whisper 模型大小
+    # v2.14.0：預設改 qwen3-asr（中文 acoustic 強於 turbo、原生繁體輸出）
+    # 舊版 default "large-v3-turbo" 仍可在設定切回；qwen3 不可用時 transcriber
+    # 會自動回錯誤訊息提示用戶切回 turbo
+    model:        str           = "qwen3-asr"        # ASR 模型（qwen3-asr / large-v3-turbo / ...）
     language:     str           = "自動偵測"          # 轉錄語言
     input_device: Optional[str] = None               # 麥克風裝置名稱（None = 系統預設）
     append_results: bool        = True               # 是否追加結果（vs. 覆蓋）
@@ -134,6 +141,15 @@ class Config:
     # "never"  = 一律完整動畫（即使系統開了 reduce motion 也跑完整動畫）
     # 改變後立即套用（不需重啟），下一個 render tick 生效
     reduce_motion_pref: str = "auto"
+
+    # ── v2.14.0 中文字體變體（Qwen3-ASR 配套）─────────────────────────────
+    # Qwen3-ASR 預設輸出簡體中文，opencc 後處理轉繁體：
+    #   "traditional_tw" = 轉繁體 + 台灣慣用語（s2twp、推薦、預設）
+    #                      例：软件→軟體、视频→影片、网络→網路
+    #   "traditional"    = 純字體轉繁體（s2t、不轉地區用語）
+    #   "off"            = 不轉換、保留 ASR 原始輸出（簡體/繁體）
+    # 只在 model=qwen3-asr 時生效；Whisper backend 不受影響
+    chinese_variant: str = "traditional_tw"
 
     # ── 讀寫介面 ──────────────────────────────────────────────────────────────
 
