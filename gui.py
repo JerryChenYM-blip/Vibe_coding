@@ -603,8 +603,11 @@ class AppWindow(ctk.CTkFrame):
         # D3-S7（v2.10.0）：動態 wraplength。視窗 resize 時更新所有 block 的
         # wraplength = container.width - container padding - block border 預留。
         # debounce 80ms 避免 resize 拖曳時 fire 過頻。
+        # v2.13.2 Bug E：**必須加 add="+"**！否則會覆蓋 CTkScrollableFrame 內部
+        # bind("<Configure>", scrollregion 更新) 的 handler（其原始碼 line 75）→
+        # scrollregion 永遠停在初始值、scrollbar 拖不動、看不到新加的 block。
         self._wraplength_debounce_id: Optional[str] = None
-        self._blocks_container.bind("<Configure>", self._on_blocks_container_resize)
+        self._blocks_container.bind("<Configure>", self._on_blocks_container_resize, add="+")
         # 佔位文字（沒有任何 block 時顯示）
         self._placeholder_label: Optional[ctk.CTkLabel] = None
         self._show_placeholder()
