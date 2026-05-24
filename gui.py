@@ -2134,12 +2134,21 @@ class AppWindow(ctk.CTkFrame):
         )
 
     def _on_model_change(self, value: str) -> None:
-        """頂部模型選單變更時：更新 cfg 並刷新狀態列文字。"""
+        """頂部模型選單變更時：更新 cfg 並刷新狀態列文字。
+
+        v2.15.0：模型切換 → 背景 warmup（跟 _on_settings_saved 同樣模式、
+        修補 v2.14.0 只覆蓋 SettingsWindow 路徑、漏掉主視窗 dropdown 的 bug）。
+        對 qwen3-asr-large 特別重要——3.4GB 首次下載 + cold load 加起來會
+        遠超過 60s _processing_timeout_check 的 fail-safe、後果是「轉錄超時」。
+        """
         old = self.cfg.model
         self.cfg.model = value
         self.cfg.save()
         log_settings("changed", field="model", old=old, new=value, source="dropdown")
         self._status_label.configure(text=f"  就緒 ({value})")
+        if value != old:
+            log.info(f"WARMUP: model changed ({old} → {value}) via top dropdown, scheduling warmup")
+            self.after(1500, self._warmup_model)
 
     def _on_language_change(self, value: str) -> None:
         """頂部語言選單變更時：更新 cfg 儲存（下次錄音生效）。"""
