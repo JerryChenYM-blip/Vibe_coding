@@ -280,6 +280,12 @@ class AppWindow(ctk.CTkFrame):
         # 寫結果 / 增 _completed、否則 silent drop（資料來自上一輪 recording、
         # 對新輪無意義）。
         self._stream_generation: int    = 0
+        # v2.17.0 streaming polish：每個 ASR chunk 完 → 立即 dispatch Ollama polish
+        # 平行進行。User 放開時 polish 已大致完成、_start_polish 只需 polish tail。
+        # 體感：22s polish → ~5-7s。Index-based slots、parallel to _stream_chunks。
+        self._stream_polished: list[str]    = []
+        self._stream_polish_dispatched: int = 0
+        self._stream_polish_completed:  int = 0
 
         # B2（v2.7.0）：processing timeout self-heal 的 after id；快速連續錄音
         # 避免 N 個 pending callback 並存（之前每次 _transition_to_processing
@@ -852,6 +858,10 @@ class AppWindow(ctk.CTkFrame):
         # (< STREAM_MIN_ENABLE_SAMPLES) _stream_tick 內部會自動跳過 dispatch。
         self._stream_dispatched = 0
         self._stream_completed  = 0
+        # v2.17.0 streaming polish 計數器 reset
+        self._stream_polished = []
+        self._stream_polish_dispatched = 0
+        self._stream_polish_completed  = 0
         self._stream_generation += 1
         self._stream_tick_id = self.after(self.STREAM_TICK_MS, self._stream_tick)
 
@@ -1060,6 +1070,10 @@ class AppWindow(ctk.CTkFrame):
                         f"STREAMING: chunk[{idx}] done "
                         f"({len(text)} chars, RTF={(r.elapsed_seconds or 0)/(r.duration_seconds or 1):.2f})"
                     )
+                    # v2.17.0：ASR chunk 完 → 立即 dispatch streaming polish
+                    # （只在 Ollama enabled 且 chunk text 非空）
+                    if self.cfg.ollama_enabled and text:
+                        self._dispatch_stream_polish(idx, text, gen)
                 else:
                     log.info(f"STREAMING: chunk[{idx}] dropped (generation mismatch)")
             except Exception:
@@ -1070,6 +1084,53 @@ class AppWindow(ctk.CTkFrame):
                     self._stream_completed += 1
 
         threading.Thread(target=_process, daemon=True).start()
+
+    def _dispatch_stream_polish(self, idx: int, text: str, gen: int) -> None:
+        """v2.17.0：把單一 ASR chunk 立即 dispatch 給 Ollama polish。
+
+        關鍵設計：
+          • 一律用 default polish prompt（OLLAMA_POLISH_PROMPT）。preset 路由
+            的 action presets（翻英文 / 條列 / 會議紀錄）需要看到全文 context、
+            chunk-level polish 沒意義；若 user 最終 preset 是 action、
+            _start_polish 會 fallback 走 full-text polish、捨棄 streamed 結果。
+          • Index-based slot pattern + generation guard（同 ASR streaming）
+          • Polish 失敗（timeout / Ollama 掛掉）→ slot 留原文當保險
+        """
+        from prompts import OLLAMA_POLISH_PROMPT
+
+        # 擴展 list 到 idx+1（slot pattern）
+        while len(self._stream_polished) <= idx:
+            self._stream_polished.append("")
+        self._stream_polish_dispatched += 1
+        dict_terms = self._dictionary_terms if self.cfg.dictionary_enabled else None
+
+        def _polish_thread(text=text, idx=idx, gen=gen):
+            try:
+                resp = self.ollama.process(
+                    text,
+                    prompt_template=OLLAMA_POLISH_PROMPT,
+                    dictionary_terms=dict_terms,
+                    preset_name="default",
+                )
+                polished = resp.text if (resp and resp.text and not resp.error) else text
+                if self._stream_generation == gen:
+                    self._stream_polished[idx] = polished
+                    log.info(
+                        f"STREAM_POLISH: chunk[{idx}] done "
+                        f"({len(polished)} chars, {(resp.elapsed_seconds or 0):.2f}s)"
+                    )
+                else:
+                    log.info(f"STREAM_POLISH: chunk[{idx}] dropped (generation mismatch)")
+            except Exception:
+                log_error("stream_polish_failed", idx=idx)
+                # 失敗時保險絲：slot 留原文（避免合併時這段消失）
+                if self._stream_generation == gen and idx < len(self._stream_polished):
+                    self._stream_polished[idx] = text
+            finally:
+                if self._stream_generation == gen:
+                    self._stream_polish_completed += 1
+
+        threading.Thread(target=_polish_thread, daemon=True).start()
 
     # ═══════════════════════════════════════════════════════════════════════
     #  TRANSCRIPTION
@@ -1342,13 +1403,67 @@ class AppWindow(ctk.CTkFrame):
 
         dict_terms = self._dictionary_terms if self.cfg.dictionary_enabled else None
 
+        # v2.17.0：streaming polish 條件 — 只 default preset 用、action preset
+        # (翻英文/條列/會議紀錄) 走原 full-text path（需看全文 context）
+        use_streaming_polish = (
+            self._stream_polish_dispatched > 0
+            and preset_name == "default"
+        )
+
         def _run():
-            resp = self.ollama.process(
-                llm_input,
-                prompt_template=preset.resolve_prompt(),
-                dictionary_terms=dict_terms,
-                preset_name=preset_name,
-            )
+            if use_streaming_polish:
+                # 等所有背景 polish chunks 完成（30s deadline 保險）
+                deadline = time.time() + self.STREAM_CHUNK_JOIN_TIMEOUT_S
+                while self._stream_polish_completed < self._stream_polish_dispatched:
+                    if time.time() > deadline:
+                        log.warning(
+                            f"STREAM_POLISH: timeout waiting "
+                            f"(done={self._stream_polish_completed}/{self._stream_polish_dispatched})"
+                        )
+                        break
+                    time.sleep(0.05)
+
+                streamed_polished = "".join(p for p in self._stream_polished if p)
+                streamed_raw      = "".join(c for c in self._stream_chunks   if c)
+                # 推算 tail = llm_input 比 streamed_raw 多出來的尾段
+                # （length-based、簡單但可能因 corrections / opencc 微差）
+                tail_raw = llm_input[len(streamed_raw):] if len(llm_input) > len(streamed_raw) else ""
+
+                if tail_raw.strip():
+                    tail_resp = self.ollama.process(
+                        tail_raw,
+                        prompt_template=preset.resolve_prompt(),
+                        dictionary_terms=dict_terms,
+                        preset_name=preset_name,
+                    )
+                    tail_polished = tail_resp.text if (
+                        tail_resp and tail_resp.text and not tail_resp.error
+                    ) else tail_raw
+                else:
+                    tail_polished = ""
+
+                combined_polished = streamed_polished + tail_polished
+                log.info(
+                    f"STREAM_POLISH: merged {self._stream_polish_dispatched} chunks "
+                    f"+ tail (final {len(combined_polished)} chars)"
+                )
+                # 合成 OllamaResponse（沿用 _finish_polish 既有 contract）
+                from ollama_client import OllamaResponse
+                resp = OllamaResponse(
+                    text=combined_polished,
+                    model=self.cfg.ollama_model,
+                    done=True,
+                    error=None,
+                    elapsed_seconds=0.0,
+                    preset_name=preset_name,
+                )
+            else:
+                resp = self.ollama.process(
+                    llm_input,
+                    prompt_template=preset.resolve_prompt(),
+                    dictionary_terms=dict_terms,
+                    preset_name=preset_name,
+                )
             # 把 raw_text（= Whisper 原文）+ target_block 交給 _finish_polish
             self.after(0, self._finish_polish, gen, raw_text, target, resp, target_block)
 
