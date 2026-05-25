@@ -173,6 +173,34 @@ def _is_silence(audio) -> bool:
     return rms < _MIN_RMS
 
 
+def _is_dict_terms_hallucination(text: str, dict_terms: Optional[list[str]] = None) -> bool:
+    """v2.16.3：偵測 Qwen3-ASR 把 context= 字典詞表整段「轉錄」回來的幻覺。
+
+    觸發 pattern：tail audio 短（0.5-1.5s）+ 些底噪、模型認不出真實 voice、
+    傾向把 system prompt 裡的 context 詞表 spit 出來當答案。
+
+    判定條件：dict_terms ≥ 10 個、且輸出文字 ≥ 80% 字元能拼出自 dict_terms。
+    保守門檻避免誤殺真實轉錄（例：user 真的講「潤飾」一個詞時不能殺）。
+    """
+    if not text or not dict_terms or len(dict_terms) < 10:
+        return False
+    # 拼湊出 dict 全部詞的「總字元集」（聯集去重）
+    dict_char_set = set("".join(dict_terms))
+    if not dict_char_set:
+        return False
+    # 算 text 裡有多少 char 屬於 dict_char_set
+    text_clean = text.replace(" ", "").replace("\n", "").replace("　", "")
+    if len(text_clean) < 15:
+        return False  # 短文字不夠 sample、跳過避免誤殺
+    in_dict_chars = sum(1 for c in text_clean if c in dict_char_set)
+    coverage = in_dict_chars / len(text_clean)
+    if coverage < 0.85:
+        return False
+    # 更精準：看是否多個 dict_terms 出現
+    matched = sum(1 for t in dict_terms if t and len(t) >= 2 and t in text)
+    return matched >= 5
+
+
 def _is_hallucination(text: str) -> bool:
     """判斷文字是否包含已知 Whisper 幻覺片段或重複 pattern。
 
@@ -441,10 +469,15 @@ class Transcriber:
             )
 
         # 幻覺過濾：優先逐段過濾（保留合法段），沒 segments 資訊才退回整段檢查
+        # v2.16.3：Qwen3-ASR 特有：context= 字典詞表整段被當成輸出（短 tail
+        # 音檔 + 底噪觸發）。額外用 _is_dict_terms_hallucination 抓這 pattern。
+        def _is_any_hallucination(text: str) -> bool:
+            return _is_hallucination(text) or _is_dict_terms_hallucination(text, dict_terms_snapshot)
+
         if result.segments:
             kept = [
                 s for s in result.segments
-                if not _is_hallucination(s.get("text", "").strip())
+                if not _is_any_hallucination(s.get("text", "").strip())
             ]
             removed = len(result.segments) - len(kept)
             if removed > 0:
@@ -457,8 +490,12 @@ class Transcriber:
                     result.text = "".join(s["text"].strip() for s in kept).strip()
                 else:
                     result.text = "（未偵測到語音內容）"
-        elif _is_hallucination(result.text):
-            log.warning(f"WHISPER: Guard - Detected hallucination: '{result.text[:50]}...'")
+        elif _is_any_hallucination(result.text):
+            log.warning(
+                f"WHISPER: Guard - Detected hallucination "
+                f"(dict-terms type={_is_dict_terms_hallucination(result.text, dict_terms_snapshot)}): "
+                f"'{result.text[:50]}...'"
+            )
             result.text = "（未偵測到語音內容）"
 
         # v2.13.0：規則式校正（< 1ms）— Whisper 系統性誤辨識（Cloud Code → Claude Code 等）
