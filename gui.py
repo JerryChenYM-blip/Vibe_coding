@@ -1880,9 +1880,30 @@ class AppWindow(ctk.CTkFrame):
             self.after(self.PENDING_TAP_POLL_MS, self._poll_pending_tap)
 
     def _on_hotkey_tap(self) -> None:
-        """主執行緒：快捷鍵 tap → 直接重用 chamber 按鈕的 toggle handler。"""
+        """主執行緒：快捷鍵 tap → 直接重用 chamber 按鈕的 toggle handler。
+
+        v2.16.1 background recording fix：
+          _transition_to_recording 內的 MiniHUD `deiconify()` 會讓 Tk 內部呼叫
+          `[NSApp activateIgnoringOtherApps:YES]` → macOS 把 Whisper Pro 標為
+          frontmost → 若 user 原本在另一個 Space 的全螢幕 app（如 Claude 全螢幕）、
+          macOS 強制把 user 切到 Whisper Pro 所在的 Space。對「背景錄音」UX 致命。
+
+          修法：toggle 結束後立即 `NSApp.deactivate()` 撤回 active 狀態、把焦點
+          還給 user 原本的 frontmost app、不觸發 Space 切換。
+
+          副作用：若 user 本來就在 Whisper Pro 視窗按熱鍵、會被 deactivate（焦點
+          跳走）。但 recording 仍正常進行（hotkey listener 是 global、不受影響）；
+          user 不會有重大干擾、且這個場景很罕見（多半 user 在別 app 用熱鍵）。
+        """
         log_action("hotkey_triggered_toggle", combo=self.cfg.hotkey, state=self._state)
         self._on_record_btn()
+        # 立即把 frontmost 還給 user 原本的 app（macOS 看 active flicker 不會
+        # 安排 Space 切換）
+        try:
+            from AppKit import NSApplication
+            NSApplication.sharedApplication().deactivate()
+        except Exception:
+            log_error("nsapp_deactivate_failed")
 
     def _try_stop(self) -> None:
         """延遲後真的停錄音。只在仍為 recording 狀態才執行（防重入）。"""
