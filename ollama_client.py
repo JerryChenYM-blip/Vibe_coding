@@ -46,15 +46,20 @@ _POLISH_OPTIONS_BASE: dict = {
     "top_p":       0.9,
 }
 
-# v2.17.1：Ollama keep_alive — 模型載入 VRAM 後保留多久。
-# 改回 "-1"（永久駐留、直到 Ollama daemon 重啟或我們明確 unload）。
-# 理由：user 反映「2m 後再用要重 cold load、polish 變慢」。VRAM 佔用 ~3GB
+# v2.17.2：Ollama keep_alive — 模型載入 VRAM 後保留多久。
+# **必須是整數 -1**（不是字串 "-1"）。Ollama API 規範：
+#   • -1 (int) → 永久駐留
+#   • 0 (int) → 立即 unload
+#   • "5m" / "1h"（字串、需單位）→ 計時 unload
+# v2.17.1 寫成 "-1" 字串、Ollama 回 status=400 「time: missing unit in
+# duration "-1"」。改成 int -1 才被認得。
+#
+# User 反映「2m 後再用要重 cold load、polish 變慢」。VRAM 佔用 ~3GB
 # （qwen3.5:4b）user 不介意（平常 GPU 沒在用）。改 -1 後：
 #   • App 啟動 → 一次 warmup 預載 model 進 VRAM
 #   • 後續所有 polish 都直接從 VRAM 推論、不會 cold load
 #   • App 關閉時 OllamaClient.unload() 主動釋放（cleanup）
-# 歷史：v2.13.0 曾改 "2m"、user 體感連續使用後 cold load 太慢、v2.17.1 改回 -1。
-_OLLAMA_KEEP_ALIVE = "-1"
+_OLLAMA_KEEP_ALIVE = -1
 
 # health check 用較短 timeout
 _HEALTH_TIMEOUT_SEC = 1.5
