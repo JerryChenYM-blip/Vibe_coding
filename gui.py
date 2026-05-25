@@ -344,6 +344,16 @@ class AppWindow(ctk.CTkFrame):
         self._pipeline_transcribe_at: Optional[float] = None  # 轉譯完成相對 t0
         self._pipeline_polish_at:     Optional[float] = None  # 潤飾完成相對 t0
         self._pipeline_summary_emitted: bool          = False # 防止重複 emit
+        # v2.18.2：raw paste strategy bug fix（Agent 4 P1-1）
+        # raw 策略：先貼原文、polish 完背景跑、不再覆蓋。第一次貼上時
+        # _do_auto_paste 不應觸發 emit、否則 polish_s 永遠是 0。改成 defer
+        # 到 polish 完成（_finish_polish）再一起 emit。
+        self._pipeline_defer_emit:    bool             = False
+        self._pipeline_deferred_paste: dict            = {}    # 暫存 paste 結果
+        # v2.18.2：streaming polish 跟 blocking polish 區分（Agent 4 P2）
+        # streaming = polish 在錄音期間就跑、polish_s 只反映 join + tail
+        # blocking  = polish 在 ASR 完成後才跑、polish_s 反映實際耗時
+        self._pipeline_polish_mode:   str              = "blocking"
 
         self._build_ui()
         self._start_hotkey_listener()
@@ -924,6 +934,10 @@ class AppWindow(ctk.CTkFrame):
         # Pipeline timing 起點：按下結束熱鍵 / 點停止按鈕的這一瞬間。
         # 從這裡開始算「使用者等多久才看到貼上的字」。
         self._pipeline_t0            = self._state_start_time
+        # v2.18.2：重置 defer + polish_mode（每次新 pipeline 都清乾淨）
+        self._pipeline_defer_emit    = False
+        self._pipeline_deferred_paste = {}
+        self._pipeline_polish_mode   = "blocking"
         self._pipeline_transcribe_at = None
         self._pipeline_polish_at     = None
         self._pipeline_summary_emitted = False
@@ -1267,6 +1281,14 @@ class AppWindow(ctk.CTkFrame):
             segments=[],
         )
         self._transition_to_idle(empty)
+        # v2.18.2：補 pipeline_timing emit（Agent 4 P1-2）
+        # 失敗 case 最需要觀察、不能 silent drop。path 標 failed_asr
+        self._emit_pipeline_timing(
+            paste_outcome="skipped",
+            paste_target=None,
+            text_len=0,
+            failure_reason="asr",
+        )
         self._show_toast("⚠ 轉錄失敗")
 
     def _processing_timeout_check(self) -> None:
@@ -1295,6 +1317,13 @@ class AppWindow(ctk.CTkFrame):
                 segments=[],
             )
             self._transition_to_idle(empty)
+            # v2.18.2：補 pipeline_timing emit（Agent 4 P1-2、跟 ASR fail 同邏輯）
+            self._emit_pipeline_timing(
+                paste_outcome="skipped",
+                paste_target=None,
+                text_len=0,
+                failure_reason="asr_timeout",
+            )
             self._show_toast("⏱ 轉錄超時 — 已自動恢復")
 
     def _on_transcription_done(self, result: TranscriptionResult) -> None:
@@ -1388,6 +1417,9 @@ class AppWindow(ctk.CTkFrame):
             # user 已切走的視窗）。預設仍是 wait（品質優先）。
             paste_strategy = getattr(self.cfg, "ollama_paste_strategy", "wait")
             if paste_strategy == "raw" and self.cfg.auto_paste and target:
+                # v2.18.2：raw 策略 defer pipeline emit、等 polish 完成 emit 才
+                # 能完整記 polish_s（Agent 4 P1-1）
+                self._pipeline_defer_emit = True
                 self._do_auto_paste(text, target)
                 target = None   # 告訴 _start_polish/_finish_polish 不要再 paste 第二次
 
@@ -1469,6 +1501,10 @@ class AppWindow(ctk.CTkFrame):
             self._stream_polish_dispatched > 0
             and preset_name == "default"
         )
+        # v2.18.2：標記 polish_mode 給 _emit_pipeline_timing 用（Agent 4 P2）
+        # streaming = polish_s 只反映 join + tail（實際 polish 在錄音期間就跑完）
+        # blocking  = polish_s 反映完整 polish 工作量
+        self._pipeline_polish_mode = "streaming" if use_streaming_polish else "blocking"
 
         def _run():
             if use_streaming_polish:
@@ -1624,11 +1660,24 @@ class AppWindow(ctk.CTkFrame):
         else:
             # 沒貼上的情境（auto_paste 關 / target 已被 raw 策略消耗 / polish 失敗
             # 仍想 emit 完整 timing） — 在此 emit pipeline summary
-            self._emit_pipeline_timing(
-                paste_outcome="skipped",
-                paste_target=None,
-                text_len=len(paste_text),
-            )
+            # v2.18.2：raw 策略下 _do_auto_paste 已被 defer、現在 polish 完成
+            # 把 defer flag 關掉、用之前暫存的 paste 結果一起 emit（這樣 polish_s
+            # 才會被記、path 才會是 with_ai_polish）
+            if self._pipeline_defer_emit and self._pipeline_deferred_paste:
+                deferred = self._pipeline_deferred_paste
+                self._pipeline_defer_emit = False  # 解除 defer、允許 emit
+                self._pipeline_deferred_paste = {}
+                self._emit_pipeline_timing(
+                    paste_outcome=deferred.get("paste_outcome", "skipped"),
+                    paste_target=deferred.get("paste_target"),
+                    text_len=deferred.get("text_len", len(paste_text)),
+                )
+            else:
+                self._emit_pipeline_timing(
+                    paste_outcome="skipped",
+                    paste_target=None,
+                    text_len=len(paste_text),
+                )
 
     # ── 原文 / 潤飾 分段切換 ─────────────────────────────────────────────
 
@@ -1731,6 +1780,7 @@ class AppWindow(ctk.CTkFrame):
         paste_outcome: str = "skipped",
         paste_target: Optional[str] = None,
         text_len: int = 0,
+        failure_reason: Optional[str] = None,
     ) -> None:
         """輸出「按下結束熱鍵 → 貼上完成」端到端 pipeline 拆解 log。
 
@@ -1743,16 +1793,30 @@ class AppWindow(ctk.CTkFrame):
         路徑：
           no_ai           ：純轉譯 → 貼上
           with_ai_polish  ：轉譯 → AI 潤飾 → 貼上
+          failed_*        ：v2.18.2 新增。如 failed_asr / failed_asr_timeout
+                            （ASR 失敗或超時、polish 從未跑、log 仍有資料）
 
         Args:
-            paste_outcome: "success" / "failed" / "skipped"（沒貼也呼叫一次）
-            paste_target:  貼上目標 App 名稱（沒貼則 None）
-            text_len:      最終輸出字數（方便估每秒處理速率）
+            paste_outcome:  "success" / "failed" / "skipped"
+            paste_target:   貼上目標 App 名稱（沒貼則 None）
+            text_len:       最終輸出字數
+            failure_reason: 失敗原因（如 "asr" / "asr_timeout"）；非 None 時
+                            path 標 "failed_{reason}"、polish_s 設 0
         """
         if self._pipeline_summary_emitted:
             return   # 防重複（例如 polish + paste 兩段都觸發）
         if self._pipeline_t0 is None:
             return   # 某些 edge case（手動觸發 polish 沒有 pipeline）
+        # v2.18.2：raw paste 策略 defer emit、第一次 paste 不算結束
+        # 等 polish 完成（_finish_polish）再一併 emit
+        if self._pipeline_defer_emit and failure_reason is None:
+            # 暫存 paste 結果、等 polish emit 時帶上
+            self._pipeline_deferred_paste = dict(
+                paste_outcome=paste_outcome,
+                paste_target=paste_target,
+                text_len=text_len,
+            )
+            return
         self._pipeline_summary_emitted = True
 
         now      = time.perf_counter()
@@ -1762,7 +1826,11 @@ class AppWindow(ctk.CTkFrame):
 
         # 各階段耗時（不是相對 t0，而是該階段自己花了多久）
         transcribe_s = t_trans if t_trans is not None else 0.0
-        if t_polish is not None and t_trans is not None:
+        if failure_reason is not None:
+            polish_s = 0.0
+            paste_s  = 0.0
+            path     = f"failed_{failure_reason}"
+        elif t_polish is not None and t_trans is not None:
             polish_s = t_polish - t_trans
             paste_s  = t_total  - t_polish
             path     = "with_ai_polish"
@@ -1781,6 +1849,7 @@ class AppWindow(ctk.CTkFrame):
             paste_outcome=paste_outcome,
             paste_target=paste_target or "",
             text_len=text_len,
+            polish_mode=self._pipeline_polish_mode,
         )
 
     def _display_result(self, result: TranscriptionResult) -> None:
