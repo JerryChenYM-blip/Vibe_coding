@@ -1721,13 +1721,43 @@ class AppWindow(ctk.CTkFrame):
     # ═══════════════════════════════════════════════════════════════════════
 
     def _render_tick(self) -> None:
-        """主渲染迴圈——每 50ms 執行一次，負責 Chamber Canvas 的全部繪製。"""
+        """主渲染迴圈——動態 tick rate、依 state + 視窗可見性節省 CPU。
+
+        v2.17.3：原本固定 50ms (20 FPS)、閒置 + 視窗最小化時仍狂吃 CPU
+        （user 實機看到 Whisper Pro 閒置 33% CPU）。改成：
+          • idle + 視窗 iconic/withdrawn → 1000ms（看不到、最低 1 FPS）
+          • idle + 視窗顯示 + reduce_motion → 500ms（呼吸週期 6s、肉眼無感）
+          • idle + 視窗顯示 + 動畫開 → 200ms（5 FPS、呼吸還是平滑）
+          • recording → 50ms（RMS 電平要 20 FPS）
+          • processing → 50ms（12 格旋轉、20 FPS）
+
+        預期 CPU 改善：idle 33% → 5-10%。
+        """
         try:
             self._draw_chamber()
         except tk.TclError:
             # App 關閉時 Canvas 已被銷毀，靜默結束迴圈
             return
-        self.after(RENDER_TICK_MS, self._render_tick)
+
+        # 動態 interval 選擇
+        state = self._state
+        if state == "recording" or state == "processing":
+            tick = RENDER_TICK_MS   # 50ms = 20 FPS（要看到 RMS / 旋轉）
+        else:
+            # idle 狀態：依視窗可見性 + 動畫偏好降頻
+            try:
+                wm_state = self.winfo_toplevel().wm_state()
+                window_visible = wm_state == "normal"
+            except Exception:
+                window_visible = True   # 取不到視窗狀態安全假設可見
+            if not window_visible:
+                tick = 1000   # 看不到、1 FPS 撐著就好
+            elif self._reduce_motion:
+                tick = 500    # reduce-motion 偏好 → 大幅降頻
+            else:
+                tick = 200    # 一般 idle → 5 FPS（呼吸 6s 週期仍平滑）
+
+        self.after(tick, self._render_tick)
 
     def _draw_chamber(self) -> None:
         """Render ambient rings + central disc + icon for the current state."""
