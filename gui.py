@@ -3779,12 +3779,111 @@ class SettingsWindow(ctk.CTkToplevel):
         sep_line(out)
         row(out, "語音轉文字後自動貼上 ⌨", make_sw(self._autopaste_var, INDIGO))
 
-        # ── AI 潤飾 (Ollama) ──────────────────────────────────────────────
-        ai = section("AI 潤飾 (Ollama)")
+        # ── AI 潤飾 ───────────────────────────────────────────────────────
+        ai = section("AI 潤飾")
 
-        self._ollama_enabled_var = ctk.BooleanVar(value=self.cfg.ollama_enabled)
-        row(ai, "啟用 AI 潤飾", make_sw(self._ollama_enabled_var, ACCENT))
+        # v2.18.0：polish backend 三選一（地端 Ollama / Vertex AI / 關閉）
+        # 之前 user 切後端要手動編 ~/.whisper_app/config.json，現在 UI 直接給。
+        self._polish_backend_var = ctk.StringVar(
+            value=getattr(self.cfg, "polish_backend", "local")
+        )
+
+        def backend_row(r):
+            wrap = ctk.CTkFrame(r, fg_color="transparent")
+            wrap.pack(side="right")
+            self._polish_backend_btns: dict[str, ctk.CTkButton] = {}
+            for value, label in (
+                ("local",  "地端 Ollama"),
+                ("vertex", "Vertex AI"),
+                ("off",    "關閉"),
+            ):
+                btn = ctk.CTkButton(
+                    wrap, text=label,
+                    width=92, height=30, corner_radius=8,
+                    font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
+                    border_width=1,
+                    command=lambda v=value: self._on_polish_backend_clicked(v),
+                )
+                btn.pack(side="left", padx=(0, 4))
+                self._polish_backend_btns[value] = btn
+            self._apply_polish_backend_chip_style()
+
+        row(ai, "Polish 後端", backend_row)
         sep_line(ai)
+
+        # ── Vertex AI Gemini 設定（僅 backend="vertex" 時顯示）────────────
+        self._vertex_frame = ctk.CTkFrame(ai, fg_color="transparent")
+        # 注意：先建好不 pack，由 _apply_polish_backend_chip_style 控制顯隱
+
+        # GCP Project ID
+        vp_row = ctk.CTkFrame(self._vertex_frame, fg_color="transparent", height=52)
+        vp_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
+        vp_row.pack_propagate(False)
+        ctk.CTkLabel(
+            vp_row, text="GCP Project ID", anchor="w",
+            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
+        ).pack(side="left")
+        self._vertex_project_id_var = ctk.StringVar(
+            value=getattr(self.cfg, "vertex_project_id", "")
+        )
+        ctk.CTkEntry(
+            vp_row, textvariable=self._vertex_project_id_var,
+            width=240, height=30, corner_radius=8,
+            fg_color=SURF_2, border_color=SURF_3,
+            text_color=TEXT_2,
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 12),
+            placeholder_text="my-gcp-project-123",
+        ).pack(side="right")
+        sep_line(self._vertex_frame)
+
+        # Vertex model 下拉
+        vm_row = ctk.CTkFrame(self._vertex_frame, fg_color="transparent", height=52)
+        vm_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
+        vm_row.pack_propagate(False)
+        ctk.CTkLabel(
+            vm_row, text="Vertex 模型", anchor="w",
+            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
+        ).pack(side="left")
+        self._vertex_model_var = ctk.StringVar(
+            value=getattr(self.cfg, "vertex_model", "gemini-2.5-flash")
+        )
+        ctk.CTkOptionMenu(
+            vm_row, variable=self._vertex_model_var,
+            values=["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite"],
+            width=220, height=30, corner_radius=8,
+            fg_color=SURF_2, button_color=SURF_3, button_hover_color=SURF_4,
+            text_color=TEXT_1,
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 12),
+        ).pack(side="right")
+
+        # 隱私警告
+        ctk.CTkLabel(
+            self._vertex_frame,
+            text=(
+                "⚠ 啟用後文字會傳到 Google Cloud（試用 credit 適用 Vertex AI 才會被抵扣）。\n"
+                "需先在終端機跑 `gcloud auth application-default login` 設定憑證。"
+            ),
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
+            text_color=WARN,
+            justify="left", anchor="w",
+        ).pack(anchor="w", padx=SPACE_LG, pady=(6, 10))
+        sep_line(self._vertex_frame)
+
+        # 保留 Ollama 開關（地端 backend 才有意義；vertex/off 時可忽略）
+        self._ollama_enabled_var = ctk.BooleanVar(value=self.cfg.ollama_enabled)
+        # 先建好 warmup row，當作 _vertex_frame 的插入 anchor（before=）
+        self._ollama_warmup_anchor = ctk.CTkFrame(ai, fg_color="transparent", height=50)
+        self._ollama_warmup_anchor.pack(fill="x", padx=SPACE_LG, pady=2)
+        self._ollama_warmup_anchor.pack_propagate(False)
+        ctk.CTkLabel(
+            self._ollama_warmup_anchor, text="啟用 Ollama 暖機", anchor="w",
+            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
+        ).pack(side="left")
+        make_sw(self._ollama_enabled_var, ACCENT)(self._ollama_warmup_anchor)
+        sep_line(ai)
+
+        # vertex_frame 顯隱用 pack(before=anchor) 維持正確順序
+        self._update_vertex_frame_visibility()
 
         # Bug D（v2.13.0）：貼上策略 chip — wait（品質優先）vs raw（速度優先）
         # 預設 wait：等潤飾完再貼。對 12B 模型可能 3-20s，user 體感「貼上慢」。
@@ -4229,6 +4328,49 @@ class SettingsWindow(ctk.CTkToplevel):
         self._paste_strategy_var.set(value)
         self._apply_paste_strategy_chip_style()
 
+    # ── v2.18.0 polish backend chip ────────────────────────────────────
+    def _apply_polish_backend_chip_style(self) -> None:
+        """根據 _polish_backend_var 重繪 3 顆 chip。"""
+        active = self._polish_backend_var.get()
+        for value, btn in self._polish_backend_btns.items():
+            if value == active:
+                btn.configure(
+                    fg_color=SURF_2, border_color=ACCENT,
+                    text_color=TEXT_1, hover_color=SURF_3,
+                )
+            else:
+                btn.configure(
+                    fg_color="transparent", border_color=SURF_3,
+                    text_color=TEXT_3, hover_color=SURF_2,
+                )
+
+    def _on_polish_backend_clicked(self, value: str) -> None:
+        """點 chip → 預覽切換，按 Save 才落地到 cfg。"""
+        if value == self._polish_backend_var.get():
+            return
+        self._polish_backend_var.set(value)
+        self._apply_polish_backend_chip_style()
+        self._update_vertex_frame_visibility()
+
+    def _update_vertex_frame_visibility(self) -> None:
+        """vertex 後端被選中時顯示 GCP 設定欄位，否則隱藏。
+
+        pack(before=anchor) 確保 vertex_frame 插在 Ollama 暖機 row 上面、
+        而不是預設地附加到 ai section 最尾端。
+        """
+        if not hasattr(self, "_vertex_frame"):
+            return
+        if self._polish_backend_var.get() == "vertex":
+            if not self._vertex_frame.winfo_ismapped():
+                anchor = getattr(self, "_ollama_warmup_anchor", None)
+                if anchor is not None and anchor.winfo_exists():
+                    self._vertex_frame.pack(fill="x", before=anchor)
+                else:
+                    self._vertex_frame.pack(fill="x")
+        else:
+            if self._vertex_frame.winfo_ismapped():
+                self._vertex_frame.pack_forget()
+
     def _on_theme_clicked(self, new_theme: str) -> None:
         """使用者點主題 chip。跟現在不同就彈 confirm dialog。"""
         if new_theme == self.cfg.theme:
@@ -4387,6 +4529,10 @@ class SettingsWindow(ctk.CTkToplevel):
         self.cfg.auto_paste     = self._autopaste_var.get()
         # ── Ollama ────────────────────────────────────────────────────────
         self.cfg.ollama_enabled  = self._ollama_enabled_var.get()
+        # v2.18.0：polish backend 三選一 + Vertex 設定
+        self.cfg.polish_backend    = self._polish_backend_var.get()
+        self.cfg.vertex_project_id = self._vertex_project_id_var.get().strip()
+        self.cfg.vertex_model      = self._vertex_model_var.get().strip()
         # Bug D（v2.13.0）：貼上策略
         self.cfg.ollama_paste_strategy = self._paste_strategy_var.get()
         model = self._ollama_model_var.get().strip()
