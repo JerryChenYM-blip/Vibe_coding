@@ -333,6 +333,18 @@ class AppWindow(ctk.CTkFrame):
         self._title_preset:  Optional[str] = None
         self._title_status:  Optional[str] = None
 
+        # ── Pipeline timing（按下結束 → 貼上完成 端到端拆解）─────────────
+        # 設計目標：讓 log 可以回答以下問題：
+        #   1. 純轉譯（無 AI）：從按下結束熱鍵到字貼上總共幾秒？
+        #   2. 純轉譯：轉譯本身耗時 vs 貼上耗時分別多少？
+        #   3. 有 AI 潤飾：轉譯 → 潤飾 → 貼上 三段各耗時？
+        #   4. 端到端總時間（不含錄音時長本身）
+        # 計時錨點都是 time.perf_counter()；None 表示該階段尚未發生。
+        self._pipeline_t0:            Optional[float] = None  # 按下結束的瞬間
+        self._pipeline_transcribe_at: Optional[float] = None  # 轉譯完成相對 t0
+        self._pipeline_polish_at:     Optional[float] = None  # 潤飾完成相對 t0
+        self._pipeline_summary_emitted: bool          = False # 防止重複 emit
+
         self._build_ui()
         self._start_hotkey_listener()
         # 診斷（Task B）：mainloop 第一個 idle tick 抵達時間戳，
@@ -909,6 +921,13 @@ class AppWindow(ctk.CTkFrame):
         self._state            = "processing"
         self._state_start_time = time.perf_counter()
 
+        # Pipeline timing 起點：按下結束熱鍵 / 點停止按鈕的這一瞬間。
+        # 從這裡開始算「使用者等多久才看到貼上的字」。
+        self._pipeline_t0            = self._state_start_time
+        self._pipeline_transcribe_at = None
+        self._pipeline_polish_at     = None
+        self._pipeline_summary_emitted = False
+
         if self._stream_tick_id is not None:
             self.after_cancel(self._stream_tick_id)
             self._stream_tick_id = None
@@ -1294,6 +1313,10 @@ class AppWindow(ctk.CTkFrame):
             log_action("transcription_late_dropped", state=self._state)
             return
 
+        # Pipeline timing 打點：轉譯完成（含背景 thread 排程 + after(0) 回主執行緒）
+        if self._pipeline_t0 is not None:
+            self._pipeline_transcribe_at = time.perf_counter() - self._pipeline_t0
+
         self._transition_to_idle(result)
         self._show_toast(f"轉錄完成 · {result.elapsed_seconds:.1f}s")
 
@@ -1386,6 +1409,14 @@ class AppWindow(ctk.CTkFrame):
             # 必須在主 thread 呼叫，否則 TSMGetInputSourceProperty 會觸發
             # dispatch_assert_queue_fail 直接閃退。詳見 CLAUDE.md §9.6。
             self._do_auto_paste(text, target)
+        else:
+            # 沒走 auto-paste（auto_paste 關 / 無 target / 無效文字）也要 emit
+            # pipeline summary — 此時 paste_s 是 0、total_s ≈ transcribe_s
+            self._emit_pipeline_timing(
+                paste_outcome="skipped",
+                paste_target=None,
+                text_len=len(text) if valid else 0,
+            )
 
     # ── 潤飾管線 ────────────────────────────────────────────────────────────
 
@@ -1522,6 +1553,11 @@ class AppWindow(ctk.CTkFrame):
 
         self._polish_busy = False
 
+        # Pipeline timing 打點：潤飾完成（含背景 polish thread 排程 + after(0) 回主）
+        # 注意：若 polish 失敗走 fallback（paste_text = raw_text），仍視為「完成這個階段」
+        if self._pipeline_t0 is not None:
+            self._pipeline_polish_at = time.perf_counter() - self._pipeline_t0
+
         if resp.error:
             # 降級：提示錯誤，title 狀態轉為「原文（潤飾失敗）」，auto-paste 貼原文
             # 注意：preset 名稱（若有）刻意保留，讓使用者知道是哪條 preset 炸
@@ -1585,6 +1621,14 @@ class AppWindow(ctk.CTkFrame):
         # dispatch_assert_queue_fail 直接閃退。詳見 CLAUDE.md §9.6。
         if target:
             self._do_auto_paste(paste_text, target)
+        else:
+            # 沒貼上的情境（auto_paste 關 / target 已被 raw 策略消耗 / polish 失敗
+            # 仍想 emit 完整 timing） — 在此 emit pipeline summary
+            self._emit_pipeline_timing(
+                paste_outcome="skipped",
+                paste_target=None,
+                text_len=len(paste_text),
+            )
 
     # ── 原文 / 潤飾 分段切換 ─────────────────────────────────────────────
 
@@ -1677,6 +1721,67 @@ class AppWindow(ctk.CTkFrame):
             self._show_toast(f"⌨  已貼入 {target}")
         else:
             self._show_toast("⌨  自動貼上失敗（請確認輔助使用權限）")
+        # Pipeline 終點：emit 完整 timing summary（不論成功 / 失敗都要記）
+        self._emit_pipeline_timing(paste_outcome="success" if success else "failed",
+                                   paste_target=target,
+                                   text_len=len(text))
+
+    def _emit_pipeline_timing(
+        self,
+        paste_outcome: str = "skipped",
+        paste_target: Optional[str] = None,
+        text_len: int = 0,
+    ) -> None:
+        """輸出「按下結束熱鍵 → 貼上完成」端到端 pipeline 拆解 log。
+
+        分四個階段，皆相對於 `_pipeline_t0`（按下結束的那一刻）：
+          transcribe   ：轉譯完成
+          polish       ：潤飾完成（無 AI 時為 None）
+          paste        ：貼上完成（無 auto_paste 時為當下呼叫點）
+          total        ：以最後階段為準
+
+        路徑：
+          no_ai           ：純轉譯 → 貼上
+          with_ai_polish  ：轉譯 → AI 潤飾 → 貼上
+
+        Args:
+            paste_outcome: "success" / "failed" / "skipped"（沒貼也呼叫一次）
+            paste_target:  貼上目標 App 名稱（沒貼則 None）
+            text_len:      最終輸出字數（方便估每秒處理速率）
+        """
+        if self._pipeline_summary_emitted:
+            return   # 防重複（例如 polish + paste 兩段都觸發）
+        if self._pipeline_t0 is None:
+            return   # 某些 edge case（手動觸發 polish 沒有 pipeline）
+        self._pipeline_summary_emitted = True
+
+        now      = time.perf_counter()
+        t_total  = now - self._pipeline_t0
+        t_trans  = self._pipeline_transcribe_at
+        t_polish = self._pipeline_polish_at
+
+        # 各階段耗時（不是相對 t0，而是該階段自己花了多久）
+        transcribe_s = t_trans if t_trans is not None else 0.0
+        if t_polish is not None and t_trans is not None:
+            polish_s = t_polish - t_trans
+            paste_s  = t_total  - t_polish
+            path     = "with_ai_polish"
+        else:
+            polish_s = 0.0
+            paste_s  = t_total - (t_trans if t_trans is not None else 0.0)
+            path     = "no_ai"
+
+        log_action(
+            "pipeline_timing",
+            path=path,
+            transcribe_s=f"{transcribe_s:.2f}",
+            polish_s=f"{polish_s:.2f}",
+            paste_s=f"{paste_s:.2f}",
+            total_s=f"{t_total:.2f}",
+            paste_outcome=paste_outcome,
+            paste_target=paste_target or "",
+            text_len=text_len,
+        )
 
     def _display_result(self, result: TranscriptionResult) -> None:
         """新增一個 UtteranceBlock，取代之前在 textbox 累積插入文字的做法。
