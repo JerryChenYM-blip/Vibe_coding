@@ -169,6 +169,13 @@ class AppWindow(ctk.CTkFrame):
     # 5 秒：權衡 detect latency 與 µs 級檢查成本。
     HOTKEY_WATCHDOG_INTERVAL_MS = 5000
 
+    # v2.17.4：定期跑 dummy ASR 防 MLX weights 被 macOS swap out。
+    # 實機觀察：35 分鐘閒置後第一次 ASR 從 RTF 0.2 飆到 4.85（24x 慢）—— macOS
+    # 把 3.4GB Qwen3-ASR weights page out 到磁碟、首次推論要 page-in。
+    # 5 分鐘背景跑一次 1.5s sine wave 保活、強迫 weights 留在 active page。
+    # 只在 state=idle 跑（避免跟 user 的 transcribe 撞 lock）。
+    MLX_KEEPALIVE_INTERVAL_MS = 5 * 60 * 1000   # 5 分鐘
+
     # Fix 18 / 2026-05-23（Layer 2）：每 N 毫秒無條件 force-restart NSEvent monitor。
     # 即使 monitor 物件還 alive、其底層 ObjC block 仍可能在閒置 1hr+ 後被 invalidate
     # 而 watchdog 偵測不到（_monitor_global is not None 仍成立）。10 分鐘是
@@ -229,6 +236,17 @@ class AppWindow(ctk.CTkFrame):
         self.ollama      = OllamaClient()
         # 用設定檔同步 Ollama 參數（base_url / model / enabled / timeout）
         self.ollama.apply_app_config(cfg)
+        # v2.18.0：Vertex AI Gemini polish client（雲端、duck-type 兼容 Ollama）
+        # lazy init、enabled 只在 polish_backend="vertex" 時 True
+        try:
+            from vertex_polish import VertexPolishClient
+            self.vertex = VertexPolishClient()
+            self.vertex.apply_app_config(cfg)
+        except Exception:
+            log_error("vertex_client_init_failed")
+            self.vertex = None
+        # polish 路由器：依 polish_backend 回對應 client（Ollama / Vertex / None）
+        self._refresh_polish_backend()
         self.hotkey_mgr  = HotkeyManager(
             on_tap_cb=self._hotkey_tap,
         )
@@ -315,6 +333,28 @@ class AppWindow(ctk.CTkFrame):
         self._title_preset:  Optional[str] = None
         self._title_status:  Optional[str] = None
 
+        # ── Pipeline timing（按下結束 → 貼上完成 端到端拆解）─────────────
+        # 設計目標：讓 log 可以回答以下問題：
+        #   1. 純轉譯（無 AI）：從按下結束熱鍵到字貼上總共幾秒？
+        #   2. 純轉譯：轉譯本身耗時 vs 貼上耗時分別多少？
+        #   3. 有 AI 潤飾：轉譯 → 潤飾 → 貼上 三段各耗時？
+        #   4. 端到端總時間（不含錄音時長本身）
+        # 計時錨點都是 time.perf_counter()；None 表示該階段尚未發生。
+        self._pipeline_t0:            Optional[float] = None  # 按下結束的瞬間
+        self._pipeline_transcribe_at: Optional[float] = None  # 轉譯完成相對 t0
+        self._pipeline_polish_at:     Optional[float] = None  # 潤飾完成相對 t0
+        self._pipeline_summary_emitted: bool          = False # 防止重複 emit
+        # v2.18.2：raw paste strategy bug fix（Agent 4 P1-1）
+        # raw 策略：先貼原文、polish 完背景跑、不再覆蓋。第一次貼上時
+        # _do_auto_paste 不應觸發 emit、否則 polish_s 永遠是 0。改成 defer
+        # 到 polish 完成（_finish_polish）再一起 emit。
+        self._pipeline_defer_emit:    bool             = False
+        self._pipeline_deferred_paste: dict            = {}    # 暫存 paste 結果
+        # v2.18.2：streaming polish 跟 blocking polish 區分（Agent 4 P2）
+        # streaming = polish 在錄音期間就跑、polish_s 只反映 join + tail
+        # blocking  = polish 在 ASR 完成後才跑、polish_s 反映實際耗時
+        self._pipeline_polish_mode:   str              = "blocking"
+
         self._build_ui()
         self._start_hotkey_listener()
         # 診斷（Task B）：mainloop 第一個 idle tick 抵達時間戳，
@@ -360,6 +400,9 @@ class AppWindow(ctk.CTkFrame):
         # v2.17.1：Ollama 預載 model 進 VRAM（背景 thread、不卡 UI）
         # 配合 keep_alive=-1、模型載入後永久駐留、user 第一次用就快
         self.after(2500, self._warmup_ollama)
+        # v2.17.4：定期跑 dummy ASR 保活 MLX weights（防 macOS swap out）
+        # 第一次 5 分鐘後跑、之後 each tick 自己排程下次
+        self.after(self.MLX_KEEPALIVE_INTERVAL_MS, self._mlx_keepalive_tick)
 
         # #4 字典：初次載入並餵給 Transcriber
         self._reload_dictionary()
@@ -888,6 +931,17 @@ class AppWindow(ctk.CTkFrame):
         self._state            = "processing"
         self._state_start_time = time.perf_counter()
 
+        # Pipeline timing 起點：按下結束熱鍵 / 點停止按鈕的這一瞬間。
+        # 從這裡開始算「使用者等多久才看到貼上的字」。
+        self._pipeline_t0            = self._state_start_time
+        # v2.18.2：重置 defer + polish_mode（每次新 pipeline 都清乾淨）
+        self._pipeline_defer_emit    = False
+        self._pipeline_deferred_paste = {}
+        self._pipeline_polish_mode   = "blocking"
+        self._pipeline_transcribe_at = None
+        self._pipeline_polish_at     = None
+        self._pipeline_summary_emitted = False
+
         if self._stream_tick_id is not None:
             self.after_cancel(self._stream_tick_id)
             self._stream_tick_id = None
@@ -1109,7 +1163,12 @@ class AppWindow(ctk.CTkFrame):
 
         def _polish_thread(text=text, idx=idx, gen=gen):
             try:
-                resp = self.ollama.process(
+                # v2.18.0：透過 self.polish router 自動路由到 Ollama / Vertex
+                # polish == None（backend=off）→ 跳過 streaming polish
+                client = self.polish
+                if client is None:
+                    return
+                resp = client.process(
                     text,
                     prompt_template=OLLAMA_POLISH_PROMPT,
                     dictionary_terms=dict_terms,
@@ -1222,6 +1281,14 @@ class AppWindow(ctk.CTkFrame):
             segments=[],
         )
         self._transition_to_idle(empty)
+        # v2.18.2：補 pipeline_timing emit（Agent 4 P1-2）
+        # 失敗 case 最需要觀察、不能 silent drop。path 標 failed_asr
+        self._emit_pipeline_timing(
+            paste_outcome="skipped",
+            paste_target=None,
+            text_len=0,
+            failure_reason="asr",
+        )
         self._show_toast("⚠ 轉錄失敗")
 
     def _processing_timeout_check(self) -> None:
@@ -1250,6 +1317,13 @@ class AppWindow(ctk.CTkFrame):
                 segments=[],
             )
             self._transition_to_idle(empty)
+            # v2.18.2：補 pipeline_timing emit（Agent 4 P1-2、跟 ASR fail 同邏輯）
+            self._emit_pipeline_timing(
+                paste_outcome="skipped",
+                paste_target=None,
+                text_len=0,
+                failure_reason="asr_timeout",
+            )
             self._show_toast("⏱ 轉錄超時 — 已自動恢復")
 
     def _on_transcription_done(self, result: TranscriptionResult) -> None:
@@ -1267,6 +1341,10 @@ class AppWindow(ctk.CTkFrame):
             )
             log_action("transcription_late_dropped", state=self._state)
             return
+
+        # Pipeline timing 打點：轉譯完成（含背景 thread 排程 + after(0) 回主執行緒）
+        if self._pipeline_t0 is not None:
+            self._pipeline_transcribe_at = time.perf_counter() - self._pipeline_t0
 
         self._transition_to_idle(result)
         self._show_toast(f"轉錄完成 · {result.elapsed_seconds:.1f}s")
@@ -1339,6 +1417,9 @@ class AppWindow(ctk.CTkFrame):
             # user 已切走的視窗）。預設仍是 wait（品質優先）。
             paste_strategy = getattr(self.cfg, "ollama_paste_strategy", "wait")
             if paste_strategy == "raw" and self.cfg.auto_paste and target:
+                # v2.18.2：raw 策略 defer pipeline emit、等 polish 完成 emit 才
+                # 能完整記 polish_s（Agent 4 P1-1）
+                self._pipeline_defer_emit = True
                 self._do_auto_paste(text, target)
                 target = None   # 告訴 _start_polish/_finish_polish 不要再 paste 第二次
 
@@ -1360,6 +1441,14 @@ class AppWindow(ctk.CTkFrame):
             # 必須在主 thread 呼叫，否則 TSMGetInputSourceProperty 會觸發
             # dispatch_assert_queue_fail 直接閃退。詳見 CLAUDE.md §9.6。
             self._do_auto_paste(text, target)
+        else:
+            # 沒走 auto-paste（auto_paste 關 / 無 target / 無效文字）也要 emit
+            # pipeline summary — 此時 paste_s 是 0、total_s ≈ transcribe_s
+            self._emit_pipeline_timing(
+                paste_outcome="skipped",
+                paste_target=None,
+                text_len=len(text) if valid else 0,
+            )
 
     # ── 潤飾管線 ────────────────────────────────────────────────────────────
 
@@ -1412,6 +1501,10 @@ class AppWindow(ctk.CTkFrame):
             self._stream_polish_dispatched > 0
             and preset_name == "default"
         )
+        # v2.18.2：標記 polish_mode 給 _emit_pipeline_timing 用（Agent 4 P2）
+        # streaming = polish_s 只反映 join + tail（實際 polish 在錄音期間就跑完）
+        # blocking  = polish_s 反映完整 polish 工作量
+        self._pipeline_polish_mode = "streaming" if use_streaming_polish else "blocking"
 
         def _run():
             if use_streaming_polish:
@@ -1433,7 +1526,9 @@ class AppWindow(ctk.CTkFrame):
                 tail_raw = llm_input[len(streamed_raw):] if len(llm_input) > len(streamed_raw) else ""
 
                 if tail_raw.strip():
-                    tail_resp = self.ollama.process(
+                    # v2.18.0：透過 polish router
+                    client = self.polish or self.ollama
+                    tail_resp = client.process(
                         tail_raw,
                         prompt_template=preset.resolve_prompt(),
                         dictionary_terms=dict_terms,
@@ -1461,7 +1556,9 @@ class AppWindow(ctk.CTkFrame):
                     preset_name=preset_name,
                 )
             else:
-                resp = self.ollama.process(
+                # v2.18.0：透過 polish router（Ollama / Vertex / fallback Ollama）
+                client = self.polish or self.ollama
+                resp = client.process(
                     llm_input,
                     prompt_template=preset.resolve_prompt(),
                     dictionary_terms=dict_terms,
@@ -1491,6 +1588,11 @@ class AppWindow(ctk.CTkFrame):
             return
 
         self._polish_busy = False
+
+        # Pipeline timing 打點：潤飾完成（含背景 polish thread 排程 + after(0) 回主）
+        # 注意：若 polish 失敗走 fallback（paste_text = raw_text），仍視為「完成這個階段」
+        if self._pipeline_t0 is not None:
+            self._pipeline_polish_at = time.perf_counter() - self._pipeline_t0
 
         if resp.error:
             # 降級：提示錯誤，title 狀態轉為「原文（潤飾失敗）」，auto-paste 貼原文
@@ -1555,6 +1657,27 @@ class AppWindow(ctk.CTkFrame):
         # dispatch_assert_queue_fail 直接閃退。詳見 CLAUDE.md §9.6。
         if target:
             self._do_auto_paste(paste_text, target)
+        else:
+            # 沒貼上的情境（auto_paste 關 / target 已被 raw 策略消耗 / polish 失敗
+            # 仍想 emit 完整 timing） — 在此 emit pipeline summary
+            # v2.18.2：raw 策略下 _do_auto_paste 已被 defer、現在 polish 完成
+            # 把 defer flag 關掉、用之前暫存的 paste 結果一起 emit（這樣 polish_s
+            # 才會被記、path 才會是 with_ai_polish）
+            if self._pipeline_defer_emit and self._pipeline_deferred_paste:
+                deferred = self._pipeline_deferred_paste
+                self._pipeline_defer_emit = False  # 解除 defer、允許 emit
+                self._pipeline_deferred_paste = {}
+                self._emit_pipeline_timing(
+                    paste_outcome=deferred.get("paste_outcome", "skipped"),
+                    paste_target=deferred.get("paste_target"),
+                    text_len=deferred.get("text_len", len(paste_text)),
+                )
+            else:
+                self._emit_pipeline_timing(
+                    paste_outcome="skipped",
+                    paste_target=None,
+                    text_len=len(paste_text),
+                )
 
     # ── 原文 / 潤飾 分段切換 ─────────────────────────────────────────────
 
@@ -1647,6 +1770,87 @@ class AppWindow(ctk.CTkFrame):
             self._show_toast(f"⌨  已貼入 {target}")
         else:
             self._show_toast("⌨  自動貼上失敗（請確認輔助使用權限）")
+        # Pipeline 終點：emit 完整 timing summary（不論成功 / 失敗都要記）
+        self._emit_pipeline_timing(paste_outcome="success" if success else "failed",
+                                   paste_target=target,
+                                   text_len=len(text))
+
+    def _emit_pipeline_timing(
+        self,
+        paste_outcome: str = "skipped",
+        paste_target: Optional[str] = None,
+        text_len: int = 0,
+        failure_reason: Optional[str] = None,
+    ) -> None:
+        """輸出「按下結束熱鍵 → 貼上完成」端到端 pipeline 拆解 log。
+
+        分四個階段，皆相對於 `_pipeline_t0`（按下結束的那一刻）：
+          transcribe   ：轉譯完成
+          polish       ：潤飾完成（無 AI 時為 None）
+          paste        ：貼上完成（無 auto_paste 時為當下呼叫點）
+          total        ：以最後階段為準
+
+        路徑：
+          no_ai           ：純轉譯 → 貼上
+          with_ai_polish  ：轉譯 → AI 潤飾 → 貼上
+          failed_*        ：v2.18.2 新增。如 failed_asr / failed_asr_timeout
+                            （ASR 失敗或超時、polish 從未跑、log 仍有資料）
+
+        Args:
+            paste_outcome:  "success" / "failed" / "skipped"
+            paste_target:   貼上目標 App 名稱（沒貼則 None）
+            text_len:       最終輸出字數
+            failure_reason: 失敗原因（如 "asr" / "asr_timeout"）；非 None 時
+                            path 標 "failed_{reason}"、polish_s 設 0
+        """
+        if self._pipeline_summary_emitted:
+            return   # 防重複（例如 polish + paste 兩段都觸發）
+        if self._pipeline_t0 is None:
+            return   # 某些 edge case（手動觸發 polish 沒有 pipeline）
+        # v2.18.2：raw paste 策略 defer emit、第一次 paste 不算結束
+        # 等 polish 完成（_finish_polish）再一併 emit
+        if self._pipeline_defer_emit and failure_reason is None:
+            # 暫存 paste 結果、等 polish emit 時帶上
+            self._pipeline_deferred_paste = dict(
+                paste_outcome=paste_outcome,
+                paste_target=paste_target,
+                text_len=text_len,
+            )
+            return
+        self._pipeline_summary_emitted = True
+
+        now      = time.perf_counter()
+        t_total  = now - self._pipeline_t0
+        t_trans  = self._pipeline_transcribe_at
+        t_polish = self._pipeline_polish_at
+
+        # 各階段耗時（不是相對 t0，而是該階段自己花了多久）
+        transcribe_s = t_trans if t_trans is not None else 0.0
+        if failure_reason is not None:
+            polish_s = 0.0
+            paste_s  = 0.0
+            path     = f"failed_{failure_reason}"
+        elif t_polish is not None and t_trans is not None:
+            polish_s = t_polish - t_trans
+            paste_s  = t_total  - t_polish
+            path     = "with_ai_polish"
+        else:
+            polish_s = 0.0
+            paste_s  = t_total - (t_trans if t_trans is not None else 0.0)
+            path     = "no_ai"
+
+        log_action(
+            "pipeline_timing",
+            path=path,
+            transcribe_s=f"{transcribe_s:.2f}",
+            polish_s=f"{polish_s:.2f}",
+            paste_s=f"{paste_s:.2f}",
+            total_s=f"{t_total:.2f}",
+            paste_outcome=paste_outcome,
+            paste_target=paste_target or "",
+            text_len=text_len,
+            polish_mode=self._pipeline_polish_mode,
+        )
 
     def _display_result(self, result: TranscriptionResult) -> None:
         """新增一個 UtteranceBlock，取代之前在 textbox 累積插入文字的做法。
@@ -1721,13 +1925,43 @@ class AppWindow(ctk.CTkFrame):
     # ═══════════════════════════════════════════════════════════════════════
 
     def _render_tick(self) -> None:
-        """主渲染迴圈——每 50ms 執行一次，負責 Chamber Canvas 的全部繪製。"""
+        """主渲染迴圈——動態 tick rate、依 state + 視窗可見性節省 CPU。
+
+        v2.17.3：原本固定 50ms (20 FPS)、閒置 + 視窗最小化時仍狂吃 CPU
+        （user 實機看到 Whisper Pro 閒置 33% CPU）。改成：
+          • idle + 視窗 iconic/withdrawn → 1000ms（看不到、最低 1 FPS）
+          • idle + 視窗顯示 + reduce_motion → 500ms（呼吸週期 6s、肉眼無感）
+          • idle + 視窗顯示 + 動畫開 → 200ms（5 FPS、呼吸還是平滑）
+          • recording → 50ms（RMS 電平要 20 FPS）
+          • processing → 50ms（12 格旋轉、20 FPS）
+
+        預期 CPU 改善：idle 33% → 5-10%。
+        """
         try:
             self._draw_chamber()
         except tk.TclError:
             # App 關閉時 Canvas 已被銷毀，靜默結束迴圈
             return
-        self.after(RENDER_TICK_MS, self._render_tick)
+
+        # 動態 interval 選擇
+        state = self._state
+        if state == "recording" or state == "processing":
+            tick = RENDER_TICK_MS   # 50ms = 20 FPS（要看到 RMS / 旋轉）
+        else:
+            # idle 狀態：依視窗可見性 + 動畫偏好降頻
+            try:
+                wm_state = self.winfo_toplevel().wm_state()
+                window_visible = wm_state == "normal"
+            except Exception:
+                window_visible = True   # 取不到視窗狀態安全假設可見
+            if not window_visible:
+                tick = 1000   # 看不到、1 FPS 撐著就好
+            elif self._reduce_motion:
+                tick = 500    # reduce-motion 偏好 → 大幅降頻
+            else:
+                tick = 200    # 一般 idle → 5 FPS（呼吸 6s 週期仍平滑）
+
+        self.after(tick, self._render_tick)
 
     def _draw_chamber(self) -> None:
         """Render ambient rings + central disc + icon for the current state."""
@@ -2712,6 +2946,13 @@ class AppWindow(ctk.CTkFrame):
         )
         # Ollama 設定同步：把新 cfg 推給 client，然後重新非同步探測一次
         self.ollama.apply_app_config(cfg)
+        # v2.18.0：Vertex 設定同步 + polish backend router 更新
+        if self.vertex is not None:
+            try:
+                self.vertex.apply_app_config(cfg)
+            except Exception:
+                log_error("vertex_apply_app_config_failed")
+        self._refresh_polish_backend()
         self._refresh_ollama_health()
 
         # 字典：重新載入（可能 enabled 變了，或路徑變了）
@@ -3152,6 +3393,59 @@ class AppWindow(ctk.CTkFrame):
 
         threading.Thread(target=_load, daemon=True).start()
 
+    def _refresh_polish_backend(self) -> None:
+        """v2.18.0：依 cfg.polish_backend 設定 self.polish 指向 Ollama / Vertex。
+
+        - "local"  → self.polish = self.ollama
+        - "vertex" → self.polish = self.vertex
+        - "off"    → self.polish = None（_start_polish 會 short-circuit）
+
+        ollama_enabled / vertex 的 health_ok 仍由各自 client 管。
+        """
+        backend = getattr(self.cfg, "polish_backend", "local")
+        if backend == "vertex" and self.vertex is not None:
+            self.polish = self.vertex
+            log.info(f"POLISH: backend = vertex (model={self.cfg.vertex_model})")
+        elif backend == "off":
+            self.polish = None
+            log.info("POLISH: backend = off (no polish)")
+        else:
+            self.polish = self.ollama
+            log.info(f"POLISH: backend = local Ollama (model={self.cfg.ollama_model})")
+
+    def _mlx_keepalive_tick(self) -> None:
+        """v2.17.4：每 5 分鐘背景跑一次 dummy ASR、防 MLX weights 被 swap。
+
+        實機觀察：閒置 35 分鐘後第一次 ASR RTF 從 0.2 飆到 4.85（24x 慢）。
+        macOS 把 3.4GB MLX weights 當作「不常用」page out 到 swap、首次推論
+        要從磁碟 page in 全部權重。
+
+        修法：每 5 分鐘背景跑一次 1.5s sine wave 推論（沿用 transcriber.warmup
+        既有路徑）、強迫 macOS VM 把 weights 留在 active page。
+
+        Guard：
+          • state != idle → 跳過（避免跟 user transcribe 撞 _transcription_lock）
+          • Qwen3-ASR session 還沒載入 → 跳過（不需要的 warmup）
+          • 失敗 silent、log warning
+        """
+        try:
+            if self._state == "idle":
+                model = self._model_var.get()
+                # 只對已載入的模型 keepalive（轉錄 lock 內、不撞用戶操作）
+                def _ping():
+                    try:
+                        # 沿用 transcriber.warmup() — 跑 1.5s sine wave
+                        self.transcriber.warmup(model)
+                        log.debug(f"MLX_KEEPALIVE: ping done (model={model})")
+                    except Exception:
+                        log_error("mlx_keepalive_ping_failed", model=model)
+                threading.Thread(target=_ping, daemon=True).start()
+        except Exception:
+            log_error("mlx_keepalive_tick_failed")
+        finally:
+            # 永遠重新排程下次（即使這次失敗）
+            self.after(self.MLX_KEEPALIVE_INTERVAL_MS, self._mlx_keepalive_tick)
+
     def _warmup_ollama(self) -> None:
         """v2.17.1：背景預載 Ollama polish model 進 VRAM。
 
@@ -3554,12 +3848,111 @@ class SettingsWindow(ctk.CTkToplevel):
         sep_line(out)
         row(out, "語音轉文字後自動貼上 ⌨", make_sw(self._autopaste_var, INDIGO))
 
-        # ── AI 潤飾 (Ollama) ──────────────────────────────────────────────
-        ai = section("AI 潤飾 (Ollama)")
+        # ── AI 潤飾 ───────────────────────────────────────────────────────
+        ai = section("AI 潤飾")
 
-        self._ollama_enabled_var = ctk.BooleanVar(value=self.cfg.ollama_enabled)
-        row(ai, "啟用 AI 潤飾", make_sw(self._ollama_enabled_var, ACCENT))
+        # v2.18.0：polish backend 三選一（地端 Ollama / Vertex AI / 關閉）
+        # 之前 user 切後端要手動編 ~/.whisper_app/config.json，現在 UI 直接給。
+        self._polish_backend_var = ctk.StringVar(
+            value=getattr(self.cfg, "polish_backend", "local")
+        )
+
+        def backend_row(r):
+            wrap = ctk.CTkFrame(r, fg_color="transparent")
+            wrap.pack(side="right")
+            self._polish_backend_btns: dict[str, ctk.CTkButton] = {}
+            for value, label in (
+                ("local",  "地端 Ollama"),
+                ("vertex", "Vertex AI"),
+                ("off",    "關閉"),
+            ):
+                btn = ctk.CTkButton(
+                    wrap, text=label,
+                    width=92, height=30, corner_radius=8,
+                    font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
+                    border_width=1,
+                    command=lambda v=value: self._on_polish_backend_clicked(v),
+                )
+                btn.pack(side="left", padx=(0, 4))
+                self._polish_backend_btns[value] = btn
+            self._apply_polish_backend_chip_style()
+
+        row(ai, "Polish 後端", backend_row)
         sep_line(ai)
+
+        # ── Vertex AI Gemini 設定（僅 backend="vertex" 時顯示）────────────
+        self._vertex_frame = ctk.CTkFrame(ai, fg_color="transparent")
+        # 注意：先建好不 pack，由 _apply_polish_backend_chip_style 控制顯隱
+
+        # GCP Project ID
+        vp_row = ctk.CTkFrame(self._vertex_frame, fg_color="transparent", height=52)
+        vp_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
+        vp_row.pack_propagate(False)
+        ctk.CTkLabel(
+            vp_row, text="GCP Project ID", anchor="w",
+            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
+        ).pack(side="left")
+        self._vertex_project_id_var = ctk.StringVar(
+            value=getattr(self.cfg, "vertex_project_id", "")
+        )
+        ctk.CTkEntry(
+            vp_row, textvariable=self._vertex_project_id_var,
+            width=240, height=30, corner_radius=8,
+            fg_color=SURF_2, border_color=SURF_3,
+            text_color=TEXT_2,
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 12),
+            placeholder_text="my-gcp-project-123",
+        ).pack(side="right")
+        sep_line(self._vertex_frame)
+
+        # Vertex model 下拉
+        vm_row = ctk.CTkFrame(self._vertex_frame, fg_color="transparent", height=52)
+        vm_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
+        vm_row.pack_propagate(False)
+        ctk.CTkLabel(
+            vm_row, text="Vertex 模型", anchor="w",
+            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
+        ).pack(side="left")
+        self._vertex_model_var = ctk.StringVar(
+            value=getattr(self.cfg, "vertex_model", "gemini-2.5-flash")
+        )
+        ctk.CTkOptionMenu(
+            vm_row, variable=self._vertex_model_var,
+            values=["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite"],
+            width=220, height=30, corner_radius=8,
+            fg_color=SURF_2, button_color=SURF_3, button_hover_color=SURF_4,
+            text_color=TEXT_1,
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 12),
+        ).pack(side="right")
+
+        # 隱私警告
+        ctk.CTkLabel(
+            self._vertex_frame,
+            text=(
+                "⚠ 啟用後文字會傳到 Google Cloud（試用 credit 適用 Vertex AI 才會被抵扣）。\n"
+                "需先在終端機跑 `gcloud auth application-default login` 設定憑證。"
+            ),
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
+            text_color=WARN,
+            justify="left", anchor="w",
+        ).pack(anchor="w", padx=SPACE_LG, pady=(6, 10))
+        sep_line(self._vertex_frame)
+
+        # 保留 Ollama 開關（地端 backend 才有意義；vertex/off 時可忽略）
+        self._ollama_enabled_var = ctk.BooleanVar(value=self.cfg.ollama_enabled)
+        # 先建好 warmup row，當作 _vertex_frame 的插入 anchor（before=）
+        self._ollama_warmup_anchor = ctk.CTkFrame(ai, fg_color="transparent", height=50)
+        self._ollama_warmup_anchor.pack(fill="x", padx=SPACE_LG, pady=2)
+        self._ollama_warmup_anchor.pack_propagate(False)
+        ctk.CTkLabel(
+            self._ollama_warmup_anchor, text="啟用 Ollama 暖機", anchor="w",
+            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
+        ).pack(side="left")
+        make_sw(self._ollama_enabled_var, ACCENT)(self._ollama_warmup_anchor)
+        sep_line(ai)
+
+        # vertex_frame 顯隱用 pack(before=anchor) 維持正確順序
+        self._update_vertex_frame_visibility()
 
         # Bug D（v2.13.0）：貼上策略 chip — wait（品質優先）vs raw（速度優先）
         # 預設 wait：等潤飾完再貼。對 12B 模型可能 3-20s，user 體感「貼上慢」。
@@ -4004,6 +4397,49 @@ class SettingsWindow(ctk.CTkToplevel):
         self._paste_strategy_var.set(value)
         self._apply_paste_strategy_chip_style()
 
+    # ── v2.18.0 polish backend chip ────────────────────────────────────
+    def _apply_polish_backend_chip_style(self) -> None:
+        """根據 _polish_backend_var 重繪 3 顆 chip。"""
+        active = self._polish_backend_var.get()
+        for value, btn in self._polish_backend_btns.items():
+            if value == active:
+                btn.configure(
+                    fg_color=SURF_2, border_color=ACCENT,
+                    text_color=TEXT_1, hover_color=SURF_3,
+                )
+            else:
+                btn.configure(
+                    fg_color="transparent", border_color=SURF_3,
+                    text_color=TEXT_3, hover_color=SURF_2,
+                )
+
+    def _on_polish_backend_clicked(self, value: str) -> None:
+        """點 chip → 預覽切換，按 Save 才落地到 cfg。"""
+        if value == self._polish_backend_var.get():
+            return
+        self._polish_backend_var.set(value)
+        self._apply_polish_backend_chip_style()
+        self._update_vertex_frame_visibility()
+
+    def _update_vertex_frame_visibility(self) -> None:
+        """vertex 後端被選中時顯示 GCP 設定欄位，否則隱藏。
+
+        pack(before=anchor) 確保 vertex_frame 插在 Ollama 暖機 row 上面、
+        而不是預設地附加到 ai section 最尾端。
+        """
+        if not hasattr(self, "_vertex_frame"):
+            return
+        if self._polish_backend_var.get() == "vertex":
+            if not self._vertex_frame.winfo_ismapped():
+                anchor = getattr(self, "_ollama_warmup_anchor", None)
+                if anchor is not None and anchor.winfo_exists():
+                    self._vertex_frame.pack(fill="x", before=anchor)
+                else:
+                    self._vertex_frame.pack(fill="x")
+        else:
+            if self._vertex_frame.winfo_ismapped():
+                self._vertex_frame.pack_forget()
+
     def _on_theme_clicked(self, new_theme: str) -> None:
         """使用者點主題 chip。跟現在不同就彈 confirm dialog。"""
         if new_theme == self.cfg.theme:
@@ -4162,6 +4598,10 @@ class SettingsWindow(ctk.CTkToplevel):
         self.cfg.auto_paste     = self._autopaste_var.get()
         # ── Ollama ────────────────────────────────────────────────────────
         self.cfg.ollama_enabled  = self._ollama_enabled_var.get()
+        # v2.18.0：polish backend 三選一 + Vertex 設定
+        self.cfg.polish_backend    = self._polish_backend_var.get()
+        self.cfg.vertex_project_id = self._vertex_project_id_var.get().strip()
+        self.cfg.vertex_model      = self._vertex_model_var.get().strip()
         # Bug D（v2.13.0）：貼上策略
         self.cfg.ollama_paste_strategy = self._paste_strategy_var.get()
         model = self._ollama_model_var.get().strip()

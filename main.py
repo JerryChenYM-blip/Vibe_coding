@@ -13,11 +13,14 @@ Whisper Pro 應用程式進入點。
 
 from __future__ import annotations
 
+import atexit
 import datetime
 import faulthandler
 import os
+import signal
 import sys
 import threading
+import time
 import traceback
 
 # ── C-level 崩潰記錄器 ───────────────────────────────────────────────────────
@@ -111,6 +114,109 @@ def _disable_app_nap() -> None:
         log.warning(f"APP_NAP: suppression failed - {e}")
 
 
+# ── Single-instance lockfile（v2.18.1 / 2026-05-25）──────────────────────────
+# v2.18.0 silent crash 根因：老 process 持有 NSEvent global hotkey monitor，
+# 新 process 啟動時 monitor 註冊衝突→ hang。
+# 解法：lockfile（pidfile）機制。啟動時若偵測舊 PID 還活著就 SIGTERM 它，
+# 3 秒後沒死再 SIGKILL，然後覆寫 pidfile 為自己 PID。atexit 清理。
+_PID_FILE = os.path.expanduser("~/.whisper_app/whisper_pro.pid")
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """用 signal 0 探測 PID 是否仍活著（不真的送訊號）。"""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _kill_stale_process(pid: int, timeout: float = 3.0) -> None:
+    """SIGTERM 舊 process，最多等 timeout 秒；沒死就 SIGKILL。"""
+    try:
+        log.warning(f"SINGLE_INSTANCE: stale PID {pid} alive — sending SIGTERM")
+        os.kill(pid, signal.SIGTERM)
+    except OSError as e:
+        log.warning(f"SINGLE_INSTANCE: SIGTERM PID {pid} failed: {e}")
+        return
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _is_pid_alive(pid):
+            log.info(f"SINGLE_INSTANCE: stale PID {pid} exited gracefully")
+            return
+        time.sleep(0.1)
+
+    # 還沒死 → SIGKILL
+    try:
+        log.warning(f"SINGLE_INSTANCE: PID {pid} did not exit in {timeout}s — sending SIGKILL")
+        os.kill(pid, signal.SIGKILL)
+    except OSError as e:
+        log.warning(f"SINGLE_INSTANCE: SIGKILL PID {pid} failed: {e}")
+
+
+def _remove_pid_file() -> None:
+    """atexit handler：清掉自己的 pidfile（只在 pidfile 內 PID 是自己時才刪）。"""
+    try:
+        if not os.path.exists(_PID_FILE):
+            return
+        with open(_PID_FILE, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        if content.isdigit() and int(content) == os.getpid():
+            os.remove(_PID_FILE)
+            log.info(f"SINGLE_INSTANCE: pidfile removed ({_PID_FILE})")
+    except Exception as e:
+        # atexit 不能拋例外
+        try:
+            log.warning(f"SINGLE_INSTANCE: pidfile cleanup failed: {e}")
+        except Exception:
+            pass
+
+
+def _acquire_single_instance_lock() -> None:
+    """確保只有一個 Whisper Pro instance 在跑。
+
+    - 讀 ~/.whisper_app/whisper_pro.pid
+    - 若 PID 存在且還活著 → SIGTERM（3s）→ SIGKILL
+    - 寫入自己的 PID
+    - 註冊 atexit 清理
+
+    任何 IO 失敗都只記 log 不拋例外（不能因為 lockfile 機制壞掉就讓 App 起不來）。
+    """
+    try:
+        os.makedirs(os.path.dirname(_PID_FILE), exist_ok=True)
+
+        # 讀舊 PID
+        if os.path.exists(_PID_FILE):
+            try:
+                with open(_PID_FILE, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content.isdigit():
+                    old_pid = int(content)
+                    if old_pid != os.getpid() and _is_pid_alive(old_pid):
+                        _kill_stale_process(old_pid)
+                    elif old_pid == os.getpid():
+                        log.debug(f"SINGLE_INSTANCE: pidfile already owned by us ({old_pid})")
+                    else:
+                        log.info(f"SINGLE_INSTANCE: stale pidfile (PID {old_pid} dead) — overwriting")
+                else:
+                    log.warning(f"SINGLE_INSTANCE: pidfile content invalid ({content!r}) — overwriting")
+            except Exception as e:
+                log.warning(f"SINGLE_INSTANCE: read pidfile failed: {e} — overwriting")
+
+        # 寫入自己的 PID（用 .tmp + replace 確保原子性）
+        tmp_path = _PID_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+        os.replace(tmp_path, _PID_FILE)
+        log.info(f"SINGLE_INSTANCE: lock acquired (PID={os.getpid()}, file={_PID_FILE})")
+
+        # 註冊 atexit 清理
+        atexit.register(_remove_pid_file)
+    except Exception as e:
+        log_error("single_instance_lock_failed", error=str(e))
+
+
 def _relaunch_app() -> bool:
     """重啟自己（v2.6.0 主題切換用）。
 
@@ -179,6 +285,11 @@ def main() -> None:
     # ── 0. 抑制 App Nap（Fix 6 Step 2 / 2026-05-22）────────────────────────
     # 必須在 mainloop 前呼叫；token 由 module-level _APP_NAP_TOKEN 強參照保留。
     _disable_app_nap()
+
+    # ── 0a. Single-instance lockfile（v2.18.1 / 2026-05-25）────────────────
+    # 防 user 雙擊 .app 時老 process 還在跑 → NSEvent monitor 衝突 silent hang。
+    # 若偵測到舊 PID 還活著就先把它幹掉，再寫自己的 PID。
+    _acquire_single_instance_lock()
 
     # ── 1. 套件依賴檢查 ──────────────────────────────────────────────────────
     missing = check_dependencies()
