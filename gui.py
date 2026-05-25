@@ -1882,26 +1882,53 @@ class AppWindow(ctk.CTkFrame):
     def _on_hotkey_tap(self) -> None:
         """主執行緒：快捷鍵 tap → 直接重用 chamber 按鈕的 toggle handler。
 
-        v2.16.1 background recording fix：
-          _transition_to_recording 內的 MiniHUD `deiconify()` 會讓 Tk 內部呼叫
-          `[NSApp activateIgnoringOtherApps:YES]` → macOS 把 Whisper Pro 標為
-          frontmost → 若 user 原本在另一個 Space 的全螢幕 app（如 Claude 全螢幕）、
-          macOS 強制把 user 切到 Whisper Pro 所在的 Space。對「背景錄音」UX 致命。
+        v2.16.2 background recording fix（v2.16.1 deactivate-only 不足、user 實測
+        仍 Space 切換）：
+          根因：_transition_to_recording 內的 MiniHUD `deiconify()` 會讓 Tk 內部
+          呼叫 `[NSApp activateIgnoringOtherApps:YES]` → macOS 排程 Space 切換
+          帶 user 到 Whisper Pro 所在 Space。單純 NSApp.deactivate() 是「被動」
+          動作、macOS 已經排程 Space switch 不會撤回。
 
-          修法：toggle 結束後立即 `NSApp.deactivate()` 撤回 active 狀態、把焦點
-          還給 user 原本的 frontmost app、不觸發 Space 切換。
+          v2.16.2 修法：主動「重新 activate user 原本的 app」（NSRunningApplication.
+          activateWithOptions_）。macOS 看到另一個 app 被 activate → 取消對我們
+          的 Space switch、留 user 在原 app/Space。
 
-          副作用：若 user 本來就在 Whisper Pro 視窗按熱鍵、會被 deactivate（焦點
-          跳走）。但 recording 仍正常進行（hotkey listener 是 global、不受影響）；
-          user 不會有重大干擾、且這個場景很罕見（多半 user 在別 app 用熱鍵）。
+          步驟：
+            1. _on_record_btn 之前 snapshot frontmost（NSWorkspace 50ns、不阻塞）
+            2. _on_record_btn 結束後 NSApp.deactivate() + 主動 prev_app.activate
+            3. 若 prev_app 是 self（Whisper Pro 已在前景）跳過、不要 self-deactivate
+
+          副作用（acceptable）：若 user 在 Whisper Pro 視窗按熱鍵但 frontmost
+          抓不到自己（osascript / NSWorkspace 抓到 dev shell）→ 會被 deactivate
+          → 焦點短暫跳走。罕見、recording 仍正常進行。
         """
+        # Snapshot frontmost app BEFORE 任何 UI / activation 動作
+        # （NSWorkspace.frontmostApplication() 是 in-process call、無 osascript 開銷）
+        prev_app = None
+        try:
+            from AppKit import NSWorkspace
+            app = NSWorkspace.sharedWorkspace().frontmostApplication()
+            if app:
+                name = (app.localizedName() or "")
+                # 排除自我（避免 self-reactivate 變成 no-op、或下方 deactivate 後反而把自己拉回來）
+                if "WhisperPro" not in name and "Whisper Pro" not in name:
+                    prev_app = app
+        except Exception:
+            log_error("hotkey_snapshot_frontmost_failed")
+
         log_action("hotkey_triggered_toggle", combo=self.cfg.hotkey, state=self._state)
         self._on_record_btn()
-        # 立即把 frontmost 還給 user 原本的 app（macOS 看 active flicker 不會
-        # 安排 Space 切換）
+
+        # 雙保險：deactivate 自己 + 主動 reactivate 原 app
+        # 後者是關鍵——macOS 看到另一個 app 被明確 activate 才會取消對我們的 Space switch
         try:
             from AppKit import NSApplication
             NSApplication.sharedApplication().deactivate()
+            if prev_app is not None:
+                # NSApplicationActivateAllWindows = 1 << 0 = 1（帶所有視窗回前）
+                # 0 表示不帶（更乾淨）；用 0 避免把 user app 額外視窗也拉前
+                prev_app.activateWithOptions_(0)
+                log.debug(f"BG_RECORD: re-activated '{prev_app.localizedName()}' to prevent Space switch")
         except Exception:
             log_error("nsapp_deactivate_failed")
 
