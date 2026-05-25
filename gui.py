@@ -236,6 +236,17 @@ class AppWindow(ctk.CTkFrame):
         self.ollama      = OllamaClient()
         # 用設定檔同步 Ollama 參數（base_url / model / enabled / timeout）
         self.ollama.apply_app_config(cfg)
+        # v2.18.0：Vertex AI Gemini polish client（雲端、duck-type 兼容 Ollama）
+        # lazy init、enabled 只在 polish_backend="vertex" 時 True
+        try:
+            from vertex_polish import VertexPolishClient
+            self.vertex = VertexPolishClient()
+            self.vertex.apply_app_config(cfg)
+        except Exception:
+            log_error("vertex_client_init_failed")
+            self.vertex = None
+        # polish 路由器：依 polish_backend 回對應 client（Ollama / Vertex / None）
+        self._refresh_polish_backend()
         self.hotkey_mgr  = HotkeyManager(
             on_tap_cb=self._hotkey_tap,
         )
@@ -1119,7 +1130,12 @@ class AppWindow(ctk.CTkFrame):
 
         def _polish_thread(text=text, idx=idx, gen=gen):
             try:
-                resp = self.ollama.process(
+                # v2.18.0：透過 self.polish router 自動路由到 Ollama / Vertex
+                # polish == None（backend=off）→ 跳過 streaming polish
+                client = self.polish
+                if client is None:
+                    return
+                resp = client.process(
                     text,
                     prompt_template=OLLAMA_POLISH_PROMPT,
                     dictionary_terms=dict_terms,
@@ -1443,7 +1459,9 @@ class AppWindow(ctk.CTkFrame):
                 tail_raw = llm_input[len(streamed_raw):] if len(llm_input) > len(streamed_raw) else ""
 
                 if tail_raw.strip():
-                    tail_resp = self.ollama.process(
+                    # v2.18.0：透過 polish router
+                    client = self.polish or self.ollama
+                    tail_resp = client.process(
                         tail_raw,
                         prompt_template=preset.resolve_prompt(),
                         dictionary_terms=dict_terms,
@@ -1471,7 +1489,9 @@ class AppWindow(ctk.CTkFrame):
                     preset_name=preset_name,
                 )
             else:
-                resp = self.ollama.process(
+                # v2.18.0：透過 polish router（Ollama / Vertex / fallback Ollama）
+                client = self.polish or self.ollama
+                resp = client.process(
                     llm_input,
                     prompt_template=preset.resolve_prompt(),
                     dictionary_terms=dict_terms,
@@ -2752,6 +2772,13 @@ class AppWindow(ctk.CTkFrame):
         )
         # Ollama 設定同步：把新 cfg 推給 client，然後重新非同步探測一次
         self.ollama.apply_app_config(cfg)
+        # v2.18.0：Vertex 設定同步 + polish backend router 更新
+        if self.vertex is not None:
+            try:
+                self.vertex.apply_app_config(cfg)
+            except Exception:
+                log_error("vertex_apply_app_config_failed")
+        self._refresh_polish_backend()
         self._refresh_ollama_health()
 
         # 字典：重新載入（可能 enabled 變了，或路徑變了）
@@ -3191,6 +3218,26 @@ class AppWindow(ctk.CTkFrame):
                 self.after(0, lambda: self._status_dot.configure(text_color=DANGER))
 
         threading.Thread(target=_load, daemon=True).start()
+
+    def _refresh_polish_backend(self) -> None:
+        """v2.18.0：依 cfg.polish_backend 設定 self.polish 指向 Ollama / Vertex。
+
+        - "local"  → self.polish = self.ollama
+        - "vertex" → self.polish = self.vertex
+        - "off"    → self.polish = None（_start_polish 會 short-circuit）
+
+        ollama_enabled / vertex 的 health_ok 仍由各自 client 管。
+        """
+        backend = getattr(self.cfg, "polish_backend", "local")
+        if backend == "vertex" and self.vertex is not None:
+            self.polish = self.vertex
+            log.info(f"POLISH: backend = vertex (model={self.cfg.vertex_model})")
+        elif backend == "off":
+            self.polish = None
+            log.info("POLISH: backend = off (no polish)")
+        else:
+            self.polish = self.ollama
+            log.info(f"POLISH: backend = local Ollama (model={self.cfg.ollama_model})")
 
     def _mlx_keepalive_tick(self) -> None:
         """v2.17.4：每 5 分鐘背景跑一次 dummy ASR、防 MLX weights 被 swap。

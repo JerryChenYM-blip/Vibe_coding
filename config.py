@@ -146,6 +146,19 @@ class Config:
     # 改變後立即套用（不需重啟），下一個 render tick 生效
     reduce_motion_pref: str = "auto"
 
+    # ── v2.18.0 Polish backend 選擇（本地 Ollama / 雲端 Vertex AI Gemini）─
+    # "local"  = Ollama（地端 GPU、隱私 100% 本地、~5s warm、會 thermal throttle）
+    # "vertex" = Google Vertex AI Gemini（雲端、不佔本地 GPU、~3-10s 含網路、需 GCP 帳號）
+    # "off"    = 完全不潤飾、ASR 原文直接貼
+    polish_backend: str = "local"
+
+    # ── v2.18.0 Vertex AI Gemini 設定（polish_backend="vertex" 時才用）────
+    # 認證走 ADC（Application Default Credentials）—— user 跑
+    # `gcloud auth application-default login` 一次即可
+    vertex_project_id: str = ""                  # GCP project（必填）
+    vertex_location:   str = "us-central1"       # Vertex region
+    vertex_model:      str = "gemini-2.5-flash"  # / pro / flash-lite
+
     # ── v2.14.0 中文字體變體（Qwen3-ASR 配套）─────────────────────────────
     # Qwen3-ASR 預設輸出簡體中文，opencc 後處理轉繁體：
     #   "traditional_tw" = 轉繁體 + 台灣慣用語（s2twp、推薦、預設）
