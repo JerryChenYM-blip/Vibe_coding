@@ -357,6 +357,9 @@ class AppWindow(ctk.CTkFrame):
         self.after(1500, self._warmup_model)
         # 開啟著的話再去探 Ollama；即使 Ollama 離線也不會卡 UI 建構。
         self.after(2000, self._refresh_ollama_health)
+        # v2.17.1：Ollama 預載 model 進 VRAM（背景 thread、不卡 UI）
+        # 配合 keep_alive=-1、模型載入後永久駐留、user 第一次用就快
+        self.after(2500, self._warmup_ollama)
 
         # #4 字典：初次載入並餵給 Transcriber
         self._reload_dictionary()
@@ -3146,6 +3149,35 @@ class AppWindow(ctk.CTkFrame):
                 log_error("warmup_failed", model=model)
                 self.after(0, lambda: self._status_label.configure(text="  模型載入失敗"))
                 self.after(0, lambda: self._status_dot.configure(text_color=DANGER))
+
+        threading.Thread(target=_load, daemon=True).start()
+
+    def _warmup_ollama(self) -> None:
+        """v2.17.1：背景預載 Ollama polish model 進 VRAM。
+
+        延遲 2.5s 跑（避開 Whisper warmup 跟 health_check）、用獨立 thread。
+        Ollama 沒裝 / 沒啟動 / 模型沒下載：silent fail、user 第一次 polish
+        仍會等 cold load（fallback 體驗、不會崩）。
+
+        配合 _OLLAMA_KEEP_ALIVE=-1：模型載入後永久駐留 VRAM、user 用任何
+        polish 都不會 cold load。
+        """
+        if not self.cfg.ollama_enabled:
+            return
+        log.info(f"OLLAMA_WARMUP: starting for model={self.cfg.ollama_model}")
+
+        def _load():
+            try:
+                ok = self.ollama.warmup()
+                if ok:
+                    log.info("OLLAMA_WARMUP: complete (model loaded into VRAM, persistent)")
+                else:
+                    log.warning(
+                        "OLLAMA_WARMUP: failed (Ollama not running or model missing) — "
+                        "polish 第一次使用會 cold load"
+                    )
+            except Exception:
+                log_error("ollama_warmup_failed")
 
         threading.Thread(target=_load, daemon=True).start()
 

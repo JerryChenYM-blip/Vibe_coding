@@ -46,10 +46,15 @@ _POLISH_OPTIONS_BASE: dict = {
     "top_p":       0.9,
 }
 
-# v2.13.0：Ollama keep_alive — 模型載入 VRAM 後保留多久。
-# Ollama 預設 5 分鐘，user 反映「使用後 GPU 一路高負載」其實是 VRAM 佔用，
-# compute 為 0。縮成 "2m" — 連續使用仍快、停止 2 分鐘後釋放 ~12GB VRAM。
-_OLLAMA_KEEP_ALIVE = "2m"
+# v2.17.1：Ollama keep_alive — 模型載入 VRAM 後保留多久。
+# 改回 "-1"（永久駐留、直到 Ollama daemon 重啟或我們明確 unload）。
+# 理由：user 反映「2m 後再用要重 cold load、polish 變慢」。VRAM 佔用 ~3GB
+# （qwen3.5:4b）user 不介意（平常 GPU 沒在用）。改 -1 後：
+#   • App 啟動 → 一次 warmup 預載 model 進 VRAM
+#   • 後續所有 polish 都直接從 VRAM 推論、不會 cold load
+#   • App 關閉時 OllamaClient.unload() 主動釋放（cleanup）
+# 歷史：v2.13.0 曾改 "2m"、user 體感連續使用後 cold load 太慢、v2.17.1 改回 -1。
+_OLLAMA_KEEP_ALIVE = "-1"
 
 # health check 用較短 timeout
 _HEALTH_TIMEOUT_SEC = 1.5
@@ -134,6 +139,76 @@ class OllamaClient:
             if (time.monotonic() - self._health_cached_at) > self.HEALTH_TTL_SEC:
                 return None
             return self._health_ok
+
+    def warmup(self) -> bool:
+        """v2.17.1：App 啟動時呼叫、預載 Ollama 模型進 VRAM。
+
+        作法：發一個 minimal /api/generate request（1 token、prompt 最短）。
+        Ollama 收到 request → 自動把 model 載入 VRAM → 配上 keep_alive=-1
+        保證後續永久駐留。
+
+        典型耗時：3-15s（看 model 大小與磁碟速度）。
+        失敗（Ollama 沒跑 / 沒裝模型 / 網路斷）：silent fail、log warning。
+        返回：True = warmup 成功、False = 失敗（user 第一次 polish 仍會慢）。
+        """
+        if not self.config.enabled or not self.config.model:
+            return False
+        t0 = time.time()
+        try:
+            payload = {
+                "model":      self.config.model,
+                "prompt":     ".",   # 最短 prompt
+                "stream":     False,
+                "options":    {"num_predict": 1, "temperature": 0},
+                "keep_alive": _OLLAMA_KEEP_ALIVE,
+                "think":      False,
+            }
+            resp = self._session.post(
+                f"{self.config.base_url}/api/generate",
+                json=payload,
+                timeout=60,   # 寬鬆 timeout、cold load 大模型可能要 ~30s
+            )
+            elapsed = time.time() - t0
+            if resp.status_code == 200:
+                log.info(
+                    f"OLLAMA: warmup complete (model={self.config.model}, "
+                    f"{elapsed:.2f}s, keep_alive={_OLLAMA_KEEP_ALIVE})"
+                )
+                return True
+            else:
+                log.warning(
+                    f"OLLAMA: warmup failed status={resp.status_code} "
+                    f"body={resp.text[:200]}"
+                )
+                return False
+        except Exception as e:
+            log.warning(f"OLLAMA: warmup exception ({type(e).__name__}: {e})")
+            return False
+
+    def unload(self) -> bool:
+        """v2.17.1：App 關閉時呼叫、明確釋放 Ollama VRAM。
+
+        作法：keep_alive=0 的 minimal request → Ollama 立即 unload 模型。
+        失敗 silent，user 不會被影響（Ollama daemon 重啟也會釋放）。
+        """
+        if not self.config.enabled or not self.config.model:
+            return False
+        try:
+            payload = {
+                "model":      self.config.model,
+                "prompt":     "",
+                "stream":     False,
+                "keep_alive": 0,   # 立即 unload
+            }
+            self._session.post(
+                f"{self.config.base_url}/api/generate",
+                json=payload,
+                timeout=5,
+            )
+            log.info(f"OLLAMA: unload requested (model={self.config.model})")
+            return True
+        except Exception:
+            return False
 
     def health_check_sync(self) -> bool:
         if not self.config.enabled:
