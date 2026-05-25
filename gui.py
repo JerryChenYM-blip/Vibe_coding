@@ -169,6 +169,13 @@ class AppWindow(ctk.CTkFrame):
     # 5 秒：權衡 detect latency 與 µs 級檢查成本。
     HOTKEY_WATCHDOG_INTERVAL_MS = 5000
 
+    # v2.17.4：定期跑 dummy ASR 防 MLX weights 被 macOS swap out。
+    # 實機觀察：35 分鐘閒置後第一次 ASR 從 RTF 0.2 飆到 4.85（24x 慢）—— macOS
+    # 把 3.4GB Qwen3-ASR weights page out 到磁碟、首次推論要 page-in。
+    # 5 分鐘背景跑一次 1.5s sine wave 保活、強迫 weights 留在 active page。
+    # 只在 state=idle 跑（避免跟 user 的 transcribe 撞 lock）。
+    MLX_KEEPALIVE_INTERVAL_MS = 5 * 60 * 1000   # 5 分鐘
+
     # Fix 18 / 2026-05-23（Layer 2）：每 N 毫秒無條件 force-restart NSEvent monitor。
     # 即使 monitor 物件還 alive、其底層 ObjC block 仍可能在閒置 1hr+ 後被 invalidate
     # 而 watchdog 偵測不到（_monitor_global is not None 仍成立）。10 分鐘是
@@ -360,6 +367,9 @@ class AppWindow(ctk.CTkFrame):
         # v2.17.1：Ollama 預載 model 進 VRAM（背景 thread、不卡 UI）
         # 配合 keep_alive=-1、模型載入後永久駐留、user 第一次用就快
         self.after(2500, self._warmup_ollama)
+        # v2.17.4：定期跑 dummy ASR 保活 MLX weights（防 macOS swap out）
+        # 第一次 5 分鐘後跑、之後 each tick 自己排程下次
+        self.after(self.MLX_KEEPALIVE_INTERVAL_MS, self._mlx_keepalive_tick)
 
         # #4 字典：初次載入並餵給 Transcriber
         self._reload_dictionary()
@@ -1721,13 +1731,43 @@ class AppWindow(ctk.CTkFrame):
     # ═══════════════════════════════════════════════════════════════════════
 
     def _render_tick(self) -> None:
-        """主渲染迴圈——每 50ms 執行一次，負責 Chamber Canvas 的全部繪製。"""
+        """主渲染迴圈——動態 tick rate、依 state + 視窗可見性節省 CPU。
+
+        v2.17.3：原本固定 50ms (20 FPS)、閒置 + 視窗最小化時仍狂吃 CPU
+        （user 實機看到 Whisper Pro 閒置 33% CPU）。改成：
+          • idle + 視窗 iconic/withdrawn → 1000ms（看不到、最低 1 FPS）
+          • idle + 視窗顯示 + reduce_motion → 500ms（呼吸週期 6s、肉眼無感）
+          • idle + 視窗顯示 + 動畫開 → 200ms（5 FPS、呼吸還是平滑）
+          • recording → 50ms（RMS 電平要 20 FPS）
+          • processing → 50ms（12 格旋轉、20 FPS）
+
+        預期 CPU 改善：idle 33% → 5-10%。
+        """
         try:
             self._draw_chamber()
         except tk.TclError:
             # App 關閉時 Canvas 已被銷毀，靜默結束迴圈
             return
-        self.after(RENDER_TICK_MS, self._render_tick)
+
+        # 動態 interval 選擇
+        state = self._state
+        if state == "recording" or state == "processing":
+            tick = RENDER_TICK_MS   # 50ms = 20 FPS（要看到 RMS / 旋轉）
+        else:
+            # idle 狀態：依視窗可見性 + 動畫偏好降頻
+            try:
+                wm_state = self.winfo_toplevel().wm_state()
+                window_visible = wm_state == "normal"
+            except Exception:
+                window_visible = True   # 取不到視窗狀態安全假設可見
+            if not window_visible:
+                tick = 1000   # 看不到、1 FPS 撐著就好
+            elif self._reduce_motion:
+                tick = 500    # reduce-motion 偏好 → 大幅降頻
+            else:
+                tick = 200    # 一般 idle → 5 FPS（呼吸 6s 週期仍平滑）
+
+        self.after(tick, self._render_tick)
 
     def _draw_chamber(self) -> None:
         """Render ambient rings + central disc + icon for the current state."""
@@ -3151,6 +3191,39 @@ class AppWindow(ctk.CTkFrame):
                 self.after(0, lambda: self._status_dot.configure(text_color=DANGER))
 
         threading.Thread(target=_load, daemon=True).start()
+
+    def _mlx_keepalive_tick(self) -> None:
+        """v2.17.4：每 5 分鐘背景跑一次 dummy ASR、防 MLX weights 被 swap。
+
+        實機觀察：閒置 35 分鐘後第一次 ASR RTF 從 0.2 飆到 4.85（24x 慢）。
+        macOS 把 3.4GB MLX weights 當作「不常用」page out 到 swap、首次推論
+        要從磁碟 page in 全部權重。
+
+        修法：每 5 分鐘背景跑一次 1.5s sine wave 推論（沿用 transcriber.warmup
+        既有路徑）、強迫 macOS VM 把 weights 留在 active page。
+
+        Guard：
+          • state != idle → 跳過（避免跟 user transcribe 撞 _transcription_lock）
+          • Qwen3-ASR session 還沒載入 → 跳過（不需要的 warmup）
+          • 失敗 silent、log warning
+        """
+        try:
+            if self._state == "idle":
+                model = self._model_var.get()
+                # 只對已載入的模型 keepalive（轉錄 lock 內、不撞用戶操作）
+                def _ping():
+                    try:
+                        # 沿用 transcriber.warmup() — 跑 1.5s sine wave
+                        self.transcriber.warmup(model)
+                        log.debug(f"MLX_KEEPALIVE: ping done (model={model})")
+                    except Exception:
+                        log_error("mlx_keepalive_ping_failed", model=model)
+                threading.Thread(target=_ping, daemon=True).start()
+        except Exception:
+            log_error("mlx_keepalive_tick_failed")
+        finally:
+            # 永遠重新排程下次（即使這次失敗）
+            self.after(self.MLX_KEEPALIVE_INTERVAL_MS, self._mlx_keepalive_tick)
 
     def _warmup_ollama(self) -> None:
         """v2.17.1：背景預載 Ollama polish model 進 VRAM。
