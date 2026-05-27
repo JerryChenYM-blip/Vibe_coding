@@ -28,6 +28,66 @@ from logger import get_logger, log_error
 
 log = get_logger("transcriber")
 
+# v2.19.0：observation hooks — audit JSONL + pipeline_id event + suspicious audio capture。
+# 模組未就緒時（Agent N 並行開發中）整段 import 失敗 → noop 取代、絕不影響轉錄。
+try:
+    import audit_log as _audit_log
+except Exception:
+    _audit_log = None
+try:
+    import pipeline_id as _pipeline_id
+except Exception:
+    _pipeline_id = None
+
+
+def _safe_pipeline_id() -> str:
+    """安全取 current pipeline ID；模組缺席或拋例外都回空字串。"""
+    if _pipeline_id is None:
+        return ""
+    try:
+        return _pipeline_id.get_current() or ""
+    except Exception:
+        return ""
+
+
+def _safe_pipeline_event(event_name: str, **fields) -> None:
+    """安全發 pipeline 事件；模組缺席或拋例外都吞掉。"""
+    if _pipeline_id is None:
+        return
+    try:
+        _pipeline_id.event(event_name, **fields)
+    except Exception:
+        pass
+
+
+def _audio_quality(audio) -> dict:
+    """算 peak / rms / 前後 500ms RMS / clipping ratio。
+
+    所有回傳值都用內建 float，已為 JSON 序列化做好準備。
+    Empty audio 回 0 值字典（避免上層分支）。
+    """
+    import numpy as np
+    if audio is None or audio.size == 0:
+        return {
+            "peak": 0.0, "rms": 0.0,
+            "rms_first_500ms": 0.0, "rms_last_500ms": 0.0,
+            "clipping_ratio": 0.0,
+            "samples": 0, "duration_s": 0.0,
+        }
+    peak = float(np.abs(audio).max())
+    rms = float(np.sqrt(np.mean(audio ** 2)))
+    head_n = min(8000, len(audio))
+    tail_n = min(8000, len(audio))
+    rms_head = float(np.sqrt(np.mean(audio[:head_n] ** 2)))
+    rms_tail = float(np.sqrt(np.mean(audio[-tail_n:] ** 2)))
+    clip = float((np.abs(audio) > 0.95).sum()) / len(audio)
+    return {
+        "peak": peak, "rms": rms,
+        "rms_first_500ms": rms_head, "rms_last_500ms": rms_tail,
+        "clipping_ratio": clip,
+        "samples": int(len(audio)), "duration_s": float(len(audio) / 16_000),
+    }
+
 
 # ── 後端偵測 ──────────────────────────────────────────────────────────────────
 
@@ -48,6 +108,31 @@ def _detect_backend() -> str:
 
 # 模組載入時偵測一次，整個 session 共用
 BACKEND = _detect_backend()
+
+
+def _detect_mlx_whisper_kwargs() -> set[str]:
+    """v2.19.0：偵測這台機器上的 mlx_whisper.transcribe 支援哪些 kwargs。
+
+    取代以前「全丟、TypeError 再 fallback」的盲試法——萬一加新 kwarg
+    （例：hallucination_silence_threshold）不被支援，會把 temperature=0 /
+    condition_on_previous_text=False 連坐 fallback 掉，導致退步。
+
+    回傳 mlx_whisper.transcribe 的所有 parameter 名稱（set）；BACKEND != mlx
+    或偵測失敗時回空 set（呼叫端用 `kw in _MLX_WHISPER_KWARGS` 一律 False、
+    走最保守 path）。
+    """
+    if BACKEND != "mlx":
+        return set()
+    try:
+        import inspect
+        import mlx_whisper
+        sig = inspect.signature(mlx_whisper.transcribe)
+        return set(sig.parameters.keys())
+    except Exception:
+        return set()
+
+
+_MLX_WHISPER_KWARGS = _detect_mlx_whisper_kwargs()
 
 # faster-whisper 模型名稱 → mlx-community HuggingFace 倉庫 ID 的映射
 # 注意：tiny/base 的 `mlx-community/whisper-tiny`、`whisper-base` repo 已於
@@ -148,8 +233,17 @@ def _apply_opencc(text: str, variant: str) -> str:
 # ── 靜音偵測與幻覺防護 ────────────────────────────────────────────────────────
 
 # 最小 RMS 閾值：低於此值視為靜音，跳過推論。
-# 0.002 是實測下限：可抓「嗯」「好」等短促輕音；再低就會把真靜音也送進去引發幻覺。
-_MIN_RMS = 0.002
+# v2.19.0：0.002 → 0.004（從 -54 dBFS 收緊到 -48 dBFS）。
+#   原因：實機 log 看到 0.002 漏掉「peak ~0.005 純底噪」案例，這類音檔被送進
+#   Qwen3-ASR 後觸發字典 dump（00:42:02：「Qwen3-ASR Qwen3 Qwen Large V3...」）。
+#   _normalize_volume 對 peak < 0.005 不會 boost，所以 RMS 仍會落在 0.001-0.003
+#   區間 → 漏網。0.004 對「嗯」「好」等輕音仍可抓住（這類經正規化後 RMS ≥ 0.05）。
+_MIN_RMS = 0.004
+
+# v2.19.0：最小音檔長度（秒）— 短於此值視為「使用者誤觸 hotkey」、直接 short-circuit。
+# 不送 ASR 避免模型對 <0.4s 片段亂編（streaming 最後一個 chunk + tail padding
+# 常落在 0.2-0.4s 區間、是字典 dump / 假新詞 / 重複病 三隻幻覺的高發地帶）。
+_MIN_DURATION_S = 0.4
 
 # 已知 Whisper 幻覺字串（模型在靜音或噪音上常輸出這些）
 # 比對時不分大小寫、去除空白
@@ -248,6 +342,42 @@ def _is_repetitive(text: str) -> bool:
     return False
 
 
+# v2.19.0：n-gram 連續重複 dedupe（中度退化、整段砍嫌過火）
+# _is_repetitive 抓 ≥ 8 次「整段都壞掉」的極端案例（整段砍）。
+# 本函式抓 3-7 次的「**局部重複**」——只砍重複部分、其他句子保留。
+#
+# 實機證據（00:42:02 + 01:01:33）：
+#   「全自動、自行、自行。」  ← 「自行」連 2 次，要砍成「全自動、自行。」
+#   「麥克風測試 麥克風測試 麥克風測試」← 4-7 字 unit 重複 3+ 次
+#
+# 風險控管：unit_len 只試 2-5（不試 1，避免砍「好好好」這類強調）；
+#         需要至少 3 次連續重複才觸發（2 次重複可能是合法強調）。
+import re as _re_for_dedupe   # 避免汙染模組級命名空間
+_DEDUPE_PATTERNS = [
+    _re_for_dedupe.compile(
+        r'(.{' + str(unit_len) + r'})((?:[、,，。\s]?\1){2,})'
+    )
+    for unit_len in (5, 4, 3, 2)   # 先試長 unit 避免子串先 match
+]
+
+
+def _dedupe_repetitive_ngrams(text: str) -> str:
+    """砍掉「2-5 字 unit 連續重複 ≥ 3 次」的退化輸出，保留首次出現。
+
+    例：
+      「全自動、自行、自行、自行」→「全自動、自行」
+      「測試 測試 測試 OK」→「測試 OK」
+      「我我我」→ 不動（unit_len=1 不檢查）
+      「我會、我會」→ 不動（只重複 2 次、未達 3 次）
+    """
+    if not text or len(text) < 6:
+        return text
+    out = text
+    for pattern in _DEDUPE_PATTERNS:
+        out = pattern.sub(r'\1', out)
+    return out
+
+
 def _normalize_volume(audio, target_peak: float = 0.9, min_peak: float = 0.5):
     """若音訊峰值過小（<min_peak）則線性放大到 target_peak。
 
@@ -306,6 +436,20 @@ class Transcriber:
         #         切換時 _ensure_qwen3_session 會卸載舊的、避免 RAM 翻倍
         self._qwen3_session = None
         self._qwen3_loaded_model: Optional[str] = None
+        # v2.19.0：可疑音檔保留開關（由 gui.py 套用 config 時呼叫 setter）。
+        # 預設關閉、避免新使用者意外累積大量音檔。
+        self._suspicious_capture_enabled: bool = False
+        self._suspicious_max_mb: int = 200
+
+    def set_suspicious_capture(self, enabled: bool, max_mb: int = 200) -> None:
+        """v2.19.0：設定可疑音檔是否保留落地。
+
+        由 gui.py 在啟動 / 套用 config 時呼叫；transcribe() 偵測到字典 dump /
+        blacklist hit / dedupe triggered / RTF slow 時、會把原始音檔存到
+        ~/.whisper_app/suspicious_audio/。
+        """
+        self._suspicious_capture_enabled = bool(enabled)
+        self._suspicious_max_mb = int(max_mb) if max_mb else 200
 
     def set_dictionary_terms(self, terms: list[str]) -> None:
         """更新個人字典術語列表，下次 transcribe() 時注入 initial_prompt。
@@ -365,9 +509,22 @@ class Transcriber:
         """
         import numpy as np
 
+        # v2.19.0：transcribe 入口先抓 pipeline_id（每個 return path 都用到）
+        pid = _safe_pipeline_id()
+
         # 空音訊：立即回傳錯誤訊息，不進行推論
         if audio is None or len(audio) == 0:
             log.error("WHISPER: Empty audio buffer received.")
+            # v2.19.0：仍寫一筆 audit（便於統計使用者誤觸頻率）
+            self._emit_audit(
+                pid=pid, model_size=model_size, language=language,
+                quality={"peak": 0.0, "rms": 0.0, "rms_first_500ms": 0.0,
+                         "rms_last_500ms": 0.0, "clipping_ratio": 0.0,
+                         "samples": 0, "duration_s": 0.0},
+                duration=0.0, backend=BACKEND, result=None,
+                dict_terms_snapshot=[], gate_short=False, gate_silent=False,
+                error="empty_audio",
+            )
             return TranscriptionResult(
                 text="（沒有偵測到音訊，請確認麥克風是否正常運作）",
                 language="", duration_seconds=0.0, elapsed_seconds=0.0,
@@ -377,6 +534,10 @@ class Transcriber:
         audio = audio.astype(np.float32)
         if audio.max() > 1.0:
             audio = audio / 32768.0   # int16 最大值，還原到 [-1, 1]
+
+        # v2.19.0：在 _normalize_volume 之前先抓 audio quality
+        # ——之後抓會被加分（peak boost 後 rms 也會跟著拉高）、無法反映原始品質
+        quality = _audio_quality(audio)
 
         # 音量自動正規化：小聲說話時避免 VAD 把整段判為靜音
         pre_peak = float(np.abs(audio).max()) if audio.size else 0.0
@@ -393,6 +554,31 @@ class Transcriber:
             f"WHISPER: Starting transcription. Backend={BACKEND}, Model={model_size}, "
             f"Lang={language}, AudioDuration={duration:.2f}s"
         )
+        _safe_pipeline_event(
+            "transcribe_start", backend=BACKEND, model=model_size,
+            duration_s=duration, language=language or "",
+        )
+
+        # v2.19.0：長度閘 — 過短音檔直接 short-circuit，不送 ASR。
+        # 0.4s 以下通常是 hotkey 誤觸 / streaming 殘餘 chunk，送進去會觸發
+        # 字典 dump、假新詞、重複病三類幻覺。
+        if duration < _MIN_DURATION_S:
+            log.info(
+                f"WHISPER: Guard - Audio duration={duration:.2f}s < {_MIN_DURATION_S}s, "
+                f"skipping inference (too short, likely accidental trigger)."
+            )
+            self._emit_audit(
+                pid=pid, model_size=model_size, language=language,
+                quality=quality, duration=duration, backend=BACKEND,
+                result=None, dict_terms_snapshot=[],
+                gate_short=True, gate_silent=False,
+                elapsed=time.perf_counter() - t0,
+            )
+            return TranscriptionResult(
+                text="（未偵測到語音內容）",
+                language="", duration_seconds=duration,
+                elapsed_seconds=time.perf_counter() - t0,
+            )
 
         # 靜音防護：能量太低就直接跳過，避免觸發幻覺
         if _is_silence(audio):
@@ -401,6 +587,13 @@ class Transcriber:
             log.info(
                 f"WHISPER: Guard - Audio peak={_peak:.6f} rms={_rms:.6f} "
                 f"below threshold={_MIN_RMS} (duration={duration:.2f}s), skipping inference."
+            )
+            self._emit_audit(
+                pid=pid, model_size=model_size, language=language,
+                quality=quality, duration=duration, backend=BACKEND,
+                result=None, dict_terms_snapshot=[],
+                gate_short=False, gate_silent=True,
+                elapsed=time.perf_counter() - t0,
             )
             return TranscriptionResult(
                 text="（未偵測到語音內容）",
@@ -413,6 +606,9 @@ class Transcriber:
         # 拿到不一致字典，或 MLX → CTranslate fallback 時兩個後端用不同字典。
         dict_terms_snapshot = self._snapshot_dictionary_terms()
 
+        # v2.19.0：實際走的 backend（fallback 後會改、影響 audit 與可疑音檔 metadata）
+        actual_backend = "qwen3-asr" if _is_qwen3_model(model_size) else BACKEND
+
         # v2.14.0：Qwen3-ASR 走獨立 backend（與 Whisper 不同套件、無 CTranslate fallback）
         if _is_qwen3_model(model_size):
             if BACKEND != "mlx":
@@ -420,6 +616,14 @@ class Transcriber:
                 log.warning(
                     "WHISPER: Qwen3-ASR 需要 Apple Silicon MLX；"
                     f"當前 backend={BACKEND}、無法執行"
+                )
+                self._emit_audit(
+                    pid=pid, model_size=model_size, language=language,
+                    quality=quality, duration=duration, backend="qwen3-asr",
+                    result=None, dict_terms_snapshot=dict_terms_snapshot,
+                    gate_short=False, gate_silent=False,
+                    elapsed=time.perf_counter() - t0,
+                    error="qwen3_requires_mlx",
                 )
                 return TranscriptionResult(
                     text="（Qwen3-ASR 需要 Apple Silicon MLX、請於設定切回 large-v3-turbo）",
@@ -430,12 +634,20 @@ class Transcriber:
                 result = self._transcribe_qwen3(
                     audio, model_size, language, dict_terms_snapshot, chinese_variant
                 )
-            except Exception:
+            except Exception as exc:
                 # Qwen3 無 fallback path、user 重試或切回 Whisper
                 log_error("qwen3_backend_failed", model=model_size)
                 log.error(
                     "WHISPER: Qwen3-ASR 失敗、無 fallback；"
                     "user 須重試或於設定切回 large-v3-turbo"
+                )
+                self._emit_audit(
+                    pid=pid, model_size=model_size, language=language,
+                    quality=quality, duration=duration, backend="qwen3-asr",
+                    result=None, dict_terms_snapshot=dict_terms_snapshot,
+                    gate_short=False, gate_silent=False,
+                    elapsed=time.perf_counter() - t0,
+                    error=f"qwen3_failed:{type(exc).__name__}",
                 )
                 return TranscriptionResult(
                     text="（Qwen3-ASR 轉錄失敗、請重試或於設定切回 large-v3-turbo）",
@@ -446,10 +658,14 @@ class Transcriber:
         elif BACKEND == "mlx":
             try:
                 result = self._transcribe_mlx(audio, model_size, language, dict_terms_snapshot)
-            except Exception:
+            except Exception as exc:
                 # MLX 失敗時降級到 CPU，確保功能不中斷
                 log_error("mlx_backend_failed", model=model_size)
-                log.warning("WHISPER: Falling back to CPU CTranslate2 backend.")
+                log.warning(
+                    f"WHISPER: Falling back to CPU CTranslate2 backend "
+                    f"(reason={type(exc).__name__})."
+                )
+                actual_backend = "ctranslate"   # fallback 後 backend 改變
                 result = self._transcribe_ctranslate(audio, model_size, language, dict_terms_snapshot)
         else:
             result = self._transcribe_ctranslate(audio, model_size, language, dict_terms_snapshot)
@@ -468,11 +684,19 @@ class Transcriber:
                 f"可能 fallback chain 觸發或硬體瓶頸；若反覆出現請回報。"
             )
 
+        # v2.19.0：保留 ASR raw_text（未過任何 filter）用於 audit
+        raw_text = result.text
+
         # 幻覺過濾：優先逐段過濾（保留合法段），沒 segments 資訊才退回整段檢查
         # v2.16.3：Qwen3-ASR 特有：context= 字典詞表整段被當成輸出（短 tail
         # 音檔 + 底噪觸發）。額外用 _is_dict_terms_hallucination 抓這 pattern。
         def _is_any_hallucination(text: str) -> bool:
             return _is_hallucination(text) or _is_dict_terms_hallucination(text, dict_terms_snapshot)
+
+        # v2.19.0：追蹤過濾結果（給 audit / 可疑音檔判定）
+        hallucination_removed = 0
+        dict_dump_detected = False
+        blacklist_hit = False
 
         if result.segments:
             kept = [
@@ -481,26 +705,45 @@ class Transcriber:
             ]
             removed = len(result.segments) - len(kept)
             if removed > 0:
+                hallucination_removed = removed
                 log.warning(
                     f"WHISPER: Guard - Removed {removed}/{len(result.segments)} "
                     f"hallucination segment(s), kept {len(kept)}."
                 )
+                # 被砍的 segments 中若有任一是 dict-dump / blacklist → 旗標起來
+                for s in result.segments:
+                    if s not in kept:
+                        t = s.get("text", "").strip()
+                        if _is_dict_terms_hallucination(t, dict_terms_snapshot):
+                            dict_dump_detected = True
+                        if _is_hallucination(t):
+                            blacklist_hit = True
                 result.segments = kept
                 if kept:
                     result.text = "".join(s["text"].strip() for s in kept).strip()
                 else:
                     result.text = "（未偵測到語音內容）"
         elif _is_any_hallucination(result.text):
+            dict_dump_detected = _is_dict_terms_hallucination(result.text, dict_terms_snapshot)
+            blacklist_hit = _is_hallucination(result.text)
             log.warning(
                 f"WHISPER: Guard - Detected hallucination "
-                f"(dict-terms type={_is_dict_terms_hallucination(result.text, dict_terms_snapshot)}): "
+                f"(dict-terms type={dict_dump_detected}): "
                 f"'{result.text[:50]}...'"
             )
             result.text = "（未偵測到語音內容）"
 
+        # v2.19.0：追蹤 dedupe 之後的文字（給 audit 「after_dedupe」欄位）
+        # 注意：「after_dedupe」實際是「過幻覺 filter 之後、跑 dedupe 之前」的文字
+        # 因為 dedupe 在 corrections 之後跑。命名上我們把「整個 post-asr 中間狀態」
+        # 看作 dedupe＋corrections 一組、audit schema 用 after_dedupe / after_corrections
+        # 表達跑完各步驟後的快照。
+        after_hallucination = result.text
+
         # v2.13.0：規則式校正（< 1ms）— Whisper 系統性誤辨識（Cloud Code → Claude Code 等）
         # 走純字串替換，不需 LLM 推理。讀 ~/.whisper_app/dictionary.json 的 corrections 段。
         # 在 polish 之前套用 → 即使 polish 關閉、原文也已校正；polish 開啟也少做事。
+        corrections_count = 0
         try:
             from dictionary import load_corrections, apply_corrections
             corrections = load_corrections()
@@ -508,6 +751,7 @@ class Transcriber:
                 before = result.text
                 result.text = apply_corrections(result.text, corrections)
                 if before != result.text:
+                    corrections_count = len(corrections)
                     log.info(
                         f"WHISPER: applied {len(corrections)} corrections"
                         f" (len {len(before)}→{len(result.text)})"
@@ -515,11 +759,194 @@ class Transcriber:
         except Exception:
             log_error("apply_corrections_failed")
 
+        after_corrections = result.text
+
+        # v2.19.0：n-gram 連續重複砍除（局部 dedupe）
+        # 在 corrections 之後跑——corrections 改完詞才測重複；否則「Cloud Cloud Cloud」
+        # 會先被砍成「Cloud」、apply_corrections 才有機會修「Cloud → Claude」。
+        dedupe_hit = False
+        if result.text and not result.text.startswith("（"):
+            before = result.text
+            result.text = _dedupe_repetitive_ngrams(result.text)
+            if before != result.text:
+                dedupe_hit = True
+                log.info(
+                    f"WHISPER: n-gram dedupe (len {len(before)}→{len(result.text)}): "
+                    f"'{before[:60]}...' → '{result.text[:60]}...'"
+                )
+
         # 記錄轉錄結果（前 100 字，方便未來 debug hallucination / 準確度）
         preview = result.text[:100].replace("\n", " ")
         log.info(f"WHISPER: Result (lang={result.language}) text='{preview}'")
 
+        # v2.19.0：寫 audit JSONL（成功路徑、最完整）
+        self._emit_audit(
+            pid=pid, model_size=model_size, language=language,
+            quality=quality, duration=duration, backend=actual_backend,
+            result=result, dict_terms_snapshot=dict_terms_snapshot,
+            gate_short=False, gate_silent=False,
+            elapsed=result.elapsed_seconds,
+            raw_text=raw_text, after_dedupe=after_hallucination,
+            after_corrections=after_corrections,
+            dedupe_hit=dedupe_hit, corrections_count=corrections_count,
+            hallucination_segments_removed=hallucination_removed,
+            dict_dump_detected=dict_dump_detected,
+        )
+
+        # v2.19.0：可疑音檔保留（在 audit 寫完後才做、避免兩者互相干擾）。
+        # 觸發條件四選一：dict-dump / blacklist hit / dedupe triggered / RTF > 1.5。
+        self._maybe_save_suspicious_audio(
+            audio=audio, pid=pid, model_size=model_size,
+            duration=duration, rtf=rtf, quality=quality,
+            dict_dump=dict_dump_detected,
+            blacklist_hit=blacklist_hit,
+            dedupe_hit=dedupe_hit,
+        )
+
         return result
+
+    # ── v2.19.0：observation helper ────────────────────────────────────────────
+
+    def _emit_audit(
+        self, *, pid: str, model_size: str, language: Optional[str],
+        quality: dict, duration: float, backend: str,
+        result: Optional[TranscriptionResult],
+        dict_terms_snapshot: list[str],
+        gate_short: bool, gate_silent: bool,
+        elapsed: float = 0.0,
+        raw_text: str = "",
+        after_dedupe: str = "",
+        after_corrections: str = "",
+        dedupe_hit: bool = False,
+        corrections_count: int = 0,
+        hallucination_segments_removed: int = 0,
+        dict_dump_detected: bool = False,
+        error: Optional[str] = None,
+    ) -> None:
+        """組 audit entry + 寫 JSONL；任何錯誤都吞掉、絕不讓 transcribe() 失敗。
+
+        所有 numpy float 都已用 float() 包裝、可安全 JSON 序列化。
+        """
+        if _audit_log is None:
+            return  # 模組未就緒（Agent N 並行開發中）
+        try:
+            final_text = result.text if result else ""
+            result_lang = result.language if result else (language or "")
+            segments_count = len(result.segments) if result else 0
+            rtf_val = (elapsed / duration) if duration > 0 else 0.0
+
+            # 字典效益：哪些 terms 出現在 final_text 裡（取前 30 避免 entry 過大）
+            terms_in_text: list[str] = []
+            if dict_terms_snapshot and final_text:
+                terms_in_text = [
+                    t for t in dict_terms_snapshot
+                    if t and len(t) >= 2 and t in final_text
+                ][:30]
+
+            entry = {
+                "type": "transcribe",
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "pipeline_id": pid or "",
+                "audio": {
+                    "duration_s": float(quality.get("duration_s", duration)),
+                    "peak": float(quality.get("peak", 0.0)),
+                    "rms": float(quality.get("rms", 0.0)),
+                    "rms_first_500ms": float(quality.get("rms_first_500ms", 0.0)),
+                    "rms_last_500ms": float(quality.get("rms_last_500ms", 0.0)),
+                    "clipping_ratio": float(quality.get("clipping_ratio", 0.0)),
+                    "samples": int(quality.get("samples", 0)),
+                },
+                "backend": backend,
+                "model": model_size,
+                "language": result_lang or language or "",
+                "elapsed_s": float(elapsed),
+                "rtf": float(rtf_val),
+                "gates": {
+                    "duration_short": bool(gate_short),
+                    "rms_silent": bool(gate_silent),
+                    "is_warmup": False,   # 標記給未來 warmup 路徑；此 emit 點固定 False
+                },
+                "raw_text": raw_text or final_text or "",
+                "after_dedupe": after_dedupe or final_text or "",
+                "after_corrections": after_corrections or final_text or "",
+                "final_text": final_text or "",
+                "post_filters": {
+                    "dedupe_hit": bool(dedupe_hit),
+                    "corrections_count": int(corrections_count),
+                    "hallucination_segments_removed": int(hallucination_segments_removed),
+                    "dict_dump_detected": bool(dict_dump_detected),
+                },
+                "segments_count": int(segments_count),
+                "dict_terms_count": int(len(dict_terms_snapshot)),
+                "dict_effectiveness": {
+                    "terms_in_text": terms_in_text,
+                    "corrections_hit": {},   # 未來填：term → 命中次數
+                },
+                "error": error,
+            }
+            _audit_log.write_transcribe(entry)
+        except Exception:
+            # 觀測點不能影響主流程；只在 logger 留痕、不 re-raise
+            try:
+                log_error("audit_emit_failed")
+            except Exception:
+                pass
+
+    def _maybe_save_suspicious_audio(
+        self, *, audio, pid: str, model_size: str,
+        duration: float, rtf: float, quality: dict,
+        dict_dump: bool, blacklist_hit: bool, dedupe_hit: bool,
+    ) -> None:
+        """v2.19.0：四條件任一觸發 → 落地音檔給日後檢視。
+
+        條件：
+          • dict_dump：Qwen3-ASR 字典詞表 dump（_is_dict_terms_hallucination 命中）
+          • blacklist_hit：傳統黑名單關鍵字命中（_is_hallucination）
+          • dedupe_hit：n-gram 連續重複 dedupe 觸發
+          • RTF > 1.5：推論顯著慢於實時、可能 fallback chain 被觸發
+
+        設定關閉時整段 noop（save_suspicious_audio 收到 enabled=False 內部處理）。
+        """
+        if _audit_log is None:
+            return
+        # 找出觸發原因（多條件命中 → 取最具診斷價值的一個）
+        reason: Optional[str] = None
+        if dict_dump:
+            reason = "dict_dump"
+        elif blacklist_hit:
+            reason = "blacklist_hit"
+        elif dedupe_hit:
+            reason = "dedupe_triggered"
+        elif rtf > 1.5:
+            reason = "rtf_slow"
+        if reason is None:
+            return  # 沒可疑事件、不保留
+
+        try:
+            metadata = {
+                "pipeline_id": pid or "",
+                "model": model_size,
+                "duration_s": float(duration),
+                "rtf": float(rtf),
+                "audio_peak": float(quality.get("peak", 0.0)),
+                "audio_rms": float(quality.get("rms", 0.0)),
+                "reasons": {
+                    "dict_dump": bool(dict_dump),
+                    "blacklist_hit": bool(blacklist_hit),
+                    "dedupe_triggered": bool(dedupe_hit),
+                    "rtf_slow": bool(rtf > 1.5),
+                },
+            }
+            _audit_log.save_suspicious_audio(
+                audio, 16000, pid, reason, metadata,
+                enabled=self._suspicious_capture_enabled,
+                max_size_mb=self._suspicious_max_mb,
+            )
+        except Exception:
+            try:
+                log_error("save_suspicious_audio_failed", reason=reason)
+            except Exception:
+                pass
 
     def transcribe_fast(
         self,
@@ -552,6 +979,13 @@ class Transcriber:
 
         duration = len(audio) / 16_000
         t0 = time.perf_counter()
+
+        # v2.19.0：長度閘 — 跟 transcribe() 同策略
+        if duration < _MIN_DURATION_S:
+            return TranscriptionResult(
+                text="（未偵測到語音內容）", language="",
+                duration_seconds=duration, elapsed_seconds=0.0,
+            )
 
         # 靜音防護
         if _is_silence(audio):
@@ -734,12 +1168,28 @@ class Transcriber:
         # 短/中音檔（< 30s）走 fast path；長音檔維持 mlx_whisper 預設（quality 優先）
         # Fix 14 / 2026-05-23：不要傳 beam_size（mlx_whisper 偵測 kwarg 就試
         # beam-search path、該 path 還沒實作 → NotImplementedError）。
+        # v2.19.0：動態依 _MLX_WHISPER_KWARGS 組 kwargs，只傳這版 mlx_whisper
+        #   實際支援的參數——避免新加的 hallucination_silence_threshold 不被支援時，
+        #   把舊有的 temperature / condition_on_previous_text 連坐 fallback 掉。
         short_kwargs: dict = {}
         if is_short:
-            short_kwargs = {
-                "temperature":               0,
-                "condition_on_previous_text": False,
-            }
+            # 既有抗幻覺基底（v2.13.0 起）
+            if "temperature" in _MLX_WHISPER_KWARGS:
+                short_kwargs["temperature"] = 0
+            if "condition_on_previous_text" in _MLX_WHISPER_KWARGS:
+                short_kwargs["condition_on_previous_text"] = False
+            # v2.19.0 新加（OpenAI 官方參數、靜音 ≥ 2 秒 decoder 停止編輯）
+            if "hallucination_silence_threshold" in _MLX_WHISPER_KWARGS:
+                short_kwargs["hallucination_silence_threshold"] = 2.0
+
+        # v2.19.0：印一行決策 log，方便 debug 為什麼 RTF 突然變慢
+        if is_short:
+            log.info(
+                f"WHISPER: mlx fast-path (duration={duration:.2f}s, "
+                f"kwargs={sorted(short_kwargs.keys())})"
+            )
+        else:
+            log.info(f"WHISPER: mlx default-path (duration={duration:.2f}s)")
 
         # D2-S3：build initial_prompt 用入口 snapshot；try + TypeError fallback
         # 都用同一份 prompt string、保證一致
@@ -898,7 +1348,8 @@ class Transcriber:
                 gc.collect()
 
             t_start = time.perf_counter()
-            log.info(f"WHISPER: Loading Qwen3-ASR session ({hf_repo})...")
+            # v2.19.0：顯式標記為 cold-load、方便 grep / 對應 audit 上的高 RTF 異常
+            log.info(f"WHISPER: qwen3 cold-load (model={model_size}, repo={hf_repo})")
             try:
                 from mlx_qwen3_asr import Session
                 self._qwen3_session = Session(model=hf_repo)

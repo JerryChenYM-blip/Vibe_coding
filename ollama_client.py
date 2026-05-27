@@ -373,6 +373,10 @@ class OllamaClient:
                 preset_name=preset_name,
             )
             self._log_polish(text, final_text, elapsed, preset_name, error=None)
+            _emit_polish_observability(
+                backend="ollama", elapsed=elapsed,
+                error=None, text_len=len(final_text),
+            )
             return response
 
         except requests.exceptions.Timeout:
@@ -383,6 +387,10 @@ class OllamaClient:
                 elapsed_seconds=elapsed, preset_name=preset_name,
             )
             self._log_polish(text, "", elapsed, preset_name, error=resp.error)
+            _emit_polish_observability(
+                backend="ollama", elapsed=elapsed,
+                error=resp.error, text_len=0,
+            )
             return resp
         except requests.exceptions.ConnectionError:
             with self._health_lock:
@@ -394,6 +402,10 @@ class OllamaClient:
                 elapsed_seconds=elapsed, preset_name=preset_name,
             )
             self._log_polish(text, "", elapsed, preset_name, error=resp.error)
+            _emit_polish_observability(
+                backend="ollama", elapsed=elapsed,
+                error=resp.error, text_len=0,
+            )
             return resp
         except Exception as e:
             log_error("ollama_process_failed", model=self.config.model)
@@ -403,6 +415,10 @@ class OllamaClient:
                 error=str(e), elapsed_seconds=elapsed, preset_name=preset_name,
             )
             self._log_polish(text, "", elapsed, preset_name, error=str(e))
+            _emit_polish_observability(
+                backend="ollama", elapsed=elapsed,
+                error=str(e), text_len=0,
+            )
             return resp
 
     # ── Streaming（預設不啟用）──────────────────────────────────────────────
@@ -456,6 +472,42 @@ class OllamaClient:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception:
             log_error("polish_log_write_failed", path=str(_POLISH_LOG_PATH))
+
+
+# ── v2.19.0 觀測性 helper ─────────────────────────────────────────────────────
+# pipeline_event + session_summary 都是 Agent N 在同步建的模組；可能還沒 ready
+# 或 import 失敗（race condition）。包成一個 helper 用 try-import / try-call
+# 把所有觀測性 noise 吞掉，process() 主流程不被影響。
+
+
+def _emit_polish_observability(
+    backend: str,
+    elapsed: float,
+    error: Optional[str],
+    text_len: int,
+) -> None:
+    """v2.19.0：polish 完成時 emit pipeline event + record session summary。
+
+    backend: "ollama" / "vertex"
+    elapsed: 耗時（秒）
+    error:   錯誤訊息（None = 成功）
+    text_len: 輸出字數（失敗時為 0）
+
+    所有 import / call 失敗都 silent — 觀測性 bug 絕不能影響主流程。
+    """
+    try:
+        from pipeline_id import event as pipeline_event  # type: ignore
+        pipeline_event(
+            "polish_done", backend=backend, elapsed_s=elapsed,
+            error=error, text_len=text_len,
+        )
+    except Exception:
+        pass
+    try:
+        import session_summary  # type: ignore
+        session_summary.record_polish(elapsed, enabled=True)
+    except Exception:
+        pass
 
 
 # ── 工具 ──────────────────────────────────────────────────────────────────────

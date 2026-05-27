@@ -195,9 +195,26 @@ def paste_to_app(
             f"AUTO-PASTE: ⌘V sent → '{app_name}' "
             f"(text_len={len(text)}, fullscreen={_is_app_fullscreen(app_name) if app_name else 'n/a'})"
         )
+        # v2.19.0：pipeline event「paste_done」、觀測性失敗不影響主流程
+        try:
+            from pipeline_id import event as pipeline_event  # type: ignore
+            pipeline_event(
+                "paste_done", target_app=app_name or "",
+                text_len=len(text), success=True,
+            )
+        except Exception:
+            pass
         return True
     except Exception:
         log_error("auto_paste_keyboard_failed", app=app_name)
+        try:
+            from pipeline_id import event as pipeline_event  # type: ignore
+            pipeline_event(
+                "paste_done", target_app=app_name or "",
+                text_len=len(text), success=False,
+            )
+        except Exception:
+            pass
         return False
 
 

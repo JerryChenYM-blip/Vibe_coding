@@ -271,6 +271,11 @@ class VertexPolishClient:
                     elapsed_s=elapsed, len_in=len(text), len_out=len(out_text),
                     error=None,
                 )
+            # v2.19.0：pipeline event + session summary（觀測性、失敗 silent）
+            _emit_polish_observability(
+                backend="vertex", elapsed=elapsed,
+                error=None, text_len=len(out_text),
+            )
 
             return VertexResponse(
                 text=out_text or text,
@@ -288,6 +293,10 @@ class VertexPolishClient:
                     model=self.config.model, preset=preset_name,
                     elapsed_s=elapsed, len_in=len(text), len_out=0, error=err,
                 )
+            _emit_polish_observability(
+                backend="vertex", elapsed=elapsed,
+                error=err, text_len=0,
+            )
             return VertexResponse(
                 text=text,   # fallback：回原文
                 model=self.config.model,
@@ -310,3 +319,30 @@ class VertexPolishClient:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception:
             log_error("vertex_polish_log_write_failed")
+
+
+# ── v2.19.0 觀測性 helper（module-level、跟 ollama_client.py 同形式）─────────
+# pipeline_id / session_summary 由 Agent N 同步在建；可能還沒 ready 或 import
+# 失敗。包成 helper 把所有觀測性 noise 吞掉，process() 主流程不被影響。
+
+
+def _emit_polish_observability(
+    backend: str,
+    elapsed: float,
+    error: Optional[str],
+    text_len: int,
+) -> None:
+    """polish 完成時 emit pipeline event + record session summary。失敗 silent。"""
+    try:
+        from pipeline_id import event as pipeline_event  # type: ignore
+        pipeline_event(
+            "polish_done", backend=backend, elapsed_s=elapsed,
+            error=error, text_len=text_len,
+        )
+    except Exception:
+        pass
+    try:
+        import session_summary  # type: ignore
+        session_summary.record_polish(elapsed, enabled=True)
+    except Exception:
+        pass

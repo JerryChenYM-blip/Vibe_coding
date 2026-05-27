@@ -118,6 +118,12 @@ class Config:
     # 啟用時每次潤飾完成後在 ~/.whisper_app/polish_log.jsonl 追加一行記錄
     polish_log_enabled: bool = True
 
+    # ── v2.19.0 可疑音檔保留（觀測性 / 後續分析）─────────────────────────────
+    # 觸發幻覺 / dedupe / RTF 慢時把 .wav 存下來給後續分析；總大小超過上限
+    # 時自動 LRU 淘汰最舊。預設關閉避免占空間，user 想 debug 時再打開。
+    suspicious_audio_capture: bool = False
+    suspicious_audio_max_size_mb: int = 200
+
     # ── Phase 3.2 歷史紀錄 ──────────────────────────────────────────────────
 
     # 啟用時每次轉錄（含潤飾）寫入 ~/.whisper_app/history.db
