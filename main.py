@@ -398,6 +398,17 @@ def main() -> None:
         except Exception:
             log_error("app_on_close_failed")
         root.destroy()
+        # v2.19.0：印出整個 session 的 polish / paste latency summary。
+        # 包 try/except 確保觀測性失敗不影響正常關閉流程。
+        try:
+            import session_summary  # type: ignore
+            summary_str = session_summary.emit_summary()
+            log.info("=" * 60)
+            for line in summary_str.split("\n"):
+                log.info(line)
+            log.info("=" * 60)
+        except Exception:
+            pass
         log.info("SESSION: ended")
 
     root.protocol("WM_DELETE_WINDOW", _on_close)

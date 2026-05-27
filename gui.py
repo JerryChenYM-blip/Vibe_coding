@@ -53,6 +53,48 @@ import auto_paste as _ap
 
 log = get_logger("gui")
 
+
+# ── v2.19.0 pipeline 觀測性 helper ───────────────────────────────────────────
+# pipeline_id / session_summary 由 Agent N 同步在建。可能還沒 ready 或 import
+# 失敗。所有呼叫一律包 try/except，觀測性 bug 絕不能影響主流程。
+
+def _pipe_new_id():
+    """新增一個 pipeline_id 並設為 thread-local current。失敗回 None。"""
+    try:
+        from pipeline_id import new_pipeline_id, set_current  # type: ignore
+        pid = new_pipeline_id()
+        set_current(pid)
+        return pid
+    except Exception:
+        return None
+
+
+def _pipe_clear():
+    """清掉 thread-local current pipeline_id。失敗 silent。"""
+    try:
+        from pipeline_id import set_current  # type: ignore
+        set_current(None)
+    except Exception:
+        pass
+
+
+def _pipe_event(name: str, **fields):
+    """印一個 pipeline event；失敗 silent。"""
+    try:
+        from pipeline_id import event as pipeline_event  # type: ignore
+        pipeline_event(name, **fields)
+    except Exception:
+        pass
+
+
+def _pipe_record_paste_latency(latency_s: float):
+    """記錄一筆 paste latency 到 session summary；失敗 silent。"""
+    try:
+        import session_summary  # type: ignore
+        session_summary.record_paste_latency(latency_s=latency_s)
+    except Exception:
+        pass
+
 # ── 強制套用 Apple 深色美學 ───────────────────────────────────────────────────
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
@@ -233,6 +275,15 @@ class AppWindow(ctk.CTkFrame):
             except Exception:
                 log_error("startup_set_device_failed", device=cfg.input_device)
         self.transcriber = Transcriber()
+        # v2.19.0：可疑音檔保留設定推給 transcriber（Agent T 還沒寫完時 hasattr 防炸）
+        if hasattr(self.transcriber, "set_suspicious_capture"):
+            try:
+                self.transcriber.set_suspicious_capture(
+                    cfg.suspicious_audio_capture,
+                    cfg.suspicious_audio_max_size_mb,
+                )
+            except Exception:
+                log_error("set_suspicious_capture_init_failed")
         self.ollama      = OllamaClient()
         # 用設定檔同步 Ollama 參數（base_url / model / enabled / timeout）
         self.ollama.apply_app_config(cfg)
@@ -843,6 +894,11 @@ class AppWindow(ctk.CTkFrame):
                 pass
             return
 
+        # v2.19.0：錄音真正開始 → 生成新 pipeline_id，貫穿整條 pipeline。
+        # （錄音啟動失敗時就不生 pid、避免 dead pid 污染 log）
+        _pipe_new_id()
+        _pipe_event("hotkey_pressed", hotkey=str(self.cfg.hotkey))
+
         log_state(
             "idle->recording",
             model=self._model_var.get(),
@@ -1346,6 +1402,13 @@ class AppWindow(ctk.CTkFrame):
         if self._pipeline_t0 is not None:
             self._pipeline_transcribe_at = time.perf_counter() - self._pipeline_t0
 
+        # v2.19.0：pipeline event「transcribe_done」
+        _pipe_event(
+            "transcribe_done",
+            text_len=len(result.text or ""),
+            elapsed_s=float(result.elapsed_seconds or 0.0),
+        )
+
         self._transition_to_idle(result)
         self._show_toast(f"轉錄完成 · {result.elapsed_seconds:.1f}s")
 
@@ -1482,6 +1545,14 @@ class AppWindow(ctk.CTkFrame):
         preset_name = preset.name
         # C1：記錄實際送 LLM 的輸入但不汙染 _last_raw
         self._last_llm_input = llm_input
+
+        # v2.19.0：pipeline event「polish_dispatch」(polish_done 由 client 自己印)
+        backend_name = getattr(self.cfg, "polish_backend", "local")
+        _pipe_event(
+            "polish_dispatch",
+            backend=backend_name,
+            preset=preset_name,
+        )
 
         # Cluster B：抓「當下 latest」block ref 一起傳進 _finish_polish。
         # polish 跑回來時這個 ref 可能已被 delete（不在 list 內）或不再是 latest，
@@ -1765,7 +1836,13 @@ class AppWindow(ctk.CTkFrame):
         典型耗時 ~380ms（osascript activate + 180ms 緩衝 + ⌘V），可接受的
         UI 短暫凍結，遠優於閃退。詳見 CLAUDE.md §9.6。
         """
+        # v2.19.0：pipeline event「paste_dispatch」+ 量測 paste latency
+        _pipe_event("paste_dispatch", target_app=target or "")
+        _t_paste_start = time.perf_counter()
         success = _ap.paste_to_app(text, target)
+        _paste_latency = time.perf_counter() - _t_paste_start
+        _pipe_record_paste_latency(_paste_latency)
+
         if success:
             self._show_toast(f"⌨  已貼入 {target}")
         else:
@@ -1774,6 +1851,13 @@ class AppWindow(ctk.CTkFrame):
         self._emit_pipeline_timing(paste_outcome="success" if success else "failed",
                                    paste_target=target,
                                    text_len=len(text))
+        # v2.19.0：整條 pipeline 結束、清掉 thread-local pid
+        # （raw paste 策略下 emit 會 defer、pipeline_done 也要 defer 以對齊；
+        #  但 defer 結束會走到 _finish_polish 內 emit、那條路徑也清；
+        #  此處走通常路徑、只要 _pipeline_summary_emitted 為 True 就清）
+        if self._pipeline_summary_emitted:
+            _pipe_event("pipeline_done")
+            _pipe_clear()
 
     def _emit_pipeline_timing(
         self,
@@ -1851,6 +1935,17 @@ class AppWindow(ctk.CTkFrame):
             text_len=text_len,
             polish_mode=self._pipeline_polish_mode,
         )
+        # v2.19.0：pipeline 終點 event + 清 thread-local pid
+        # 任何 emit 路徑（success / skipped / failed_*）都會走到這、統一收尾。
+        # 注意：_do_auto_paste 也會呼叫 _pipe_event("pipeline_done") + _pipe_clear()，
+        # 重複呼叫無害（set_current(None) 是 idempotent）。
+        _pipe_event(
+            "pipeline_done",
+            path=path,
+            total_s=round(t_total, 3),
+            text_len=text_len,
+        )
+        _pipe_clear()
 
     def _display_result(self, result: TranscriptionResult) -> None:
         """新增一個 UtteranceBlock，取代之前在 textbox 累積插入文字的做法。
@@ -2954,6 +3049,17 @@ class AppWindow(ctk.CTkFrame):
                 log_error("vertex_apply_app_config_failed")
         self._refresh_polish_backend()
         self._refresh_ollama_health()
+
+        # v2.19.0：可疑音檔保留設定也同步推給 transcriber
+        # hasattr 防 Agent T 還在進行時（setter 還沒實作）的 race
+        if hasattr(self.transcriber, "set_suspicious_capture"):
+            try:
+                self.transcriber.set_suspicious_capture(
+                    cfg.suspicious_audio_capture,
+                    cfg.suspicious_audio_max_size_mb,
+                )
+            except Exception:
+                log_error("set_suspicious_capture_apply_failed")
 
         # 字典：重新載入（可能 enabled 變了，或路徑變了）
         self._reload_dictionary()

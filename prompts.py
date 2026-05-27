@@ -225,8 +225,17 @@ def format_qwen3_context(dictionary_terms: Optional[Iterable[str]] = None) -> st
       • Qwen3-ASR: `<|im_start|>system\n{context}<|im_end|>` 真正的 LLM
         system message，整個 generation 過程都看得到、biasing 強度比 Whisper
         的 decoder prefix 高
-      • 官方建議格式：**空白分隔的純詞表**（不要塞句子或自然語指令、會干擾）
       • 上限沒明確規定，這裡仍取前 50 個（跟 polish 上限同步）
+
+    v2.19.0：**格式改造**——加 metadata frame「專有名詞：…。」防字典 dump 幻覺。
+      原本是空白分隔的 bare word list（官方範例「交易 停滞」），但實機 log 發現
+      靜音 / 雜音段時 Qwen3-ASR 會把這串 bare list 當成「**剛剛轉錄完的句子**」
+      續寫——直接把字典詞當答案吐出來（00:42:02 真實 case：
+      「Qwen3-ASR Qwen3 Qwen Large V3 Turbo Whisper Pro Ollama Claude Cloud
+      ChatGPT Cursor GitHub」）。
+      改成有「專有名詞：」前綴 + 頓號分隔 + 句號收尾的 framed list 後，模型
+      理解為「**參考清單**而非待續寫文本」，dump 機率大幅下降。
+      TypeWhisper 184-run 實測（同類技術）：WER 33.8% → 18.2%。
 
     dictionary_terms 空時回空字串（Qwen3-ASR transcribe(context="") 是合法的）。
     """
@@ -235,8 +244,8 @@ def format_qwen3_context(dictionary_terms: Optional[Iterable[str]] = None) -> st
     terms = [t.strip() for t in dictionary_terms if t and t.strip()]
     if not terms:
         return ""
-    # 空白分隔（官方範例：「交易 停滞」）
-    return " ".join(terms[:50])
+    # v2.19.0：framed list — 加 metadata 前綴 + 頓號分隔 + 句號收尾
+    return "專有名詞：" + "、".join(terms[:50]) + "。"
 
 
 def format_polish_prompt(
