@@ -389,6 +389,17 @@ def main() -> None:
 
     threading.Thread(target=_check_access, daemon=True).start()
 
+    # v2.19.x：背景預載 Silero VAD v5 模型（~9 MB、PyTorch、首次 inference ~500ms）。
+    # 不預載則第一次錄音 stop 時會看到 ~500ms 額外延遲；背景跑不阻塞主啟動。
+    def _warmup_silero():
+        try:
+            from transcriber import _ensure_silero_vad
+            _ensure_silero_vad()
+        except Exception:
+            pass
+
+    threading.Thread(target=_warmup_silero, daemon=True).start()
+
     # ── 6. 視窗關閉處理 ──────────────────────────────────────────────────────
     def _on_close():
         """使用者按視窗關閉按鈕時：先通知 AppWindow 清理資源，再銷毀 tkinter。"""

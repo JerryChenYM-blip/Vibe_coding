@@ -284,6 +284,15 @@ class AppWindow(ctk.CTkFrame):
                 )
             except Exception:
                 log_error("set_suspicious_capture_init_failed")
+        # v2.19.x：Silero VAD v5 設定（神經前置過濾、擋鍵盤/雜音；hasattr 防舊版 transcriber）
+        if hasattr(self.transcriber, "set_silero_vad"):
+            try:
+                self.transcriber.set_silero_vad(
+                    cfg.silero_vad_enabled,
+                    cfg.silero_vad_threshold,
+                )
+            except Exception:
+                log_error("set_silero_vad_init_failed")
         self.ollama      = OllamaClient()
         # 用設定檔同步 Ollama 參數（base_url / model / enabled / timeout）
         self.ollama.apply_app_config(cfg)
@@ -355,6 +364,18 @@ class AppWindow(ctk.CTkFrame):
         self._stream_polished: list[str]    = []
         self._stream_polish_dispatched: int = 0
         self._stream_polish_completed:  int = 0
+
+        # v2.19.x LocalAgreement-2 streaming（experimental、躲在 config flag 後）
+        # cfg.streaming_algo == "local_agreement" 時、_transition_to_recording 會
+        # 建一個 LocalAgreementBuffer；fixed_chunk path 保持 None、不受影響。
+        # 詳見 streaming_local_agreement.py。
+        self._la_buffer = None
+        # LA path 在背景 thread 跑 process_tick；in_flight 避免 tick 重疊
+        self._la_in_flight: bool = False
+        # LA finalize 在背景跑、與 _run_transcription 共用「等 ASR 完成」邏輯；
+        # _run_transcription 直接用這顆結果合併、不再額外跑 transcribe(tail)
+        self._la_finalize_done: bool = False
+        self._la_finalize_text: str = ""
 
         # B2（v2.7.0）：processing timeout self-heal 的 after id；快速連續錄音
         # 避免 N 個 pending callback 並存（之前每次 _transition_to_processing
@@ -965,6 +986,38 @@ class AppWindow(ctk.CTkFrame):
         self._stream_polish_dispatched = 0
         self._stream_polish_completed  = 0
         self._stream_generation += 1
+
+        # v2.19.x LocalAgreement-2 path（experimental、躲在 config flag 後、預設關）。
+        # 預設值 cfg.streaming_algo == "fixed_chunk" → _la_buffer 維持 None、
+        # _stream_tick 維持原 fixed-chunk 邏輯不變。
+        # local_agreement 時建 buffer、_stream_tick 入口會 route 到 _stream_tick_la()。
+        algo = getattr(self.cfg, "streaming_algo", "fixed_chunk")
+        if algo == "local_agreement":
+            try:
+                from streaming_local_agreement import LocalAgreementBuffer
+                min_s = float(getattr(self.cfg, "streaming_la_min_chunk_s", 5.0))
+                max_s = int(getattr(self.cfg, "streaming_la_max_buffer_s", 120))
+                self._la_buffer = LocalAgreementBuffer(
+                    transcriber=self.transcriber,
+                    language=self.cfg.get_whisper_language(),
+                    model_size=self.cfg.model,
+                    chinese_variant=getattr(self.cfg, "chinese_variant", "off"),
+                    min_chunk_samples=int(min_s * 16_000),
+                    max_buffer_samples=int(max_s * 16_000),
+                )
+                self._la_in_flight = False
+                self._la_finalize_done = False
+                self._la_finalize_text = ""
+                log.info(
+                    f"STREAMING: LocalAgreement-2 enabled "
+                    f"(min_chunk={min_s}s, max_buf={max_s}s)"
+                )
+            except Exception:
+                log_error("la_buffer_init_failed")
+                self._la_buffer = None   # fallback 退回 fixed_chunk path
+        else:
+            self._la_buffer = None
+
         self._stream_tick_id = self.after(self.STREAM_TICK_MS, self._stream_tick)
 
         # Phase 4.3 mini 視窗：開啟錄音 HUD
@@ -1041,6 +1094,23 @@ class AppWindow(ctk.CTkFrame):
         model = self._model_var.get()
         lang  = self.cfg.get_whisper_language()
         audio = tail if len(tail) > 800 else full_audio
+
+        # v2.19.x LocalAgreement-2 path：把剩餘 audio 餵給 buffer + 起 finalize。
+        # _run_transcription 內部會偵測 _la_buffer 非 None 改走 LA 合併路徑、
+        # 不再從 audio 跑 transcribe(tail)。即便如此仍把整段 audio 傳進去——
+        # _run_transcription 還是會跑一個 transcribe 拿 segment / language（finalize
+        # 完才有完整輸出、但這條路徑保險絲還是讓 fixed-chunk 邏輯能正常回 result）。
+        # 簡化：LA path 把整段累積進 buffer，finalize 內部會跑最後一次 ASR、結果
+        # 就是完整文字。
+        if self._la_buffer is not None:
+            # 把錄音停下後的最後一段（_stream_samples 之後）也餵進 buffer
+            try:
+                if len(tail):
+                    self._la_buffer.add_audio(tail)
+                    self._stream_samples = len(full_audio)
+            except Exception:
+                log_error("la_final_add_audio_failed")
+            self._start_la_finalize()
 
         threading.Thread(
             target=self._run_transcription,
@@ -1120,6 +1190,12 @@ class AppWindow(ctk.CTkFrame):
         """
         self._stream_tick_id = None
         if self._state != "recording":
+            return
+
+        # v2.19.x LocalAgreement-2 path：route 到 _stream_tick_la()。
+        # _la_buffer 非 None 表示這輪錄音用 LA 演算法、fixed-chunk 邏輯整段跳過。
+        if self._la_buffer is not None:
+            self._stream_tick_la()
             return
 
         snap = self.recorder.get_buffer_snapshot()
@@ -1251,6 +1327,145 @@ class AppWindow(ctk.CTkFrame):
         threading.Thread(target=_polish_thread, daemon=True).start()
 
     # ═══════════════════════════════════════════════════════════════════════
+    #  v2.19.x LocalAgreement-2 STREAMING（experimental）
+    # ═══════════════════════════════════════════════════════════════════════
+    #
+    # 與 fixed-chunk path 的對照：
+    #   fixed-chunk：每 10s 切一個獨立 chunk、各自轉、concat → 邊界切碎 + 重複病
+    #   LocalAgreement-2：累積整段、重轉未 commit 尾段、跟上輪取 LCP commit
+    #
+    # 介面：
+    #   _stream_tick_la()       — 路由自 _stream_tick；feed audio + dispatch tick
+    #   _dispatch_la_process()  — 背景 thread 跑 buffer.process_tick()，更新 UI
+    #   _start_la_finalize()    — _transition_to_processing 呼叫；背景跑 finalize
+    #
+    # 與 streaming polish 的關係：
+    #   暫時不整合（避免 race）。LA path commit 進來只更新 UI + audit、polish 等
+    #   錄音結束 finalize 之後跑一次（blocking polish）。Streaming polish 在
+    #   v2.17.0 跑 per-chunk Ollama 呼叫，每個 commit 都觸發會大幅增加 Ollama 負載
+    #   且 commit 與 chunk 邊界不對齊、polish 出來再 concat 容易斷句。
+    # TODO（future work / 下個 session）：
+    #   • 整合 streaming polish on LA—— commit 累積到一個門檻（例如句末符號 / N 字
+    #     以上）再 dispatch polish。Index-based slot pattern 仍可用、但 idx 不再
+    #     對應 chunk 而對應「commit 批次」。
+    #   • _dispatch_la_process 改 priority queue / single worker thread、避免 LA
+    #     tick 重疊 + transcribe() 的 _transcription_lock 排隊。
+    #   • Display commit incrementally to UI（目前是錄音結束才一次性 display）。
+
+    def _stream_tick_la(self) -> None:
+        """LocalAgreement-2 streaming tick（路由自 _stream_tick）。
+
+        流程：
+          1. 從 recorder 拿新累積 audio（用 _stream_samples 當 cursor、跟 fixed-chunk
+             共用）feed 給 _la_buffer.add_audio()
+          2. 若上一輪 process_tick 還在跑（_la_in_flight=True）→ 排下輪即可，不重疊
+             dispatch（transcribe() 的 _transcription_lock 會排隊、但這樣會堆積太多）
+          3. dispatch 背景 thread 跑 process_tick；完成回主執行緒更新 UI（目前是
+             只寫 log；UI display 留給錄音結束一次性 display）
+          4. 排下次 tick
+        """
+        snap = self.recorder.get_buffer_snapshot()
+        # 用 _stream_samples 當 cursor 拿增量、feed 進 buffer
+        # （_stream_samples 在 _transition_to_recording 已被 reset 為 0）
+        new_audio = snap[self._stream_samples:]
+        if len(new_audio):
+            try:
+                self._la_buffer.add_audio(new_audio)
+                self._stream_samples = len(snap)
+            except Exception:
+                log_error("la_add_audio_failed")
+
+        # 沒在 in-flight 就 dispatch
+        if not self._la_in_flight:
+            self._dispatch_la_process()
+
+        # 排下次 tick（_state 已在 _stream_tick 入口檢查過、這裡再保險）
+        if self._state == "recording":
+            self._stream_tick_id = self.after(
+                self.STREAM_TICK_MS, self._stream_tick
+            )
+
+    def _dispatch_la_process(self) -> None:
+        """背景 thread 跑 _la_buffer.process_tick()。
+
+        Generation guard：_transition_to_recording 會把 _stream_generation +=1，
+        若 dispatch 期間 user 已開新一輪錄音（generation 變了 / _la_buffer 變了 /
+        state 變了）→ 結果 silent drop。
+        """
+        if self._la_buffer is None:
+            return
+        self._la_in_flight = True
+        gen = self._stream_generation
+        la_buf = self._la_buffer
+
+        def _process(gen=gen, la_buf=la_buf):
+            try:
+                new_commit = la_buf.process_tick()
+                # Generation guard
+                if (
+                    self._stream_generation == gen
+                    and self._la_buffer is la_buf
+                ):
+                    if new_commit:
+                        log.info(
+                            f"LA: stream tick commit (+{len(new_commit)} chars, "
+                            f"total={len(la_buf.committed_text)})"
+                        )
+            except Exception:
+                log_error("la_dispatch_process_failed")
+            finally:
+                # 即使 generation 不匹配也要 clear，避免下輪卡住
+                # （但只 clear 自己這輪、用 buffer identity 比對）
+                if self._la_buffer is la_buf:
+                    self._la_in_flight = False
+
+        threading.Thread(target=_process, daemon=True).start()
+
+    def _start_la_finalize(self) -> None:
+        """錄音結束時呼叫；背景 thread 跑 _la_buffer.finalize() 取完整文字。
+
+        結果寫進 self._la_finalize_text，_la_finalize_done=True，_run_transcription
+        等待這個 flag 後直接用、不再額外跑 transcribe(tail)。
+
+        為什麼不在 _transition_to_processing 直接 join：finalize 內部會跑一次 ASR、
+        需要 _transcription_lock；可能花幾秒；要在背景跑、不阻塞主執行緒切 UI。
+        """
+        if self._la_buffer is None:
+            return
+        gen = self._stream_generation
+        la_buf = self._la_buffer
+        self._la_finalize_done = False
+        self._la_finalize_text = ""
+
+        def _finalize(gen=gen, la_buf=la_buf):
+            try:
+                # 等任何 in-flight process_tick 跑完（簡單 spin、最多幾秒）
+                t_wait = time.time()
+                while self._la_in_flight:
+                    if time.time() - t_wait > 15.0:
+                        log.warning("LA: finalize gave up waiting for in-flight tick")
+                        break
+                    time.sleep(0.05)
+                text = la_buf.finalize()
+                # Generation guard
+                if (
+                    self._stream_generation == gen
+                    and self._la_buffer is la_buf
+                ):
+                    self._la_finalize_text = text
+                    self._la_finalize_done = True
+                    log.info(
+                        f"LA: finalize complete ({len(text)} chars)"
+                    )
+            except Exception:
+                log_error("la_finalize_failed")
+                # 失敗也要設 done，否則 _run_transcription 永遠等不到
+                if self._la_buffer is la_buf:
+                    self._la_finalize_done = True
+
+        threading.Thread(target=_finalize, daemon=True).start()
+
+    # ═══════════════════════════════════════════════════════════════════════
     #  TRANSCRIPTION
     # ═══════════════════════════════════════════════════════════════════════
 
@@ -1265,6 +1480,44 @@ class AppWindow(ctk.CTkFrame):
         _on_transcription_failed 回主執行緒把狀態切回 idle。
         """
         try:
+            # v2.19.x LocalAgreement-2 path：完全跳過 fixed-chunk merge 邏輯。
+            # _start_la_finalize 已在背景跑 finalize、會跑最後一次 ASR 並把完整
+            # commit 寫進 _la_finalize_text。我們在這裡 spin 等 finalize 完、
+            # 把結果包成 TranscriptionResult。整段 audio 在 _transition_to_processing
+            # 已餵進 buffer、不再呼叫 self.transcriber.transcribe(audio)。
+            if self._la_buffer is not None:
+                deadline = time.time() + self.STREAM_CHUNK_JOIN_TIMEOUT_S
+                while not self._la_finalize_done:
+                    if time.time() > deadline:
+                        log.warning(
+                            "LA: timeout waiting for finalize, using whatever "
+                            "committed_text we have"
+                        )
+                        break
+                    time.sleep(0.05)
+                # 取完整文字（finalize 成功 → _la_finalize_text；timeout → buffer
+                # 的 committed_text 當保險絲）
+                la_text = (
+                    self._la_finalize_text
+                    if self._la_finalize_done and self._la_finalize_text
+                    else self._la_buffer.committed_text
+                )
+                # 估算 duration（buffer 累積總長）；elapsed 用 0（finalize 內部已 log）
+                duration_s = self._la_buffer.buffer_seconds
+                result = TranscriptionResult(
+                    text=la_text.strip() or "（未偵測到語音內容）",
+                    language=lang or "",
+                    duration_seconds=duration_s,
+                    elapsed_seconds=0.0,
+                    segments=[],
+                )
+                log.info(
+                    f"LA: _run_transcription using LA result "
+                    f"({len(la_text)} chars, duration={duration_s:.1f}s)"
+                )
+                self.after(0, self._on_transcription_done, result)
+                return
+
             # 一律用使用者選的模型做最終轉錄，不再因短音檔退化到 transcribe_fast
             # （那條路徑寫死 small，會嚴重拖垮品質）。
             # v2.14.0：傳 chinese_variant 給 Qwen3-ASR 用（Whisper backend ignore）
@@ -3061,6 +3314,16 @@ class AppWindow(ctk.CTkFrame):
             except Exception:
                 log_error("set_suspicious_capture_apply_failed")
 
+        # v2.19.x：Silero VAD 設定也同步推給 transcriber（套用設定 / 匯入設定後生效）
+        if hasattr(self.transcriber, "set_silero_vad"):
+            try:
+                self.transcriber.set_silero_vad(
+                    cfg.silero_vad_enabled,
+                    cfg.silero_vad_threshold,
+                )
+            except Exception:
+                log_error("set_silero_vad_apply_failed")
+
         # 字典：重新載入（可能 enabled 變了，或路徑變了）
         self._reload_dictionary()
 
@@ -3500,10 +3763,11 @@ class AppWindow(ctk.CTkFrame):
         threading.Thread(target=_load, daemon=True).start()
 
     def _refresh_polish_backend(self) -> None:
-        """v2.18.0：依 cfg.polish_backend 設定 self.polish 指向 Ollama / Vertex。
+        """v2.18.0：依 cfg.polish_backend 設定 self.polish 指向 Ollama / Vertex / Hybrid。
 
         - "local"  → self.polish = self.ollama
         - "vertex" → self.polish = self.vertex
+        - "hybrid" → self.polish = self.hybrid（v2.19.x：rule + pinyin + 可選 Gemini）
         - "off"    → self.polish = None（_start_polish 會 short-circuit）
 
         ollama_enabled / vertex 的 health_ok 仍由各自 client 管。
@@ -3512,6 +3776,29 @@ class AppWindow(ctk.CTkFrame):
         if backend == "vertex" and self.vertex is not None:
             self.polish = self.vertex
             log.info(f"POLISH: backend = vertex (model={self.cfg.vertex_model})")
+        elif backend == "hybrid":
+            # v2.19.x：lazy init hybrid client（沒裝 google-genai 也能跑 Layer 1+2）
+            if not hasattr(self, "hybrid") or self.hybrid is None:
+                try:
+                    from hybrid_polish import HybridPolishClient
+                    self.hybrid = HybridPolishClient()
+                except Exception:
+                    log_error("hybrid_polish_init_failed")
+                    self.hybrid = None
+            if self.hybrid is not None:
+                try:
+                    self.hybrid.apply_app_config(self.cfg)
+                except Exception:
+                    log_error("hybrid_polish_apply_config_failed")
+                self.polish = self.hybrid
+                log.info(
+                    f"POLISH: backend = hybrid (use_gemini="
+                    f"{getattr(self.cfg, 'hybrid_use_gemini', True)}, "
+                    f"vertex_project={'set' if self.cfg.vertex_project_id else 'unset'})"
+                )
+            else:
+                self.polish = None
+                log.warning("POLISH: backend=hybrid requested but init failed; polish disabled")
         elif backend == "off":
             self.polish = None
             log.info("POLISH: backend = off (no polish)")
@@ -3967,14 +4254,17 @@ class SettingsWindow(ctk.CTkToplevel):
             wrap = ctk.CTkFrame(r, fg_color="transparent")
             wrap.pack(side="right")
             self._polish_backend_btns: dict[str, ctk.CTkButton] = {}
+            # v2.19.x：加 Hybrid 第 4 chip（rule + pinyin guard + optional Gemini）
+            # 寬度從 92 縮到 78、4 chip 才放得下
             for value, label in (
                 ("local",  "地端 Ollama"),
                 ("vertex", "Vertex AI"),
+                ("hybrid", "Hybrid"),
                 ("off",    "關閉"),
             ):
                 btn = ctk.CTkButton(
                     wrap, text=label,
-                    width=92, height=30, corner_radius=8,
+                    width=78, height=30, corner_radius=8,
                     font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
                     border_width=1,
                     command=lambda v=value: self._on_polish_backend_clicked(v),
