@@ -73,6 +73,15 @@ OLLAMA_POLISH_SYSTEM = (
 OLLAMA_SYSTEM_PROMPT = OLLAMA_POLISH_PROMPT
 
 
+# ── v2.19.x Hybrid polish 用、極短指令、Flash-Lite 跑（cost-sensitive）────
+# Hybrid backend 跑 rule → pinyin → optional Gemini Flash-Lite 三層。
+# 第三層走 Flash-Lite（最便宜），prompt 故意極短、只修明顯錯字、不重寫。
+HYBRID_POLISH_PROMPT = """\
+只修明顯錯字、不改寫、不加標點、不換詞、不解釋。直接輸出修正後文字：
+{text}
+"""
+
+
 # ── Phase 2 情境 preset prompts ───────────────────────────────────────────────
 
 # 每個 preset 的 prompt 都繼承 Phase 1 的「去 filler / 修錯字 / 保留英文」底盤，

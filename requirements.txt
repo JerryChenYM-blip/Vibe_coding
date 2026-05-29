@@ -23,3 +23,10 @@ OpenCC==1.3.1
 # v2.18.0 雲端 polish backend（Google Vertex AI Gemini、選用）
 # 認證走 ADC：跑一次 `gcloud auth application-default login` 即可
 google-genai>=1.0.0
+
+# v2.19.x Silero VAD v5 神經前置過濾（擋鍵盤/背景音/雜音、抑制 ASR 幻覺）
+# 放在 RMS gate 之後、ASR 之前；用神經網路判斷音檔是否含人聲
+silero-vad>=5.0.0
+
+# v2.19.x Pinyin guard（拼音 fuzzy match 修中文 ASR 同音/近音誤辨）
+pypinyin>=0.50.0

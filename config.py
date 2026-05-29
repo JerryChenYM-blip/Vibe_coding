@@ -124,6 +124,13 @@ class Config:
     suspicious_audio_capture: bool = False
     suspicious_audio_max_size_mb: int = 200
 
+    # ── v2.19.x Silero VAD v5 前置過濾 ───────────────────────────────────────
+    # 放在 RMS gate 之後、ASR 之前的神經 VAD：擋「有能量但非人聲」（鍵盤敲擊、
+    # 紙張摩擦、冷氣聲、背景音樂、麥克風拍打聲）這類 RMS 閘漏網、卻會觸發 ASR
+    # 幻覺的雜音。threshold：0.0 全當人聲、1.0 極嚴格；0.35 對中文輕聲也夠靈敏。
+    silero_vad_enabled:   bool  = True
+    silero_vad_threshold: float = 0.35
+
     # ── Phase 3.2 歷史紀錄 ──────────────────────────────────────────────────
 
     # 啟用時每次轉錄（含潤飾）寫入 ~/.whisper_app/history.db
@@ -152,11 +159,28 @@ class Config:
     # 改變後立即套用（不需重啟），下一個 render tick 生效
     reduce_motion_pref: str = "auto"
 
+    # ── v2.19.x Streaming 演算法選擇 ─────────────────────────────────────
+    # "fixed_chunk"    = v2.16.0 原 path（10s chunk 獨立轉 + concat、預設）
+    # "local_agreement"= LocalAgreement-2 path（重轉未 commit 尾段、LCP 取共識；
+    #                    experimental、修「chunk 邊界切碎」+「邊界重複病」、
+    #                    需手動改 config.json 才會走）
+    streaming_algo: str = "fixed_chunk"
+    # LocalAgreement 參數
+    streaming_la_min_chunk_s: float = 5.0    # 未 commit 尾段至少多長才重轉（秒）
+    streaming_la_max_buffer_s: int   = 120   # audio buffer 上限、超過 force commit（秒）
+
     # ── v2.18.0 Polish backend 選擇（本地 Ollama / 雲端 Vertex AI Gemini）─
     # "local"  = Ollama（地端 GPU、隱私 100% 本地、~5s warm、會 thermal throttle）
     # "vertex" = Google Vertex AI Gemini（雲端、不佔本地 GPU、~3-10s 含網路、需 GCP 帳號）
+    # "hybrid" = v2.19.x rule + pinyin guard + optional Gemini Flash-Lite 三層串聯
+    #            （rule 永遠跑、Gemini 在 vertex_project_id 設好 + hybrid_use_gemini=True 時跑）
     # "off"    = 完全不潤飾、ASR 原文直接貼
     polish_backend: str = "local"
+
+    # ── v2.19.x Hybrid polish 設定 ───────────────────────────────────────
+    # 第 3 層 Gemini Flash-Lite 啟用否（要 vertex_project_id 才有效）
+    # 關掉就只跑 rule + pinyin guard（極快、~10ms、零雲端費用）
+    hybrid_use_gemini: bool = True
 
     # ── v2.18.0 Vertex AI Gemini 設定（polish_backend="vertex" 時才用）────
     # 認證走 ADC（Application Default Credentials）—— user 跑

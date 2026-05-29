@@ -267,6 +267,80 @@ def _is_silence(audio) -> bool:
     return rms < _MIN_RMS
 
 
+# ── v2.19.x Silero VAD v5：神經前置過濾 ──────────────────────────────────────
+# 補 RMS gate 漏網的「有能量但非人聲」（鍵盤、紙張、冷氣、背景音樂、麥克風拍打）。
+# 注意：silero-vad v5+ API 用 load_silero_vad() 而非 torch.hub.load。
+# 模型 ~9 MB（v6.2.1）、PyTorch backend；lazy load + module-level 快取，
+# 載入失敗一次就不再試（避免每次 transcribe 重試造成停頓）。
+_silero_vad_model = None
+_silero_vad_lock = threading.Lock()
+_silero_vad_load_failed = False
+
+
+def _ensure_silero_vad():
+    """Lazy load Silero VAD v5 model；回 None 表示載入失敗、呼叫端自行 fallback。"""
+    global _silero_vad_model, _silero_vad_load_failed
+    if _silero_vad_model is not None:
+        return _silero_vad_model
+    if _silero_vad_load_failed:
+        return None
+    with _silero_vad_lock:
+        if _silero_vad_model is not None:
+            return _silero_vad_model
+        if _silero_vad_load_failed:
+            return None
+        try:
+            from silero_vad import load_silero_vad
+            # PyTorch 版（CPU）；onnx 版速度差不多但會多一個 onnxruntime 重依賴
+            _silero_vad_model = load_silero_vad(onnx=False)
+            log.info("WHISPER: Silero VAD v5 loaded successfully")
+            return _silero_vad_model
+        except Exception as e:
+            log_error("silero_vad_load_failed", error=str(e))
+            log.warning(
+                f"WHISPER: Silero VAD load failed ({e}); falling back to RMS-only gate"
+            )
+            _silero_vad_load_failed = True
+            return None
+
+
+def _silero_no_voice(audio, threshold: float = 0.35) -> bool:
+    """用 Silero VAD v5 判斷整段音檔是否「不含人聲」。
+
+    回傳：
+      True  = 確認沒人聲（雜音 / 鍵盤 / 環境音）→ 呼叫端 short-circuit、不送 ASR
+      False = 有人聲（或 VAD 不可用 / 出錯）→ 呼叫端正常進 ASR
+
+    保守策略：任何 exception 都回 False（讓 ASR 正常跑、不要因 VAD 故障吃掉錄音）。
+    """
+    import numpy as np
+    model = _ensure_silero_vad()
+    if model is None:
+        return False   # VAD 不可用、不 short-circuit
+    try:
+        from silero_vad import get_speech_timestamps
+        import torch
+        # Silero VAD v5 需要 1-D torch tensor、float32、16 kHz
+        audio_tensor = torch.from_numpy(audio.astype(np.float32))
+        # threshold 是「>= threshold 才算 speech」、不是「<」
+        # min_speech_duration_ms=200：比 faster-whisper 內建 VAD（50ms）嚴格、
+        # 避免極短噪聲（按鍵 click）被當人聲；min_silence 給 300ms 是 VAD 預設值。
+        speech_segments = get_speech_timestamps(
+            audio_tensor,
+            model,
+            threshold=threshold,
+            sampling_rate=16_000,
+            min_speech_duration_ms=200,
+            min_silence_duration_ms=300,
+            return_seconds=False,
+        )
+        # 沒任何 speech segment = 整段純雜音
+        return len(speech_segments) == 0
+    except Exception as e:
+        log_error("silero_vad_inference_failed", error=str(e))
+        return False   # 故障時不擋
+
+
 def _is_dict_terms_hallucination(text: str, dict_terms: Optional[list[str]] = None) -> bool:
     """v2.16.3：偵測 Qwen3-ASR 把 context= 字典詞表整段「轉錄」回來的幻覺。
 
@@ -440,6 +514,18 @@ class Transcriber:
         # 預設關閉、避免新使用者意外累積大量音檔。
         self._suspicious_capture_enabled: bool = False
         self._suspicious_max_mb: int = 200
+        # v2.19.x：Silero VAD v5 設定（gui.py 套用 config 時透過 setter 推進來）
+        self._silero_vad_enabled: bool = True
+        self._silero_vad_threshold: float = 0.35
+
+    def set_silero_vad(self, enabled: bool, threshold: float = 0.35) -> None:
+        """v2.19.x：設定 Silero VAD v5 神經前置過濾。
+
+        由 gui.py 在啟動 / 套用 config 時呼叫。VAD 在 RMS gate 之後執行、
+        擋「有能量但非人聲」的雜音、抑制 ASR 幻覺。
+        """
+        self._silero_vad_enabled = bool(enabled)
+        self._silero_vad_threshold = float(threshold)
 
     def set_suspicious_capture(self, enabled: bool, max_mb: int = 200) -> None:
         """v2.19.0：設定可疑音檔是否保留落地。
@@ -595,6 +681,33 @@ class Transcriber:
                 gate_short=False, gate_silent=True,
                 elapsed=time.perf_counter() - t0,
             )
+            return TranscriptionResult(
+                text="（未偵測到語音內容）",
+                language="", duration_seconds=duration,
+                elapsed_seconds=time.perf_counter() - t0,
+            )
+
+        # v2.19.x Silero VAD gate：抓「有能量但非人聲」的雜音。
+        # 放在 RMS gate 之後——RMS 砍掉真靜音、Silero 砍掉鍵盤/紙張/冷氣/背景音樂。
+        # 兩層加起來把 ASR 暴露在「無真實 voice」的機率壓到接近 0。
+        # 觸發時走 audit_log 的 silero_vad_block event（非 transcribe entry）；
+        # transcribe entry 的 gates 不會出現這次、不衝突。
+        if self._silero_vad_enabled and _silero_no_voice(audio, self._silero_vad_threshold):
+            log.info(
+                f"WHISPER: Guard - Silero VAD detected no speech "
+                f"(threshold={self._silero_vad_threshold}, duration={duration:.2f}s), "
+                f"skipping inference."
+            )
+            if _audit_log is not None:
+                try:
+                    _audit_log.write_event(
+                        "silero_vad_block",
+                        pid or "",
+                        duration_s=float(duration),
+                        threshold=float(self._silero_vad_threshold),
+                    )
+                except Exception:
+                    pass
             return TranscriptionResult(
                 text="（未偵測到語音內容）",
                 language="", duration_seconds=duration,
@@ -761,6 +874,33 @@ class Transcriber:
 
         after_corrections = result.text
 
+        # v2.19.x：pinyin guard（拼音 fuzzy match 修中文 ASR 同音/近音誤辨）
+        # 跟 apply_corrections 同層、always-on、polish 關閉也跑
+        # 在 apply_corrections 之後、dedupe 之前：先 exact rule 修，再 fuzzy 補
+        try:
+            from dictionary import apply_pinyin_guard
+            if result.text and not result.text.startswith("（"):
+                before = result.text
+                result.text, pinyin_fixes = apply_pinyin_guard(result.text)
+                if pinyin_fixes:
+                    log.info(
+                        f"WHISPER: pinyin guard fixed {len(pinyin_fixes)} term(s): "
+                        f"{pinyin_fixes[:5]}"
+                    )
+                    # 寫 audit log（失敗 silent、不影響主流程）
+                    try:
+                        import audit_log
+                        import pipeline_id as _pid_mod
+                        audit_log.write_event(
+                            "pinyin_guard_hit",
+                            _pid_mod.get_current() or "",
+                            fixes=[{"from": f, "to": t} for f, t in pinyin_fixes],
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            log_error("apply_pinyin_guard_failed")
+
         # v2.19.0：n-gram 連續重複砍除（局部 dedupe）
         # 在 corrections 之後跑——corrections 改完詞才測重複；否則「Cloud Cloud Cloud」
         # 會先被砍成「Cloud」、apply_corrections 才有機會修「Cloud → Claude」。
@@ -864,6 +1004,11 @@ class Transcriber:
                 "gates": {
                     "duration_short": bool(gate_short),
                     "rms_silent": bool(gate_silent),
+                    # v2.19.x：Silero VAD 觸發時 transcribe() 直接 return、不會走到
+                    # _emit_audit，所以這個欄位在 transcribe entry 裡永遠是 False；
+                    # 真實 VAD block 統計請看 audit_log 的 silero_vad_block events。
+                    # 留欄位讓未來 schema 完整（避免 jq filter 寫 .gates.silero_no_voice 找不到）。
+                    "silero_no_voice": False,
                     "is_warmup": False,   # 標記給未來 warmup 路徑；此 emit 點固定 False
                 },
                 "raw_text": raw_text or final_text or "",
@@ -992,6 +1137,15 @@ class Transcriber:
             return TranscriptionResult(
                 text="（未偵測到語音內容）", language="",
                 duration_seconds=duration, elapsed_seconds=0.0,
+            )
+
+        # v2.19.x Silero VAD gate：streaming 路徑同樣受神經 VAD 保護。
+        # 雖然 streaming chunk 一般較短、被當人聲機率高，但鍵盤敲擊 / 拍打麥克風
+        # 同樣會 leak 進來、抑制這類雜音同樣重要。
+        if self._silero_vad_enabled and _silero_no_voice(audio, self._silero_vad_threshold):
+            return TranscriptionResult(
+                text="（未偵測到語音內容）", language="",
+                duration_seconds=duration, elapsed_seconds=time.perf_counter() - t0,
             )
 
         # 用 "small" 模型做快速推論（在此場景下 small 的速度/品質比最佳）
