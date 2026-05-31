@@ -469,6 +469,43 @@ def _normalize_volume(audio, target_peak: float = 0.9, min_peak: float = 0.5):
     return (audio * scale).astype(audio.dtype)
 
 
+def _make_keepalive_audio():
+    """合成 1.5s「假人聲」keepalive ping payload。
+
+    v2.20.2：取代純 440Hz sine wave。real-world audit log（5.3hr idle + 61 ping
+    仍 cold load 12s）顯示純 sine 觸發的 acoustic path 不夠完整、page resident
+    set 不夠廣。改用 multi-formant + AM envelope 更接近真實語音 spectral feature。
+
+    設計：
+      • Voicing tone：~150 Hz 基頻（中文男聲下沿）
+      • Formants：~800 / ~1500 / ~2500 Hz（中文母音 'i'/'a' 區間）
+      • AM envelope：5 Hz 模擬音節節奏（每秒 5 個假音節）
+      • 低 amplitude 0.05（耳機聽不到、但 RMS gate 跟 Silero VAD 都會放行）
+
+    注意：此 payload 只在 _warmup_qwen3 / _warmup_mlx 內走 backend.transcribe()
+    直呼叫使用，**不走** Transcriber.transcribe() 外層的 RMS gate / Silero VAD，
+    所以即使振幅 0.05（低於 _MIN_RMS 閾值）也不會被擋。
+    """
+    import numpy as np
+    sr = 16_000
+    t = np.arange(int(sr * 1.5), dtype=np.float32) / sr
+    f0 = 150.0          # 基頻
+    formants = [800.0, 1500.0, 2500.0]
+    formant_amps = [0.6, 0.3, 0.1]
+    # 多 formant 疊加
+    signal = sum(a * np.sin(2 * np.pi * f * t) for f, a in zip(formants, formant_amps))
+    # 加 voicing harmonic
+    signal += 0.4 * np.sin(2 * np.pi * f0 * t)
+    # AM envelope（5 Hz、模擬音節節奏）
+    envelope = 0.5 + 0.5 * np.sin(2 * np.pi * 5.0 * t)
+    signal *= envelope
+    # 歸一化 + 低音量
+    peak = np.abs(signal).max()
+    if peak > 0:
+        signal = signal / peak * 0.05
+    return signal.astype(np.float32)
+
+
 # ── 資料類別 ──────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -609,6 +646,16 @@ class Transcriber:
         # v2.19.0：transcribe 入口先抓 pipeline_id（每個 return path 都用到）
         pid = _safe_pipeline_id()
 
+        # v2.20.1：4 段 timing checkpoint
+        # 用於拆解 elapsed_s，對短音檔（< 2s）特別關鍵：startup overhead vs 推論本體
+        # 看起來很像、要分開才能正確判斷 RTF。
+        #   • t_start_pipeline   → pipeline 起點（normalize / VAD / dict snapshot 前）
+        #   • t_prep_end         → 進 backend 推論前（_normalize_volume + VAD + dict snapshot 結束）
+        #   • t_inference_end    → backend 推論結束（_transcribe_qwen3/mlx/ctranslate 出來）
+        #   • t_postprocess_end  → hallucination / corrections / pinyin / dedupe 結束
+        t_start_pipeline = time.perf_counter()
+        t_prep_end = t_inference_end = t_postprocess_end = t_start_pipeline  # 早期 return path 預設值
+
         # 空音訊：立即回傳錯誤訊息，不進行推論
         if audio is None or len(audio) == 0:
             log.error("WHISPER: Empty audio buffer received.")
@@ -621,6 +668,9 @@ class Transcriber:
                 duration=0.0, backend=BACKEND, result=None,
                 dict_terms_snapshot=[], gate_short=False, gate_silent=False,
                 error="empty_audio",
+                breakdown=self._make_breakdown(
+                    t_start_pipeline, t_start_pipeline, t_start_pipeline, t_start_pipeline,
+                ),
             )
             return TranscriptionResult(
                 text="（沒有偵測到音訊，請確認麥克風是否正常運作）",
@@ -665,12 +715,17 @@ class Transcriber:
                 f"WHISPER: Guard - Audio duration={duration:.2f}s < {_MIN_DURATION_S}s, "
                 f"skipping inference (too short, likely accidental trigger)."
             )
+            # v2.20.1：早期 return 把目前時點當 prep_end、後續 inference / postprocess 為 0
+            t_prep_end = time.perf_counter()
             self._emit_audit(
                 pid=pid, model_size=model_size, language=language,
                 quality=quality, duration=duration, backend=BACKEND,
                 result=None, dict_terms_snapshot=[],
                 gate_short=True, gate_silent=False,
                 elapsed=time.perf_counter() - t0,
+                breakdown=self._make_breakdown(
+                    t_start_pipeline, t_prep_end, t_prep_end, t_prep_end,
+                ),
             )
             return TranscriptionResult(
                 text="（未偵測到語音內容）",
@@ -686,12 +741,16 @@ class Transcriber:
                 f"WHISPER: Guard - Audio peak={_peak:.6f} rms={_rms:.6f} "
                 f"below threshold={_MIN_RMS} (duration={duration:.2f}s), skipping inference."
             )
+            t_prep_end = time.perf_counter()
             self._emit_audit(
                 pid=pid, model_size=model_size, language=language,
                 quality=quality, duration=duration, backend=BACKEND,
                 result=None, dict_terms_snapshot=[],
                 gate_short=False, gate_silent=True,
                 elapsed=time.perf_counter() - t0,
+                breakdown=self._make_breakdown(
+                    t_start_pipeline, t_prep_end, t_prep_end, t_prep_end,
+                ),
             )
             return TranscriptionResult(
                 text="（未偵測到語音內容）",
@@ -731,6 +790,9 @@ class Transcriber:
         # 拿到不一致字典，或 MLX → CTranslate fallback 時兩個後端用不同字典。
         dict_terms_snapshot = self._snapshot_dictionary_terms()
 
+        # v2.20.1：prep 結束 checkpoint（normalize + RMS gate + Silero VAD + dict snapshot 完成）
+        t_prep_end = time.perf_counter()
+
         # v2.19.0：實際走的 backend（fallback 後會改、影響 audit 與可疑音檔 metadata）
         actual_backend = "qwen3-asr" if _is_qwen3_model(model_size) else BACKEND
 
@@ -749,6 +811,9 @@ class Transcriber:
                     gate_short=False, gate_silent=False,
                     elapsed=time.perf_counter() - t0,
                     error="qwen3_requires_mlx",
+                    breakdown=self._make_breakdown(
+                        t_start_pipeline, t_prep_end, t_prep_end, t_prep_end,
+                    ),
                 )
                 return TranscriptionResult(
                     text="（Qwen3-ASR 需要 Apple Silicon MLX、請於設定切回 large-v3-turbo）",
@@ -766,6 +831,8 @@ class Transcriber:
                     "WHISPER: Qwen3-ASR 失敗、無 fallback；"
                     "user 須重試或於設定切回 large-v3-turbo"
                 )
+                # v2.20.1：inference 失敗、t_inference_end 用「現在」反映實際失敗耗時
+                t_inference_end_fail = time.perf_counter()
                 self._emit_audit(
                     pid=pid, model_size=model_size, language=language,
                     quality=quality, duration=duration, backend="qwen3-asr",
@@ -773,6 +840,9 @@ class Transcriber:
                     gate_short=False, gate_silent=False,
                     elapsed=time.perf_counter() - t0,
                     error=f"qwen3_failed:{type(exc).__name__}",
+                    breakdown=self._make_breakdown(
+                        t_start_pipeline, t_prep_end, t_inference_end_fail, t_inference_end_fail,
+                    ),
                 )
                 return TranscriptionResult(
                     text="（Qwen3-ASR 轉錄失敗、請重試或於設定切回 large-v3-turbo）",
@@ -794,6 +864,9 @@ class Transcriber:
                 result = self._transcribe_ctranslate(audio, model_size, language, dict_terms_snapshot)
         else:
             result = self._transcribe_ctranslate(audio, model_size, language, dict_terms_snapshot)
+
+        # v2.20.1：inference 結束 checkpoint（backend 任一條 path 出來都用同一個時點）
+        t_inference_end = time.perf_counter()
 
         # 填入實際的音訊長度與推論耗時（兩個後端的 _transcribe_* 不填這兩欄）
         result.duration_seconds = duration
@@ -934,6 +1007,9 @@ class Transcriber:
         preview = result.text[:100].replace("\n", " ")
         log.info(f"WHISPER: Result (lang={result.language}) text='{preview}'")
 
+        # v2.20.1：postprocess 結束 checkpoint（hallucination filter / corrections / pinyin / dedupe 都做完）
+        t_postprocess_end = time.perf_counter()
+
         # v2.19.0：寫 audit JSONL（成功路徑、最完整）
         self._emit_audit(
             pid=pid, model_size=model_size, language=language,
@@ -946,6 +1022,9 @@ class Transcriber:
             dedupe_hit=dedupe_hit, corrections_count=corrections_count,
             hallucination_segments_removed=hallucination_removed,
             dict_dump_detected=dict_dump_detected,
+            breakdown=self._make_breakdown(
+                t_start_pipeline, t_prep_end, t_inference_end, t_postprocess_end,
+            ),
         )
 
         # v2.19.0：可疑音檔保留（在 audit 寫完後才做、避免兩者互相干擾）。
@@ -962,6 +1041,29 @@ class Transcriber:
 
     # ── v2.19.0：observation helper ────────────────────────────────────────────
 
+    @staticmethod
+    def _make_breakdown(
+        t_start: float, t_prep_end: float, t_inference_end: float, t_postprocess_end: float,
+    ) -> dict:
+        """v2.20.1：把 4 個 perf_counter checkpoint 算成 breakdown dict（ms）。
+
+        4 個欄位讓 audit log 能拆解原本黑盒的 elapsed_s：
+          • prep_ms        — normalize_volume + RMS gate + Silero VAD + dict snapshot
+          • inference_ms   — backend ASR 推論本體（_transcribe_qwen3 / _mlx / _ctranslate）
+          • postprocess_ms — hallucination filter / corrections / pinyin / dedupe
+          • total_ms       — prep + inference + postprocess（= 舊 elapsed_s × 1000）
+
+        早期 return path（empty / duration_short / silence / qwen3_missing）會把
+        inference / postprocess 端的時點全壓在 t_prep_end，這幾段 ms = 0、
+        prep_ms 反映實際 prep 耗時。
+        """
+        return {
+            "prep_ms":        max(0.0, (t_prep_end       - t_start)        * 1000.0),
+            "inference_ms":   max(0.0, (t_inference_end  - t_prep_end)     * 1000.0),
+            "postprocess_ms": max(0.0, (t_postprocess_end - t_inference_end) * 1000.0),
+            "total_ms":       max(0.0, (t_postprocess_end - t_start)        * 1000.0),
+        }
+
     def _emit_audit(
         self, *, pid: str, model_size: str, language: Optional[str],
         quality: dict, duration: float, backend: str,
@@ -977,6 +1079,7 @@ class Transcriber:
         hallucination_segments_removed: int = 0,
         dict_dump_detected: bool = False,
         error: Optional[str] = None,
+        breakdown: Optional[dict] = None,
     ) -> None:
         """組 audit entry + 寫 JSONL；任何錯誤都吞掉、絕不讓 transcribe() 失敗。
 
@@ -989,6 +1092,16 @@ class Transcriber:
             result_lang = result.language if result else (language or "")
             segments_count = len(result.segments) if result else 0
             rtf_val = (elapsed / duration) if duration > 0 else 0.0
+
+            # v2.20.1：拆 elapsed_s → breakdown + inference_rtf
+            # 舊欄位（elapsed_s / rtf）維持原意義以保向下相容；新欄位讓分析端能
+            # 區分 startup overhead vs 真實模型速度。
+            #   • breakdown.inference_ms ÷ duration = inference_rtf
+            #     ← 才是「模型真實 RTF」，elapsed_s 那個 rtf 是「user 體感 RTF」
+            #   • breakdown 缺值（舊 callers）→ 寫空 dict，jq 用 `.breakdown // {}` 安全 fallback
+            breakdown_dict = dict(breakdown) if isinstance(breakdown, dict) else {}
+            inference_ms = float(breakdown_dict.get("inference_ms", 0.0)) if breakdown_dict else 0.0
+            inference_rtf = (inference_ms / 1000.0 / duration) if duration > 0 else 0.0
 
             # 字典效益：哪些 terms 出現在 final_text 裡（取前 30 避免 entry 過大）
             terms_in_text: list[str] = []
@@ -1016,6 +1129,9 @@ class Transcriber:
                 "language": result_lang or language or "",
                 "elapsed_s": float(elapsed),
                 "rtf": float(rtf_val),
+                # v2.20.1 新增：細分時段（ms） + 真實推論 RTF
+                "breakdown": breakdown_dict,
+                "inference_rtf": float(inference_rtf),
                 "gates": {
                     "duration_short": bool(gate_short),
                     "rms_silent": bool(gate_silent),
@@ -1251,7 +1367,7 @@ class Transcriber:
     # ── MLX 後端（Apple Silicon Metal GPU）────────────────────────────────────
 
     def _warmup_mlx(self, model_size: str) -> None:
-        """MLX 後端暖機：載入模型並跑一次 1.5s 低振幅 sine wave。
+        """MLX 後端暖機：載入模型並跑一次 1.5s 低振幅合成音檔。
 
         Fix 11 / 2026-05-23 — 為什麼不是 silence：
           原本跑 0.2s zeros，但 mlx_whisper 內建 VAD 偵測到靜音會 fast-skip，
@@ -1261,21 +1377,22 @@ class Transcriber:
           診斷依據是 5/22 一整天 RTF 都 0.06-0.13，但 5/23 重啟 App 後第一次
           推論 RTF 7.5。
 
-        修法：用 1.5s 440Hz sine wave at amplitude 0.1
+        修法：用 1.5s 假人聲（_make_keepalive_audio()，formant + AM envelope）
           • 通過內建 VAD（有能量 → 不被 fast-skip）
           • 強制走完整 encoder + decoder pipeline → Metal shader 全部編譯
-          • 加 beam_size=1 / temperature=0 / condition_on_previous_text=False
-            斷掉 temperature fallback chain（避免 sine wave 觸發幻覺重試把
+          • 加 temperature=0 + condition_on_previous_text=False
+            斷掉 temperature fallback chain（避免合成音檔觸發幻覺重試把
             warmup 自己拖到 10 秒以上）
+
+        v2.20.2：payload 從 440Hz sine 改成 formant-based 假人聲（與 _warmup_qwen3
+        共用 _make_keepalive_audio()）。real-world audit log 顯示純 sine page
+        residency 不夠廣，需要 spectral feature 更接近真實語音。
 
         Warmup 耗時：~2s → ~5s，但之後第一次正式錄音 RTF 可以維持 ~0.06。
         """
         import mlx_whisper
-        import numpy as np
         hf_repo = _MLX_MODEL_MAP.get(model_size, _MLX_MODEL_MAP["large-v3-turbo"])
-        sr = 16_000
-        t_axis = np.arange(int(sr * 1.5), dtype=np.float32) / sr
-        audio  = (0.1 * np.sin(2 * np.pi * 440.0 * t_axis)).astype(np.float32)
+        audio = _make_keepalive_audio()
         with self._transcription_lock:
             try:
                 # Fix 14 / 2026-05-23：mlx_whisper 偵測到 beam_size kwarg 就試圖走
@@ -1299,7 +1416,7 @@ class Transcriber:
                         language="zh",
                         verbose=False,
                     )
-                log.info(f"WHISPER: Warmup MLX complete (repo={hf_repo}, sine-wave 1.5s)")
+                log.info(f"WHISPER: Warmup MLX complete (repo={hf_repo}, payload=formant-1.5s)")
             except Exception:
                 log_error("warmup_mlx_failed", model=model_size, repo=hf_repo)
 
@@ -1532,21 +1649,22 @@ class Transcriber:
                 raise RuntimeError(f"無法載入 Qwen3-ASR session ({hf_repo}): {e}")
 
     def _warmup_qwen3(self, model_size: str) -> None:
-        """Qwen3-ASR 暖機：載入 session + 跑 1.5s sine wave 編譯 Metal shader。
+        """Qwen3-ASR 暖機：載入 session + 跑 1.5s 假人聲 payload 編譯 Metal shader。
 
-        類似 _warmup_mlx 的策略——用 sine wave 而非 silence、強制走完整
+        類似 _warmup_mlx 的策略——用合成音檔而非 silence、強制走完整
         encoder + decoder pipeline 把 Metal shader 全部編譯起來。
+
+        v2.20.2：payload 從 440Hz sine 改成 formant-based 假人聲（_make_keepalive_audio）。
+        理由：keepalive ping 也走這個路徑，需要更接近真實語音的 spectral feature
+        把更多 acoustic encoder 子模組的 weight page 帶回 active set。
         """
-        import numpy as np
-        sr = 16_000
-        t_axis = np.arange(int(sr * 1.5), dtype=np.float32) / sr
-        audio = (0.1 * np.sin(2 * np.pi * 440.0 * t_axis)).astype(np.float32)
         hf_repo = _qwen3_hf_repo(model_size)
+        audio = _make_keepalive_audio()
         with self._transcription_lock:
             try:
                 session = self._ensure_qwen3_session(model_size)
                 session.transcribe(audio, language="Chinese", context="")
-                log.info(f"WHISPER: Warmup Qwen3-ASR complete ({model_size}, sine-wave 1.5s)")
+                log.info(f"WHISPER: Warmup Qwen3-ASR complete ({model_size}, payload=formant-1.5s)")
             except Exception:
                 log_error("warmup_qwen3_failed", model=hf_repo)
 
