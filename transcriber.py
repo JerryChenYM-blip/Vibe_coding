@@ -517,6 +517,17 @@ class Transcriber:
         # v2.19.x：Silero VAD v5 設定（gui.py 套用 config 時透過 setter 推進來）
         self._silero_vad_enabled: bool = True
         self._silero_vad_threshold: float = 0.35
+        # v2.20.1：Pinyin guard 預設關（230 筆 real-world 抓到 sliding window FP）
+        self._pinyin_guard_enabled: bool = False
+
+    def set_pinyin_guard(self, enabled: bool) -> None:
+        """v2.20.1：啟用/停用 pinyin guard。
+
+        預設關。230 筆 audit log 抓到 sliding window + pinyin match 沒詞邊界
+        概念、把「已經準備」substring「經準」誤配「精準」→「已精準備」regression。
+        要啟用需先做 confusables whitelist 或 jieba 詞邊界保護。
+        """
+        self._pinyin_guard_enabled = bool(enabled)
 
     def set_silero_vad(self, enabled: bool, threshold: float = 0.35) -> None:
         """v2.19.x：設定 Silero VAD v5 神經前置過濾。
@@ -648,7 +659,8 @@ class Transcriber:
         # v2.19.0：長度閘 — 過短音檔直接 short-circuit，不送 ASR。
         # 0.4s 以下通常是 hotkey 誤觸 / streaming 殘餘 chunk，送進去會觸發
         # 字典 dump、假新詞、重複病三類幻覺。
-        if duration < _MIN_DURATION_S:
+        # v2.20.1：< 改 <= 補邊界 — audit log 抓到 duration=0.40 整數沒觸發、Silero 才擋。
+        if duration <= _MIN_DURATION_S:
             log.info(
                 f"WHISPER: Guard - Audio duration={duration:.2f}s < {_MIN_DURATION_S}s, "
                 f"skipping inference (too short, likely accidental trigger)."
@@ -875,31 +887,34 @@ class Transcriber:
         after_corrections = result.text
 
         # v2.19.x：pinyin guard（拼音 fuzzy match 修中文 ASR 同音/近音誤辨）
-        # 跟 apply_corrections 同層、always-on、polish 關閉也跑
-        # 在 apply_corrections 之後、dedupe 之前：先 exact rule 修，再 fuzzy 補
-        try:
-            from dictionary import apply_pinyin_guard
-            if result.text and not result.text.startswith("（"):
-                before = result.text
-                result.text, pinyin_fixes = apply_pinyin_guard(result.text)
-                if pinyin_fixes:
-                    log.info(
-                        f"WHISPER: pinyin guard fixed {len(pinyin_fixes)} term(s): "
-                        f"{pinyin_fixes[:5]}"
-                    )
-                    # 寫 audit log（失敗 silent、不影響主流程）
-                    try:
-                        import audit_log
-                        import pipeline_id as _pid_mod
-                        audit_log.write_event(
-                            "pinyin_guard_hit",
-                            _pid_mod.get_current() or "",
-                            fixes=[{"from": f, "to": t} for f, t in pinyin_fixes],
+        # v2.20.1：預設關 — 230 筆 audit log 抓到 false positive
+        #   「已經準備」substring「經準」被誤配字典「精準」→「已精準備」regression。
+        # sliding window 沒詞邊界概念、要靠 confusables whitelist 或 jieba 才能安全
+        # 重啟用。user 想試可改 config.pinyin_guard_enabled=True、自負風險。
+        if getattr(self, "_pinyin_guard_enabled", False):
+            try:
+                from dictionary import apply_pinyin_guard
+                if result.text and not result.text.startswith("（"):
+                    before = result.text
+                    result.text, pinyin_fixes = apply_pinyin_guard(result.text)
+                    if pinyin_fixes:
+                        log.info(
+                            f"WHISPER: pinyin guard fixed {len(pinyin_fixes)} term(s): "
+                            f"{pinyin_fixes[:5]}"
                         )
-                    except Exception:
-                        pass
-        except Exception:
-            log_error("apply_pinyin_guard_failed")
+                        # 寫 audit log（失敗 silent、不影響主流程）
+                        try:
+                            import audit_log
+                            import pipeline_id as _pid_mod
+                            audit_log.write_event(
+                                "pinyin_guard_hit",
+                                _pid_mod.get_current() or "",
+                                fixes=[{"from": f, "to": t} for f, t in pinyin_fixes],
+                            )
+                        except Exception:
+                            pass
+            except Exception:
+                log_error("apply_pinyin_guard_failed")
 
         # v2.19.0：n-gram 連續重複砍除（局部 dedupe）
         # 在 corrections 之後跑——corrections 改完詞才測重複；否則「Cloud Cloud Cloud」
@@ -1126,7 +1141,8 @@ class Transcriber:
         t0 = time.perf_counter()
 
         # v2.19.0：長度閘 — 跟 transcribe() 同策略
-        if duration < _MIN_DURATION_S:
+        # v2.20.1：< 改 <= 補邊界
+        if duration <= _MIN_DURATION_S:
             return TranscriptionResult(
                 text="（未偵測到語音內容）", language="",
                 duration_seconds=duration, elapsed_seconds=0.0,

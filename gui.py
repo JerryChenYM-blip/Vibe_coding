@@ -293,6 +293,14 @@ class AppWindow(ctk.CTkFrame):
                 )
             except Exception:
                 log_error("set_silero_vad_init_failed")
+        # v2.20.1：Pinyin guard 預設關（regression 從 real-world 抓到）
+        if hasattr(self.transcriber, "set_pinyin_guard"):
+            try:
+                self.transcriber.set_pinyin_guard(
+                    getattr(cfg, "pinyin_guard_enabled", False)
+                )
+            except Exception:
+                log_error("set_pinyin_guard_init_failed")
         self.ollama      = OllamaClient()
         # 用設定檔同步 Ollama 參數（base_url / model / enabled / timeout）
         self.ollama.apply_app_config(cfg)
@@ -3323,6 +3331,15 @@ class AppWindow(ctk.CTkFrame):
                 )
             except Exception:
                 log_error("set_silero_vad_apply_failed")
+
+        # v2.20.1：Pinyin guard 設定同步（預設關、user 改了 config.json 也能即時生效）
+        if hasattr(self.transcriber, "set_pinyin_guard"):
+            try:
+                self.transcriber.set_pinyin_guard(
+                    getattr(cfg, "pinyin_guard_enabled", False)
+                )
+            except Exception:
+                log_error("set_pinyin_guard_apply_failed")
 
         # 字典：重新載入（可能 enabled 變了，或路徑變了）
         self._reload_dictionary()
