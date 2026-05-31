@@ -31,6 +31,54 @@ _LOCK = threading.Lock()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# v2.20.3 N8：config hash — 標記每筆 audit entry 所在的設定 snapshot
+# 未來 A/B 分析 jq 一行可 group by：
+#   jq -c 'select(.type=="transcribe") | {hash: .config_hash, rtf: .rtf}' transcribe_log.jsonl
+# ─────────────────────────────────────────────────────────────────────────────
+_config_hash_lock = threading.Lock()
+_current_config_hash: str = "init"
+
+
+def set_config_hash(config_obj) -> str:
+    """v2.20.3 N8：算 config 的 8-char SHA-1 hash、設為 current。
+
+    只 hash 「會影響 transcribe behavior」的欄位、其他（theme、history_retention_days）不算
+    避免外觀改動造成假 A/B 分組。
+
+    回傳 hash（也設定到 module-level state）。
+    """
+    import hashlib
+    global _current_config_hash
+    # 只取會影響轉錄/潤飾/streaming 行為的欄位
+    relevant = {
+        "model":                 getattr(config_obj, "model", None),
+        "language":              getattr(config_obj, "language", None),
+        "polish_backend":        getattr(config_obj, "polish_backend", None),
+        "ollama_enabled":        getattr(config_obj, "ollama_enabled", None),
+        "ollama_model":          getattr(config_obj, "ollama_model", None),
+        "silero_vad_enabled":    getattr(config_obj, "silero_vad_enabled", None),
+        "silero_vad_threshold":  getattr(config_obj, "silero_vad_threshold", None),
+        "pinyin_guard_enabled":  getattr(config_obj, "pinyin_guard_enabled", None),
+        "streaming_algo":        getattr(config_obj, "streaming_algo", None),
+        "chinese_variant":       getattr(config_obj, "chinese_variant", None),
+        "preset_routing_enabled": getattr(config_obj, "preset_routing_enabled", None),
+        "dictionary_enabled":    getattr(config_obj, "dictionary_enabled", None),
+        "vertex_model":          getattr(config_obj, "vertex_model", None),
+    }
+    serialized = json.dumps(relevant, sort_keys=True, ensure_ascii=False)
+    h = hashlib.sha1(serialized.encode("utf-8")).hexdigest()[:8]
+    with _config_hash_lock:
+        _current_config_hash = h
+    return h
+
+
+def get_config_hash() -> str:
+    """v2.20.3 N8：讀 current config hash（給內部用）。"""
+    with _config_hash_lock:
+        return _current_config_hash
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # JSON 序列化 helpers — 處理 numpy / Path 等非原生型別
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -133,6 +181,8 @@ def write_transcribe(entry: dict) -> None:
     rec = dict(entry)
     rec.setdefault("type", "transcribe")
     rec.setdefault("ts", _now_iso())
+    # v2.20.3 N8：自動帶 config_hash（呼叫端沒帶才補；呼叫端有蓋值就尊重）
+    rec.setdefault("config_hash", get_config_hash())
 
     _append_jsonl(rec)
 
@@ -156,8 +206,10 @@ def write_event(event_type: str, pipeline_id: Optional[str], **fields: Any) -> N
         "type": str(event_type),
         "ts":   _now_iso(),
         "pipeline_id": pipeline_id,
+        "config_hash": get_config_hash(),  # v2.20.3 N8：自動帶 config snapshot 標記
     }
     # 把 fields 平鋪進 record（不嵌套，方便 jq 撈）
+    # 注意：若 fields 含 config_hash、會蓋掉上面預設值（呼叫端有意覆寫就尊重）
     for k, v in fields.items():
         rec[k] = v
 

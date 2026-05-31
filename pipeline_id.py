@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import os
+import time
 import threading
 from typing import Optional, Any
 
@@ -22,6 +23,11 @@ log = get_logger("pipeline")
 
 # Thread-local storage：每個 thread 各自有一份「目前 pipeline id」
 _local = threading.local()
+
+# v2.20.3 N3：thread-local timeline 狀態，記下 pipeline 內每個 milestone 的時間戳。
+# 跟 _local 分開放：pid 是「這 thread 現在屬於哪條 pipeline」，timeline 是
+# 「這 thread 目前 pipeline 跑到哪、各 milestone 何時達到」。
+_timeline_state = threading.local()
 
 # base36 字母表
 _BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
@@ -107,3 +113,60 @@ def event(event_name: str, **fields: Any) -> None:
             log_error("pipeline_event_audit_failed", event=event_name)
         except Exception:
             pass
+
+
+# ── v2.20.3 N3：Pipeline timing breakdown ─────────────────────────────────────
+# 用途：細分一條 pipeline 從「hotkey release → paste complete」中間每個 milestone
+# 各花多少 ms。讓 user-perceived latency 不再只有一個總數、能拆出真正的瓶頸
+# （錄音收尾？模型推論？postprocess？polish？貼上？）。
+#
+# 與 _local（pid）分工：
+#   - _local.pid       —— 「我現在屬於哪條 pipeline」（給 log/audit 串貫）
+#   - _timeline_state  —— 「這條 pipeline 已經跑過哪些 milestone、各 perf_counter() 多少」
+# 兩者皆 per-thread；pipeline 跨 thread 時呼叫端要負責把 milestone 都記在
+# 同一個 thread（目前 gui.py 主執行緒走 callback 鏈、天然在同 thread）。
+
+def record_event(name: str) -> None:
+    """記下 pipeline 中達到 named milestone 的時間（per-thread）。
+
+    Silent fail — 計時系統不能影響真正流程。
+    """
+    try:
+        if not hasattr(_timeline_state, "events"):
+            _timeline_state.events = {}
+        _timeline_state.events[name] = time.perf_counter()
+    except Exception:
+        pass
+
+
+def get_durations() -> dict[str, float]:
+    """回傳目前 thread 各 milestone 相對 anchor 的 ms 數。
+
+    Anchor 邏輯：優先用 `hotkey_release`；沒有則拿最早出現的 milestone 當 anchor。
+    回傳的 dict key 形如 `{milestone}_ms`，value 是相對 anchor 的毫秒數（float）。
+    沒有任何 milestone 時回傳 {}。
+
+    例：events = {hotkey_release: 100.0, transcribe_done: 100.945, paste_complete: 101.01}
+        return: {"hotkey_release_ms": 0.0, "transcribe_done_ms": 945.0, "paste_complete_ms": 1010.0}
+    """
+    try:
+        if not hasattr(_timeline_state, "events"):
+            return {}
+        events = _timeline_state.events
+        if not events:
+            return {}
+        anchor = events.get("hotkey_release")
+        if anchor is None:
+            anchor = min(events.values())
+        return {f"{k}_ms": (v - anchor) * 1000.0 for k, v in events.items()}
+    except Exception:
+        return {}
+
+
+def clear_events() -> None:
+    """清空當前 thread 的 timeline（pipeline 結束時呼叫）。"""
+    try:
+        if hasattr(_timeline_state, "events"):
+            _timeline_state.events = {}
+    except Exception:
+        pass

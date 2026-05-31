@@ -146,6 +146,30 @@ def record_paste_latency(latency_s: float) -> None:
             pass
 
 
+def record_pipeline_timing(durations: dict) -> None:
+    """v2.20.3 N3：每條 pipeline 各段時間（ms）。
+
+    durations dict 形如：
+        {"hotkey_release_ms": 0.0, "transcribe_start_ms": 45.0,
+         "transcribe_done_ms": 945.0, "paste_complete_ms": 1010.0}
+
+    內部用 dict-of-list 累積、emit_summary 時取中位數。Silent fail。
+    """
+    try:
+        with _lock:
+            if not isinstance(durations, dict) or not durations:
+                return
+            bucket = _state.setdefault("pipeline_timing", {})
+            for k, v in durations.items():
+                if isinstance(v, (int, float)):
+                    bucket.setdefault(k, []).append(float(v))
+    except Exception:
+        try:
+            log_error("session_summary_pipeline_timing_failed")
+        except Exception:
+            pass
+
+
 def emit_summary() -> str:
     """產生多行 summary 字串。也寫一筆 type=session 進 audit JSONL。
 
@@ -255,6 +279,9 @@ def _snapshot_locked() -> dict[str, Any]:
     gates_fired = dict(_state["gates_fired"])
     backend_counts = dict(_state["backend_counts"])
     hallucinations = dict(_state["hallucinations"])
+    # v2.20.3 N3：深拷貝 pipeline timing buckets（list 重新建構避免外部 mutate）
+    pt_src = _state.get("pipeline_timing") or {}
+    pipeline_timing = {k: list(v) for k, v in pt_src.items()}
 
     total_short_circuited = sum(
         c for k, c in gates_fired.items() if k in ("duration_short", "rms_silent", "is_warmup")
@@ -284,6 +311,8 @@ def _snapshot_locked() -> dict[str, Any]:
         "polish_avg_latency":  _avg(polish_lat),
         "paste_avg_latency":   _avg(paste_lat),
         "errors":              _state["errors"],
+        # v2.20.3 N3：pipeline 各 milestone 累積 list
+        "pipeline_timing":     pipeline_timing,
     }
 
 
@@ -377,6 +406,17 @@ def _format_summary(snap: dict[str, Any]) -> list[str]:
         f"  └─ avg user-perceived latency (hotkey release→paste): "
         f"{snap['paste_avg_latency']:.1f}s"
     )
+
+    # v2.20.3 N3：pipeline timing breakdown（中位數、ms）
+    # 用「median per milestone」拆解 user-perceived latency；
+    # 預期 milestone：hotkey_release_ms（恆為 0）、transcribe_start_ms、
+    # transcribe_done_ms、polish_start_ms、polish_done_ms、
+    # paste_start_ms、paste_complete_ms（依路徑而定）
+    pt = snap.get("pipeline_timing") or {}
+    if pt:
+        medians = {k: round(_percentile(v, 50), 1) for k, v in pt.items() if v}
+        if medians:
+            lines.append(f"  ├─ pipeline timing (median ms): {medians}")
 
     if snap["errors"]:
         lines.append(f"  (errors during session: {snap['errors']})")
