@@ -214,9 +214,13 @@ class AppWindow(ctk.CTkFrame):
     # v2.17.4：定期跑 dummy ASR 防 MLX weights 被 macOS swap out。
     # 實機觀察：35 分鐘閒置後第一次 ASR 從 RTF 0.2 飆到 4.85（24x 慢）—— macOS
     # 把 3.4GB Qwen3-ASR weights page out 到磁碟、首次推論要 page-in。
-    # 5 分鐘背景跑一次 1.5s sine wave 保活、強迫 weights 留在 active page。
+    # 背景定期跑保活、強迫 weights 留在 active page。
     # 只在 state=idle 跑（避免跟 user 的 transcribe 撞 lock）。
-    MLX_KEEPALIVE_INTERVAL_MS = 5 * 60 * 1000   # 5 分鐘
+    #
+    # v2.20.2：5 min → 90s — real-world audit log（5.3hr idle + 61 ping 仍 cold load 12s）
+    # 證明 5min 間隔不足以抵擋 macOS unified memory page-out。90s 比較保守、
+    # 同時也是經驗值：M 系列 unified memory 大概 60-120s 不被 access 就會被 OS 標 page-out 候選。
+    MLX_KEEPALIVE_INTERVAL_MS = 90 * 1000   # 90 秒
 
     # Fix 18 / 2026-05-23（Layer 2）：每 N 毫秒無條件 force-restart NSEvent monitor。
     # 即使 monitor 物件還 alive、其底層 ObjC block 仍可能在閒置 1hr+ 後被 invalidate
@@ -3844,9 +3848,12 @@ class AppWindow(ctk.CTkFrame):
                 # 只對已載入的模型 keepalive（轉錄 lock 內、不撞用戶操作）
                 def _ping():
                     try:
-                        # 沿用 transcriber.warmup() — 跑 1.5s sine wave
+                        # v2.20.2：沿用 transcriber.warmup() —— 內部已換成
+                        # _make_keepalive_audio()（1.5s formant-based 假人聲、低音量）。
+                        # 走 session.transcribe() 直呼叫、不過 Transcriber.transcribe()
+                        # 外層的 RMS gate / Silero VAD，所以不會被擋掉。
                         self.transcriber.warmup(model)
-                        log.debug(f"MLX_KEEPALIVE: ping done (model={model})")
+                        log.info(f"MLX_KEEPALIVE: ping done (model={model}, payload=formant-1.5s)")
                     except Exception:
                         log_error("mlx_keepalive_ping_failed", model=model)
                 threading.Thread(target=_ping, daemon=True).start()

@@ -26,11 +26,49 @@ import traceback
 # ── C-level 崩潰記錄器 ───────────────────────────────────────────────────────
 # 捕捉 SIGSEGV / SIGABRT / SIGBUS 等 C 層面崩潰（例如 MLX/Metal mutex 失敗）。
 # 這類崩潰 Python 例外機制抓不到，faulthandler 會在 kill 前把 traceback 寫入
-# fault.log，方便事後分析。用獨立檔案（而非 whisper_app.log）避免被 rotation
-# 截斷。路徑仍固定在專案根目錄，方便 debug 時立即可見。
-_fault_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fault.log")
-_fault_log_fh = open(_fault_log_path, "a", encoding="utf-8")
-faulthandler.enable(file=_fault_log_fh, all_threads=True)  # 所有執行緒的 traceback 都記下來
+# fault.log，方便事後分析。
+#
+# v2.20.2 F3 修：
+#  • path 從 project root 搬到 ~/.whisper_app/fault.log，跟其他 log 一起。
+#    舊位置（project root）在 .app bundle 內是 read-only，會 silent fail；
+#    且 user 不會自己跑去 project root 翻檔。
+#  • 開檔用 line-buffered（buffering=1），確保 process 突然 die 時尾段也能
+#    刷到磁碟。
+#  • 額外 register SIGTERM / SIGUSR1 ── 主要抓 single-instance lockfile 把
+#    舊 process 用 SIGTERM 殺掉時的 traceback，過去這類事件 silent 沒紀錄。
+#  • 每次啟動寫一行 attach banner，方便辨識「這次啟動 vs 上次 crash」邊界。
+#  • 檔案不顯式 close ── 整個 process 生命期都開著，由 OS 在 process die
+#    時自然 flush + close（line-buffered 已經保證內容隨寫隨入磁碟）。
+_fault_log_path = os.path.join(
+    os.path.expanduser("~/.whisper_app"), "fault.log",
+)
+try:
+    os.makedirs(os.path.dirname(_fault_log_path), exist_ok=True)
+except Exception:
+    # 連資料夾都建不起來就算了，下面 open 會自然失敗
+    pass
+
+try:
+    # buffering=1 = line-buffered；crash 前最後幾行能進磁碟
+    _fault_log_fh = open(_fault_log_path, "a", encoding="utf-8", buffering=1)
+    faulthandler.enable(file=_fault_log_fh, all_threads=True)
+    # 額外抓 SIGTERM（被別人殺掉）/ SIGUSR1（手動 trigger debug dump）
+    try:
+        faulthandler.register(signal.SIGTERM, file=_fault_log_fh, all_threads=True)
+        faulthandler.register(signal.SIGUSR1, file=_fault_log_fh, all_threads=True)
+    except Exception:
+        # Windows 沒 SIGUSR1、或極端環境 register 失敗都不致命
+        pass
+    # 起新 session 時寫一行分隔 banner，方便辨識「上次 crash vs 本次啟動」
+    _fault_log_fh.write(
+        f"\n=== faulthandler attached at {datetime.datetime.now().isoformat()} "
+        f"(pid={os.getpid()}) ===\n"
+    )
+    _fault_log_fh.flush()
+except Exception as _e:
+    # 即使 fault.log 開不起來，App 仍要能啟動 ── 退回到 stderr enable
+    sys.stderr.write(f"[main] faulthandler enable failed: {_e}\n")
+    faulthandler.enable(all_threads=True)
 
 
 # ── 匯入統一日誌系統 ─────────────────────────────────────────────────────────
@@ -401,8 +439,27 @@ def main() -> None:
     threading.Thread(target=_warmup_silero, daemon=True).start()
 
     # ── 6. 視窗關閉處理 ──────────────────────────────────────────────────────
+    # v2.20.2 F2 修：用 module-level guard 防 _on_close 被多次觸發（紅× +
+    # ⌘Q + Dock quit 任兩個若在同一個 mainloop tick 內進來，WM_DELETE_WINDOW
+    # callback 可能被排到兩次；guard 確保 emit_summary 只跑一次）。
+    _close_state = {"called": False}
+
     def _on_close():
-        """使用者按視窗關閉按鈕時：先通知 AppWindow 清理資源，再銷毀 tkinter。"""
+        """使用者按視窗關閉按鈕時：先通知 AppWindow 清理資源，再銷毀 tkinter。
+
+        v2.20.2 F2 修：
+        - 加 `_close_state["called"]` idempotent guard。
+        - 移除「把 emit_summary() 的 return value split 後逐行 log」這段
+          —— emit_summary 內部本身已經 `for line in lines: log.info(line)`
+          自己印一次（session_summary.py:200-204）。呼叫端再印就變雙印。
+        - 分隔線改成只印一次（before/after summary 各一條，由本函式負責；
+          summary 內容由 emit_summary 自己負責）。
+        """
+        if _close_state["called"]:
+            log.debug("SESSION: _on_close re-entered, skip (idempotent)")
+            return
+        _close_state["called"] = True
+
         log.info("SESSION: user requested close")
         try:
             app.on_close()
@@ -411,12 +468,12 @@ def main() -> None:
         root.destroy()
         # v2.19.0：印出整個 session 的 polish / paste latency summary。
         # 包 try/except 確保觀測性失敗不影響正常關閉流程。
+        # 注意：emit_summary() 內部自己會 log.info 每一行（side-effect），
+        # 這裡只負責印 banner 分隔線、不要再印 return value。
         try:
             import session_summary  # type: ignore
-            summary_str = session_summary.emit_summary()
             log.info("=" * 60)
-            for line in summary_str.split("\n"):
-                log.info(line)
+            session_summary.emit_summary()   # 內部會自己 log.info 每行
             log.info("=" * 60)
         except Exception:
             pass

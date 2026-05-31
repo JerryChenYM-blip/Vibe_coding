@@ -32,7 +32,8 @@ def _fresh_state() -> dict[str, Any]:
         "session_start_wall": datetime.now(),  # 用於 emit summary 顯示
         "transcribe_count":  0,
         "backend_counts":    {},   # {"qwen3-asr": 82, "large-v3-turbo": 5}
-        "rtf_list":          [],   # for p50/p95/p99
+        "rtf_list":          [],   # for p50/p95/p99（user-perceived RTF = elapsed_s / duration）
+        "inference_rtf_list": [],  # v2.20.1：真實模型 RTF（breakdown.inference_ms / duration）
         "elapsed_list":      [],   # 轉錄秒數（不算 polish）
         "gates_fired":       {},   # {"duration_short": 3, "rms_silent": 12, ...}
         "hallucinations":    {     # 三種反幻覺機制各記一個 counter
@@ -77,6 +78,10 @@ def record_transcribe(entry: dict) -> None:
             elapsed = entry.get("elapsed_s")
             if isinstance(elapsed, (int, float)):
                 _state["elapsed_list"].append(float(elapsed))
+            # v2.20.1：真實推論 RTF（剔除 prep + postprocess）
+            inf_rtf = entry.get("inference_rtf")
+            if isinstance(inf_rtf, (int, float)) and inf_rtf > 0:
+                _state["inference_rtf_list"].append(float(inf_rtf))
 
             # Gates fired（True 才算 fire；is_warmup 也算記一筆）
             gates = entry.get("gates") or {}
@@ -181,6 +186,9 @@ def emit_summary() -> str:
             rtf_p50=snap["rtf_p50"],
             rtf_p95=snap["rtf_p95"],
             rtf_p99=snap["rtf_p99"],
+            # v2.20.1：真實推論 RTF（剔除 startup overhead）
+            inference_rtf_median=snap["inference_rtf_median"],
+            inference_rtf_count=snap["inference_rtf_count"],
             gates_fired=snap["gates_fired"],
             hallucinations=snap["hallucinations"],
             corrections_total=snap["corrections_total"],
@@ -241,6 +249,7 @@ def _snapshot_locked() -> dict[str, Any]:
     """在 lock 之下取一份穩定的 snapshot（避免 race）。"""
     duration_s = max(0.0, time.monotonic() - _state["session_start_ts"])
     rtfs = list(_state["rtf_list"])
+    inf_rtfs = list(_state["inference_rtf_list"])
     polish_lat = list(_state["polish_latencies"])
     paste_lat = list(_state["paste_latencies"])
     gates_fired = dict(_state["gates_fired"])
@@ -262,6 +271,9 @@ def _snapshot_locked() -> dict[str, Any]:
         "rtf_p50":             _percentile(rtfs, 50),
         "rtf_p95":             _percentile(rtfs, 95),
         "rtf_p99":             _percentile(rtfs, 99),
+        # v2.20.1：真實推論 RTF（剔除 startup overhead）；空 list 時為 0
+        "inference_rtf_median": _percentile(inf_rtfs, 50),
+        "inference_rtf_count":  len(inf_rtfs),
         "gates_fired":         gates_fired,
         "total_short_circuited": total_short_circuited,
         "short_circuit_ratio": short_circuit_ratio,
@@ -315,6 +327,16 @@ def _format_summary(snap: dict[str, Any]) -> list[str]:
         )
     else:
         lines.append("  ├─ avg RTF: (no data)")
+
+    # v2.20.1：真實推論 RTF（剔除 prep + postprocess startup overhead）
+    # vs 上一行的 total RTF（user 體感）：這行才是「模型本體有多快」
+    if snap["inference_rtf_count"] > 0:
+        lines.append(
+            f"  ├─ avg inference_rtf: {snap['inference_rtf_median']:.2f} "
+            f"(median, vs total RTF {snap['rtf_p50']:.2f})"
+        )
+    else:
+        lines.append("  ├─ avg inference_rtf: (no data)")
 
     # Gates fired
     gates = snap["gates_fired"]
