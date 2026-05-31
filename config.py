@@ -131,6 +131,13 @@ class Config:
     silero_vad_enabled:   bool  = True
     silero_vad_threshold: float = 0.35
 
+    # v2.20.1 Pinyin guard — 預設關（v2.20.0 上線後 230 筆 audit log 發現
+    # sliding window + pinyin match 沒詞邊界概念、會把「已經準備」substring
+    # 「經準」誤配字典「精準」→ 改成「已精準備」這類 false positive。
+    # 真實 workload 1 hit / 230 全是 regression。
+    # 想啟用要先補 confusables whitelist 或 jieba 詞邊界保護。
+    pinyin_guard_enabled: bool = False
+
     # ── Phase 3.2 歷史紀錄 ──────────────────────────────────────────────────
 
     # 啟用時每次轉錄（含潤飾）寫入 ~/.whisper_app/history.db
