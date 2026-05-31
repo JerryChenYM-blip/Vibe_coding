@@ -557,6 +557,15 @@ class Transcriber:
         # v2.20.1：Pinyin guard 預設關（230 筆 real-world 抓到 sliding window FP）
         self._pinyin_guard_enabled: bool = False
 
+        # v2.20.3 N2：cold/warm 自動推斷狀態
+        # 給 audit log 的 context 子物件用，下游 jq 可據此判斷一筆轉錄
+        # 落在 cold（剛重啟、距上次 keepalive 久）或 warm（剛 ping 過）區間。
+        self._last_transcribe_at: Optional[float] = None       # perf_counter
+        self._last_keepalive_ping_at: Optional[float] = None   # perf_counter
+        self._session_start_at: float = time.perf_counter()
+        self._warmup_completed: bool = False
+        self._transcribe_count: int = 0   # 用來判斷 is_first_after_restart
+
     def set_pinyin_guard(self, enabled: bool) -> None:
         """v2.20.1：啟用/停用 pinyin guard。
 
@@ -593,6 +602,18 @@ class Transcriber:
         """
         with self._dictionary_lock:
             self._dictionary_terms = list(terms) if terms else []
+
+    # v2.20.3 N2：cold/warm 自動推斷的兩個 setter
+    # gui.py 在 keepalive ping 跑完、warmup 跑完時呼叫；transcribe() 入口
+    # 抓 perf_counter 差值即可判斷該次轉錄距離上次 ping/warmup 多久。
+
+    def mark_keepalive_ping(self) -> None:
+        """v2.20.3 N2：gui.py 在 keepalive ping 跑完時呼叫。"""
+        self._last_keepalive_ping_at = time.perf_counter()
+
+    def mark_warmup_complete(self) -> None:
+        """v2.20.3 N2：warmup 跑完時呼叫（覆蓋既有的 warmup() 結尾）。"""
+        self._warmup_completed = True
 
     def _snapshot_dictionary_terms(self) -> list[str]:
         """D2-S3：lock 內取 _dictionary_terms 的淺拷貝快照。
@@ -656,6 +677,26 @@ class Transcriber:
         t_start_pipeline = time.perf_counter()
         t_prep_end = t_inference_end = t_postprocess_end = t_start_pipeline  # 早期 return path 預設值
 
+        # v2.20.3 N2：捕捉 context 給 audit entry
+        # is_first_after_restart 用「_transcribe_count == 0」判斷（呼叫這次之前 0 次）。
+        # 早期 return path（empty / short / silence / VAD block）也帶 context、
+        # 一律把這次算進去（_transcribe_count += 1），這樣下一筆即使是早期 return
+        # 也能正確得到「距上次嘗試」的秒數。
+        now = time.perf_counter()
+        context = {
+            "seconds_since_last_transcribe": (now - self._last_transcribe_at) if self._last_transcribe_at else None,
+            "seconds_since_last_keepalive_ping": (now - self._last_keepalive_ping_at) if self._last_keepalive_ping_at else None,
+            "seconds_since_session_start": now - self._session_start_at,
+            "warmup_completed": self._warmup_completed,
+            "is_first_after_restart": self._transcribe_count == 0,
+        }
+        self._transcribe_count += 1
+        self._last_transcribe_at = now
+
+        # v2.20.3 N4：corrections_hit 收集器（在 corrections filter 套用時被 update）
+        # 留在 transcribe() 整個 scope 末端、最後塞進 dict_effectiveness 傳給 _emit_audit。
+        corrections_hit: dict = {}
+
         # 空音訊：立即回傳錯誤訊息，不進行推論
         if audio is None or len(audio) == 0:
             log.error("WHISPER: Empty audio buffer received.")
@@ -671,6 +712,7 @@ class Transcriber:
                 breakdown=self._make_breakdown(
                     t_start_pipeline, t_start_pipeline, t_start_pipeline, t_start_pipeline,
                 ),
+                context=context,   # v2.20.3 N2
             )
             return TranscriptionResult(
                 text="（沒有偵測到音訊，請確認麥克風是否正常運作）",
@@ -726,6 +768,7 @@ class Transcriber:
                 breakdown=self._make_breakdown(
                     t_start_pipeline, t_prep_end, t_prep_end, t_prep_end,
                 ),
+                context=context,   # v2.20.3 N2
             )
             return TranscriptionResult(
                 text="（未偵測到語音內容）",
@@ -751,6 +794,7 @@ class Transcriber:
                 breakdown=self._make_breakdown(
                     t_start_pipeline, t_prep_end, t_prep_end, t_prep_end,
                 ),
+                context=context,   # v2.20.3 N2
             )
             return TranscriptionResult(
                 text="（未偵測到語音內容）",
@@ -814,6 +858,7 @@ class Transcriber:
                     breakdown=self._make_breakdown(
                         t_start_pipeline, t_prep_end, t_prep_end, t_prep_end,
                     ),
+                    context=context,   # v2.20.3 N2
                 )
                 return TranscriptionResult(
                     text="（Qwen3-ASR 需要 Apple Silicon MLX、請於設定切回 large-v3-turbo）",
@@ -843,6 +888,7 @@ class Transcriber:
                     breakdown=self._make_breakdown(
                         t_start_pipeline, t_prep_end, t_inference_end_fail, t_inference_end_fail,
                     ),
+                    context=context,   # v2.20.3 N2
                 )
                 return TranscriptionResult(
                     text="（Qwen3-ASR 轉錄失敗、請重試或於設定切回 large-v3-turbo）",
@@ -921,15 +967,40 @@ class Transcriber:
                     result.text = "".join(s["text"].strip() for s in kept).strip()
                 else:
                     result.text = "（未偵測到語音內容）"
+                # v2.20.3 N7：per-filter audit event
+                try:
+                    if _audit_log is not None:
+                        _audit_log.write_event(
+                            "post_filter_applied",
+                            _safe_pipeline_id(),
+                            filter="hallucination_segments",
+                            removed=int(removed),
+                            kept=int(len(kept)),
+                        )
+                except Exception:
+                    pass
         elif _is_any_hallucination(result.text):
             dict_dump_detected = _is_dict_terms_hallucination(result.text, dict_terms_snapshot)
             blacklist_hit = _is_hallucination(result.text)
+            before_text = result.text
             log.warning(
                 f"WHISPER: Guard - Detected hallucination "
                 f"(dict-terms type={dict_dump_detected}): "
                 f"'{result.text[:50]}...'"
             )
             result.text = "（未偵測到語音內容）"
+            # v2.20.3 N7：per-filter audit event（整段被換掉）
+            try:
+                if _audit_log is not None:
+                    _audit_log.write_event(
+                        "post_filter_applied",
+                        _safe_pipeline_id(),
+                        filter="hallucination_full_text",
+                        is_dict_dump=bool(dict_dump_detected),
+                        before_text=before_text[:200],
+                    )
+            except Exception:
+                pass
 
         # v2.19.0：追蹤 dedupe 之後的文字（給 audit 「after_dedupe」欄位）
         # 注意：「after_dedupe」實際是「過幻覺 filter 之後、跑 dedupe 之前」的文字
@@ -950,10 +1021,31 @@ class Transcriber:
                 result.text = apply_corrections(result.text, corrections)
                 if before != result.text:
                     corrections_count = len(corrections)
+                    # v2.20.3 N7：算具體 hits（哪幾條規則命中）順手填 corrections_hit。
+                    # corrections 形態是 list[tuple[str, str]]（見 dictionary.load_corrections）。
+                    hits: dict = {}
+                    for src, tgt in corrections:
+                        if src in before and src not in result.text:
+                            hits[src] = tgt
                     log.info(
-                        f"WHISPER: applied {len(corrections)} corrections"
+                        f"WHISPER: applied {len(hits)} corrections"
                         f" (len {len(before)}→{len(result.text)})"
                     )
+                    # v2.20.3 N7：per-filter audit event
+                    try:
+                        if _audit_log is not None:
+                            _audit_log.write_event(
+                                "post_filter_applied",
+                                _safe_pipeline_id(),
+                                filter="corrections",
+                                before_len=len(before),
+                                after_len=len(result.text),
+                                hits=hits,
+                            )
+                    except Exception:
+                        pass
+                    # N4：把 hits 補進 transcribe scope 的 corrections_hit
+                    corrections_hit.update(hits)
         except Exception:
             log_error("apply_corrections_failed")
 
@@ -975,15 +1067,17 @@ class Transcriber:
                             f"WHISPER: pinyin guard fixed {len(pinyin_fixes)} term(s): "
                             f"{pinyin_fixes[:5]}"
                         )
-                        # 寫 audit log（失敗 silent、不影響主流程）
+                        # v2.20.3 N7：per-filter audit 統一 schema = post_filter_applied
                         try:
-                            import audit_log
-                            import pipeline_id as _pid_mod
-                            audit_log.write_event(
-                                "pinyin_guard_hit",
-                                _pid_mod.get_current() or "",
-                                fixes=[{"from": f, "to": t} for f, t in pinyin_fixes],
-                            )
+                            if _audit_log is not None:
+                                _audit_log.write_event(
+                                    "post_filter_applied",
+                                    _safe_pipeline_id(),
+                                    filter="pinyin_guard",
+                                    before_text=before[:200],
+                                    after_text=result.text[:200],
+                                    fixes=[{"from": f, "to": t} for f, t in pinyin_fixes],
+                                )
                         except Exception:
                             pass
             except Exception:
@@ -1002,6 +1096,18 @@ class Transcriber:
                     f"WHISPER: n-gram dedupe (len {len(before)}→{len(result.text)}): "
                     f"'{before[:60]}...' → '{result.text[:60]}...'"
                 )
+                # v2.20.3 N7：per-filter audit event
+                try:
+                    if _audit_log is not None:
+                        _audit_log.write_event(
+                            "post_filter_applied",
+                            _safe_pipeline_id(),
+                            filter="ngram_dedupe",
+                            before_text=before[:200],
+                            after_text=result.text[:200],
+                        )
+                except Exception:
+                    pass
 
         # 記錄轉錄結果（前 100 字，方便未來 debug hallucination / 準確度）
         preview = result.text[:100].replace("\n", " ")
@@ -1009,6 +1115,20 @@ class Transcriber:
 
         # v2.20.1：postprocess 結束 checkpoint（hallucination filter / corrections / pinyin / dedupe 都做完）
         t_postprocess_end = time.perf_counter()
+
+        # v2.20.3 N4：dict_effectiveness — 掃 final_text 找真正出現的 dict term
+        # 在 emit audit 之前算，便於與外部傳入的 corrections_hit 一併打包。
+        # 條件「len(term) >= 2 and term in text」避免單字 term 噪音命中。
+        terms_in_text: list[str] = []
+        if dict_terms_snapshot and result.text:
+            text_for_match = result.text
+            for term in dict_terms_snapshot:
+                if term and len(term) >= 2 and term in text_for_match:
+                    terms_in_text.append(term)
+        dict_effectiveness = {
+            "terms_in_text": terms_in_text,
+            "corrections_hit": corrections_hit,
+        }
 
         # v2.19.0：寫 audit JSONL（成功路徑、最完整）
         self._emit_audit(
@@ -1025,6 +1145,8 @@ class Transcriber:
             breakdown=self._make_breakdown(
                 t_start_pipeline, t_prep_end, t_inference_end, t_postprocess_end,
             ),
+            context=context,                          # v2.20.3 N2
+            dict_effectiveness=dict_effectiveness,    # v2.20.3 N4
         )
 
         # v2.19.0：可疑音檔保留（在 audit 寫完後才做、避免兩者互相干擾）。
@@ -1080,6 +1202,8 @@ class Transcriber:
         dict_dump_detected: bool = False,
         error: Optional[str] = None,
         breakdown: Optional[dict] = None,
+        context: Optional[dict] = None,                  # v2.20.3 N2：cold/warm 推斷狀態
+        dict_effectiveness: Optional[dict] = None,        # v2.20.3 N4：terms_in_text + corrections_hit
     ) -> None:
         """組 audit entry + 寫 JSONL；任何錯誤都吞掉、絕不讓 transcribe() 失敗。
 
@@ -1103,13 +1227,22 @@ class Transcriber:
             inference_ms = float(breakdown_dict.get("inference_ms", 0.0)) if breakdown_dict else 0.0
             inference_rtf = (inference_ms / 1000.0 / duration) if duration > 0 else 0.0
 
-            # 字典效益：哪些 terms 出現在 final_text 裡（取前 30 避免 entry 過大）
-            terms_in_text: list[str] = []
-            if dict_terms_snapshot and final_text:
-                terms_in_text = [
-                    t for t in dict_terms_snapshot
-                    if t and len(t) >= 2 and t in final_text
-                ][:30]
+            # v2.20.3 N4：dict_effectiveness 由 caller（transcribe）算好傳入；
+            # 沒傳就走舊邏輯（給 early-return / empty_audio 等沒進 post-filter 的 path
+            # 兜底，這些 path 也應該記錄字典命中分析，避免 schema 出現空欄位）。
+            if dict_effectiveness is None:
+                terms_in_text: list[str] = []
+                if dict_terms_snapshot and final_text:
+                    terms_in_text = [
+                        t for t in dict_terms_snapshot
+                        if t and len(t) >= 2 and t in final_text
+                    ][:30]
+                dict_effectiveness_dict = {
+                    "terms_in_text": terms_in_text,
+                    "corrections_hit": {},
+                }
+            else:
+                dict_effectiveness_dict = dict(dict_effectiveness)
 
             entry = {
                 "type": "transcribe",
@@ -1154,10 +1287,10 @@ class Transcriber:
                 },
                 "segments_count": int(segments_count),
                 "dict_terms_count": int(len(dict_terms_snapshot)),
-                "dict_effectiveness": {
-                    "terms_in_text": terms_in_text,
-                    "corrections_hit": {},   # 未來填：term → 命中次數
-                },
+                # v2.20.3 N4：dict_effectiveness 由 caller 或 fallback 提供
+                "dict_effectiveness": dict_effectiveness_dict,
+                # v2.20.3 N2：cold/warm 自動推斷 context（缺值 jq 用 .context // {}）
+                "context": dict(context) if isinstance(context, dict) else {},
                 "error": error,
             }
             _audit_log.write_transcribe(entry)
@@ -1335,6 +1468,10 @@ class Transcriber:
             self._warmup_mlx(model_size)
         else:
             self._warmup_ctranslate(model_size)
+        # v2.20.3 N2：warmup 跑完 → audit context.warmup_completed = True
+        # 即使內部 _warmup_* 失敗（log_error 但不 raise），這裡仍會被 set；
+        # 失敗時下次 transcribe 仍可能 cold start、context 欄位讓分析端可後驗。
+        self._warmup_completed = True
 
     def unload(self) -> None:
         """釋放模型記憶體（CPU 與 MLX）。App 切換到省電模式時可呼叫。"""

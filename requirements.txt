@@ -30,3 +30,6 @@ silero-vad>=5.0.0
 
 # v2.19.x Pinyin guard（拼音 fuzzy match 修中文 ASR 同音/近音誤辨）
 pypinyin>=0.50.0
+
+# v2.20.3 N5：keepalive ping 記憶體 snapshot 用（RSS / VM size）
+psutil>=5.9.0

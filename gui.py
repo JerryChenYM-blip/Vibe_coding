@@ -267,6 +267,12 @@ class AppWindow(ctk.CTkFrame):
         self.pack(fill="both", expand=True)
 
         self.cfg = cfg
+        # v2.20.3 N8：config hash 更新（給 audit_log 每筆 entry 自動帶 snapshot 標記）
+        try:
+            import audit_log
+            audit_log.set_config_hash(self.cfg)
+        except Exception:
+            pass
         self.recorder    = AudioRecorder()
         # F1（v2.12.0）：啟動時依 cfg.input_device 設裝置；失敗回退系統預設
         if cfg.input_device:
@@ -487,6 +493,12 @@ class AppWindow(ctk.CTkFrame):
         # v2.17.4：定期跑 dummy ASR 保活 MLX weights（防 macOS swap out）
         # 第一次 5 分鐘後跑、之後 each tick 自己排程下次
         self.after(self.MLX_KEEPALIVE_INTERVAL_MS, self._mlx_keepalive_tick)
+        # v2.20.3 N5：記下上次 keepalive ping 結束時間（用 perf_counter，單調）。
+        # 用來算 since_last_ping_s（兩次 ping 間隔；首次為 None → 不 emit since_last）
+        self._last_ping_at: Optional[float] = None
+        # v2.20.3 N6：hotkey 健康 snapshot 計數器（每 5 分鐘 fire 一次 audit event）
+        # 60 ticks × 5s = 300s = 5 min
+        self._hotkey_health_tick_count: int = 0
 
         # #4 字典：初次載入並餵給 Transcriber
         self._reload_dictionary()
@@ -1063,6 +1075,16 @@ class AppWindow(ctk.CTkFrame):
         self._pipeline_polish_at     = None
         self._pipeline_summary_emitted = False
 
+        # v2.20.3 N3：pipeline timing breakdown 起點 milestone。
+        # hotkey_release 是 anchor（user 放開的瞬間 ≈ recording 結束的瞬間）。
+        # 後續 milestone（transcribe_start/done、polish_*、paste_*）皆相對於此 anchor。
+        try:
+            import pipeline_id as _pid  # noqa: PLC0415 — local import 防 cycle
+            _pid.clear_events()         # 開新 pipeline 先清舊
+            _pid.record_event("hotkey_release")
+        except Exception:
+            pass
+
         if self._stream_tick_id is not None:
             self.after_cancel(self._stream_tick_id)
             self._stream_tick_id = None
@@ -1123,6 +1145,14 @@ class AppWindow(ctk.CTkFrame):
             except Exception:
                 log_error("la_final_add_audio_failed")
             self._start_la_finalize()
+
+        # v2.20.3 N3：把背景 ASR thread 起點記成一個 milestone。
+        # 跟 hotkey_release 的差距 ≈「錄音收尾 + UI 切狀態 + thread spin-up」。
+        try:
+            import pipeline_id as _pid  # noqa: PLC0415
+            _pid.record_event("transcribe_start")
+        except Exception:
+            pass
 
         threading.Thread(
             target=self._run_transcription,
@@ -1667,6 +1697,13 @@ class AppWindow(ctk.CTkFrame):
         if self._pipeline_t0 is not None:
             self._pipeline_transcribe_at = time.perf_counter() - self._pipeline_t0
 
+        # v2.20.3 N3：milestone「transcribe_done」（細到 ms 給 session_summary 用）
+        try:
+            import pipeline_id as _pid  # noqa: PLC0415
+            _pid.record_event("transcribe_done")
+        except Exception:
+            pass
+
         # v2.19.0：pipeline event「transcribe_done」
         _pipe_event(
             "transcribe_done",
@@ -1819,6 +1856,13 @@ class AppWindow(ctk.CTkFrame):
             preset=preset_name,
         )
 
+        # v2.20.3 N3：milestone「polish_start」
+        try:
+            import pipeline_id as _pid  # noqa: PLC0415
+            _pid.record_event("polish_start")
+        except Exception:
+            pass
+
         # Cluster B：抓「當下 latest」block ref 一起傳進 _finish_polish。
         # polish 跑回來時這個 ref 可能已被 delete（不在 list 內）或不再是 latest，
         # _finish_polish 用 identity 比對來決定是否安全 set_polished。
@@ -1929,6 +1973,13 @@ class AppWindow(ctk.CTkFrame):
         # 注意：若 polish 失敗走 fallback（paste_text = raw_text），仍視為「完成這個階段」
         if self._pipeline_t0 is not None:
             self._pipeline_polish_at = time.perf_counter() - self._pipeline_t0
+
+        # v2.20.3 N3：milestone「polish_done」
+        try:
+            import pipeline_id as _pid  # noqa: PLC0415
+            _pid.record_event("polish_done")
+        except Exception:
+            pass
 
         if resp.error:
             # 降級：提示錯誤，title 狀態轉為「原文（潤飾失敗）」，auto-paste 貼原文
@@ -2103,10 +2154,22 @@ class AppWindow(ctk.CTkFrame):
         """
         # v2.19.0：pipeline event「paste_dispatch」+ 量測 paste latency
         _pipe_event("paste_dispatch", target_app=target or "")
+        # v2.20.3 N3：milestone「paste_start」（dispatch ⌘V 之前的瞬間）
+        try:
+            import pipeline_id as _pid  # noqa: PLC0415
+            _pid.record_event("paste_start")
+        except Exception:
+            pass
         _t_paste_start = time.perf_counter()
         success = _ap.paste_to_app(text, target)
         _paste_latency = time.perf_counter() - _t_paste_start
         _pipe_record_paste_latency(_paste_latency)
+        # v2.20.3 N3：milestone「paste_complete」
+        try:
+            import pipeline_id as _pid  # noqa: PLC0415
+            _pid.record_event("paste_complete")
+        except Exception:
+            pass
 
         if success:
             self._show_toast(f"⌨  已貼入 {target}")
@@ -2200,6 +2263,21 @@ class AppWindow(ctk.CTkFrame):
             text_len=text_len,
             polish_mode=self._pipeline_polish_mode,
         )
+        # v2.20.3 N3：拿 thread-local timeline 各 milestone（ms）一起 emit。
+        # 同時把 durations 餵給 session_summary 累積、session 結束時印中位數。
+        durations: dict = {}
+        try:
+            import pipeline_id as _pid  # noqa: PLC0415
+            durations = _pid.get_durations()
+            if durations:
+                try:
+                    import session_summary  # noqa: PLC0415
+                    session_summary.record_pipeline_timing(durations)
+                except Exception:
+                    pass
+        except Exception:
+            durations = {}
+
         # v2.19.0：pipeline 終點 event + 清 thread-local pid
         # 任何 emit 路徑（success / skipped / failed_*）都會走到這、統一收尾。
         # 注意：_do_auto_paste 也會呼叫 _pipe_event("pipeline_done") + _pipe_clear()，
@@ -2209,7 +2287,14 @@ class AppWindow(ctk.CTkFrame):
             path=path,
             total_s=round(t_total, 3),
             text_len=text_len,
+            durations=durations,
         )
+        # v2.20.3 N3：清 timeline（與 thread-local pid 同步釋放）
+        try:
+            import pipeline_id as _pid  # noqa: PLC0415
+            _pid.clear_events()
+        except Exception:
+            pass
         _pipe_clear()
 
     def _display_result(self, result: TranscriptionResult) -> None:
@@ -3263,6 +3348,12 @@ class AppWindow(ctk.CTkFrame):
                 log_settings("changed", field=field_name, old=ov, new=nv,
                              source="settings_window")
         self.cfg = cfg
+        # v2.20.3 N8：config 變動後重算 hash（後續 audit entry 會帶新 snapshot 標記）
+        try:
+            import audit_log
+            audit_log.set_config_hash(self.cfg)
+        except Exception:
+            pass
         # 只有 hotkey 真正變更才重啟 pynput listener——反覆 stop/start 在 macOS
         # 上曾與 MLX/Metal 並存時觸發 native 層不穩定，能避免就避免。
         # PR #8 修正：延遲 100ms 再重啟，讓 SettingsWindow.destroy() 與舊 Listener
@@ -3414,6 +3505,47 @@ class AppWindow(ctk.CTkFrame):
                 getattr(mgr, "_monitor_global", None) is not None
                 or getattr(mgr, "_monitor_local", None) is not None
             )
+
+            # v2.20.3 N6：每 5 分鐘（60 ticks × 5s）寫一筆 hotkey_health snapshot 給
+            # audit log，記下 monitor 是否還活著、目前 pressed 集合、ns held modifiers、
+            # combo_active 等狀態。用途：事後抓「user 反映 hotkey 不靈」的根因 —
+            # 若 snapshot 顯示 monitor 已死 / pressed 卡住，就知道是哪層出問題。
+            self._hotkey_health_tick_count += 1
+            if self._hotkey_health_tick_count >= 60:
+                self._hotkey_health_tick_count = 0
+                try:
+                    import audit_log  # noqa: PLC0415
+                    # 安全取值：mgr 任何 attr 可能因版本差異不存在 → 用 getattr fallback。
+                    # set 要轉 list 才能 JSON serialize；元素轉 str 避免 PyObjC Key 型別炸。
+                    pressed_set_raw = getattr(mgr, "_pressed", set()) or set()
+                    ns_held_raw = getattr(mgr, "_ns_held_modifiers", set()) or set()
+                    pressed_list = [str(k) for k in pressed_set_raw]
+                    # ns_held_modifiers 元素是 keycode int，直接轉 list 即可
+                    try:
+                        ns_held_list = sorted(int(x) for x in ns_held_raw)
+                    except Exception:
+                        ns_held_list = [str(x) for x in ns_held_raw]
+                    # last event 時間（相對「現在 ago 多少秒」）
+                    last_event_at_raw = getattr(mgr, "_last_event_at", None)
+                    last_event_s_ago: Optional[float] = None
+                    if isinstance(last_event_at_raw, (int, float)) and last_event_at_raw > 0:
+                        last_event_s_ago = round(
+                            time.monotonic() - float(last_event_at_raw), 1
+                        )
+                    # watchdog 狀態用簡單分類：monitor 死 = degraded、else normal
+                    watchdog_state = "normal" if monitor_alive else "degraded"
+                    audit_log.write_event(
+                        "hotkey_health",
+                        "",
+                        monitor_alive=bool(monitor_alive),
+                        pressed_set=pressed_list,
+                        ns_held_modifiers=ns_held_list,
+                        combo_active=bool(getattr(mgr, "_combo_active", False)),
+                        last_event_s_ago=last_event_s_ago,
+                        watchdog_state=watchdog_state,
+                    )
+                except Exception:
+                    log_error("hotkey_health_snapshot_failed")
             if not monitor_alive:
                 log.warning("HOTKEY: watchdog restarting NSEvent monitor (reason=monitor_missing)")
                 log_action("hotkey_listener_auto_restarted", reason="monitor_missing")
@@ -3847,13 +3979,55 @@ class AppWindow(ctk.CTkFrame):
                 model = self._model_var.get()
                 # 只對已載入的模型 keepalive（轉錄 lock 內、不撞用戶操作）
                 def _ping():
+                    # v2.20.3 N5：量 ping 自身耗時（≈ 模型 warmup 推論時間）
+                    _t_start = time.perf_counter()
                     try:
                         # v2.20.2：沿用 transcriber.warmup() —— 內部已換成
                         # _make_keepalive_audio()（1.5s formant-based 假人聲、低音量）。
                         # 走 session.transcribe() 直呼叫、不過 Transcriber.transcribe()
                         # 外層的 RMS gate / Silero VAD，所以不會被擋掉。
                         self.transcriber.warmup(model)
-                        log.info(f"MLX_KEEPALIVE: ping done (model={model}, payload=formant-1.5s)")
+                        elapsed_ms = int((time.perf_counter() - _t_start) * 1000)
+                        log.info(
+                            f"MLX_KEEPALIVE: ping done (model={model}, "
+                            f"payload=formant-1.5s, elapsed_ms={elapsed_ms})"
+                        )
+                        # v2.20.3 N5：寫 keepalive_ping audit event 含記憶體 snapshot。
+                        # 用途：監測 RSS / MLX Metal cache 隨時間漂移、抓 leak/swap-out。
+                        try:
+                            import audit_log    # noqa: PLC0415
+                            import psutil       # noqa: PLC0415
+                            proc = psutil.Process()
+                            rss_mb = proc.memory_info().rss / 1024 / 1024
+                            # MLX Metal cache（VRAM 駐留量）—— 非 Apple Silicon
+                            # / 沒裝 mlx 時 graceful fallback 成 None
+                            metal_mb: Optional[float] = None
+                            try:
+                                import mlx.core as mx  # noqa: PLC0415
+                                metal_mb = mx.metal.get_active_memory() / 1024 / 1024
+                            except Exception:
+                                metal_mb = None
+                            # since_last_ping_s：首次 ping 為 None（不知道間隔）
+                            now_pc = time.perf_counter()
+                            prev = self._last_ping_at
+                            since_last: Optional[float] = (
+                                round(now_pc - prev, 2) if prev is not None else None
+                            )
+                            self._last_ping_at = now_pc
+                            audit_log.write_event(
+                                "keepalive_ping",
+                                "",
+                                elapsed_ms=elapsed_ms,
+                                process_rss_mb=round(rss_mb, 1),
+                                mlx_metal_cache_mb=(
+                                    round(metal_mb, 1) if metal_mb is not None else None
+                                ),
+                                since_last_ping_s=since_last,
+                                model=model,
+                            )
+                        except Exception:
+                            # 觀測性失敗不能影響 keepalive 本身
+                            pass
                     except Exception:
                         log_error("mlx_keepalive_ping_failed", model=model)
                 threading.Thread(target=_ping, daemon=True).start()

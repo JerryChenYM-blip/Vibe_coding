@@ -23,6 +23,56 @@ import threading
 import time
 import traceback
 
+# ── v2.20.3：STARTUP phase tracking ──────────────────────────────────────────
+# 5/25 23:42 那次 silent crash burst：4 次 NEW SESSION 後完全沒後續 CONFIG /
+# HOTKEY / COCOA log → 表示死在 import 跟 mainloop 之間某處，但具體死在哪
+# 看不出來。
+#
+# 解法：每個 init 里程碑 emit 一筆 "STARTUP: phase=..." 事件，同時寫進：
+#   • whisper_app.log（INFO）：跟得上現有 log style
+#   • audit_log JSONL：給事後 query
+#   • _STARTUP_PHASES list：crash 時 atexit hook 把整串 dump 進 fault.log
+#
+# 下次 silent crash 看 fault.log 尾段 "Startup phases reached before crash"
+# 區塊，最後一個 phase 就是死亡前抵達的最遠點。
+import time as _time_for_startup
+_STARTUP_T0 = _time_for_startup.perf_counter()
+_STARTUP_PHASES: list[tuple[str, float]] = []   # 累積、給 crash 後也能 dump
+
+
+def _startup_phase(name: str, **fields) -> None:
+    """v2.20.3 STARTUP phase tracking — 每個 init 階段一筆 event。
+
+    寫 3 個地方：
+      • whisper_app.log（INFO）：跟得上現有 log style
+      • audit_log JSONL：給事後 query
+      • _STARTUP_PHASES list：crash 時 faulthandler 可 dump
+
+    所有寫入都包 try/except —— 觀測性失敗絕對不能拖累 startup。
+    注意：startup 早期 logger 可能還沒 import、audit_log 也可能還沒就緒，
+    所以兩邊都單獨 try。pipeline_id 在 startup 期間還沒生成 → 傳空字串。
+    """
+    elapsed_ms = (_time_for_startup.perf_counter() - _STARTUP_T0) * 1000
+    _STARTUP_PHASES.append((name, elapsed_ms))
+    try:
+        # log 變數要等 line ~79 才存在；用 globals().get 避免 NameError
+        _log = globals().get("log")
+        if _log is not None:
+            _log.info(f"STARTUP: phase={name} t={elapsed_ms:.0f}ms")  # v2.20.3：STARTUP phase tracking
+    except Exception:
+        pass
+    try:
+        import audit_log
+        audit_log.write_event(
+            "startup_phase", "",
+            phase=name,
+            elapsed_ms=elapsed_ms,
+            **fields,
+        )
+    except Exception:
+        pass
+
+
 # ── C-level 崩潰記錄器 ───────────────────────────────────────────────────────
 # 捕捉 SIGSEGV / SIGABRT / SIGBUS 等 C 層面崩潰（例如 MLX/Metal mutex 失敗）。
 # 這類崩潰 Python 例外機制抓不到，faulthandler 會在 kill 前把 traceback 寫入
@@ -71,12 +121,41 @@ except Exception as _e:
     faulthandler.enable(all_threads=True)
 
 
+# ── v2.20.3：crash 時 dump startup phases ────────────────────────────────────
+# atexit handler：把 _STARTUP_PHASES 寫進 fault.log 尾巴。silent crash 後
+# user / 工程師打開 fault.log 就能看到「啟動跑到哪一站死的」。
+#
+# 注意：atexit 在「正常 sys.exit」「unhandled exception」都會跑；C-level
+# 崩潰（SIGSEGV）走 faulthandler 不會跑 atexit。後者 faulthandler 自己會
+# 寫 traceback、雖然看不到 phases 但至少有 C trace。兩條路互補。
+def _dump_startup_phases_on_crash():
+    """Crash 時把 startup phase 紀錄寫進 fault.log、方便事後辨識死點。"""
+    try:
+        if _fault_log_fh and not _fault_log_fh.closed:
+            _fault_log_fh.write("\n=== Startup phases reached before crash ===\n")
+            for name, ms in _STARTUP_PHASES:
+                _fault_log_fh.write(f"  {ms:7.0f} ms  {name}\n")
+            _fault_log_fh.flush()
+    except Exception:
+        pass
+
+
+atexit.register(_dump_startup_phases_on_crash)
+
+# v2.20.3：第一個 phase ── faulthandler 已 attach、atexit hook 已註冊。
+# 此時 `log` 還沒 import，helper 只會寫進 _STARTUP_PHASES + audit_log。
+_startup_phase("faulthandler_attached")
+
+
 # ── 匯入統一日誌系統 ─────────────────────────────────────────────────────────
 # import logger 時會自動 setup_logging()，log 會寫到
 # ~/.whisper_app/logs/whisper_app.log 並同時輸出到終端。
 from logger import get_logger, log_error
 
 log = get_logger("main")
+
+# v2.20.3：logger 已就緒、後續 _startup_phase() 才能寫到 whisper_app.log
+_startup_phase("logger_initialized")
 
 # 每次啟動印一條分隔線，方便在 log 裡辨識 session 邊界
 log.info("=" * 60)
@@ -99,6 +178,10 @@ from hotkey_manager import check_accessibility, is_pynput_available
 # .app bundle 路徑（給 _relaunch_app 用）
 import pathlib as _pathlib
 _APP_BUNDLE = _pathlib.Path.home() / "Applications" / "WhisperPro.app"
+
+# v2.20.3：所有 module-level import 完成 ── 5/25 silent crash 死在這之前的話、
+# 後續 phase 就不會出現；activity = 「imports_done 出現了 → 至少 import 全 OK」
+_startup_phase("imports_done")
 
 
 def check_dependencies() -> list[str]:
@@ -328,6 +411,7 @@ def main() -> None:
     # 防 user 雙擊 .app 時老 process 還在跑 → NSEvent monitor 衝突 silent hang。
     # 若偵測到舊 PID 還活著就先把它幹掉，再寫自己的 PID。
     _acquire_single_instance_lock()
+    _startup_phase("pidfile_acquired")   # v2.20.3：STARTUP phase tracking
 
     # ── 1. 套件依賴檢查 ──────────────────────────────────────────────────────
     missing = check_dependencies()
@@ -344,6 +428,14 @@ def main() -> None:
         f"hotkey={cfg.hotkey} auto_paste={cfg.auto_paste} auto_copy={cfg.auto_copy} "
         f"theme={cfg.theme}"
     )
+    _startup_phase("config_loaded", model=cfg.model, theme=cfg.theme)  # v2.20.3：STARTUP phase tracking
+
+    # v2.20.3 N8：config hash 初始化（讓 startup 期間的 audit entry 也有正確 snapshot 標記）
+    try:
+        import audit_log
+        audit_log.set_config_hash(cfg)
+    except Exception:
+        pass
 
     # ── 2a. CustomTkinter appearance mode（v2.6.0）────────────────────────
     # 讓 CTk 內建 widget（scrollbar、dropdown 預設樣式等）跟隨 cfg.theme。
@@ -413,6 +505,7 @@ def main() -> None:
     # ── 4. 建立主應用程式視窗 ─────────────────────────────────────────────────
     app = AppWindow(root, cfg)
     log.info("GUI: AppWindow initialized")
+    _startup_phase("gui_window_created")   # v2.20.3：STARTUP phase tracking
 
     # ── 5. 輔助使用權限確認（非阻塞）────────────────────────────────────────
     def _check_access():
@@ -483,6 +576,7 @@ def main() -> None:
 
     # ── 7. 進入主迴圈 ─────────────────────────────────────────────────────────
     log.info("GUI: entering mainloop")
+    _startup_phase("mainloop_entered")   # v2.20.3：最後一筆 startup phase；之後是 user 操作
     try:
         root.mainloop()
     except Exception:
