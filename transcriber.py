@@ -216,18 +216,78 @@ def _get_opencc_converter(variant: str):
         return None
 
 
+# ── v2.21.0 Phase A：台灣詞彙偏好修正（opencc s2twp 過度轉換的否決層）────────────
+#
+# 問題：opencc s2twp 把使用者口述的「優化」自作主張轉成台灣 IT 圈說法「最佳化」。
+#   實測 9098 筆 log：「最佳化」出現 11 次、「優化」0 次 = 100% 被轉掉、使用者
+#   從沒成功輸出過「優化」。使用者明確抱怨要保留「優化」。
+#
+# 設計紀律（比照 v2.20.1 pinyin guard 翻車教訓）：
+#   1. **影子驗證過**：555 筆真實 log 中「最佳化」12 處全是動詞、後接字無一個是
+#      身/學/妝（危險複合詞如「最佳化身=最佳+化身」「最佳化學」），零誤傷。
+#   2. **負向 lookahead 保險**：仍排除「最佳化身/最佳化學」這類 最佳+化X 邊界。
+#   3. 連帶修「最佳話」（最佳化 → 同音 化→話 二度錯、9098 筆有出現）。
+_OPENCC_OVERRIDE_ENABLED = True
+
+# regex 否決規則：(pattern, replacement)。pattern 用負向 lookahead 避免邊界誤傷。
+import re as _re_opencc_override
+_OPENCC_OVERRIDE_RULES = [
+    # 最佳化 → 優化，但「最佳化身/最佳化學/最佳化妝」不動（那是 最佳+化X）
+    (_re_opencc_override.compile(r'最佳化(?![身學妝])'), '優化'),
+    # 最佳話 → 優化（化→話 同音二度錯；最佳話 本身不是合法詞、安全替換）
+    (_re_opencc_override.compile(r'最佳話'), '優化'),
+]
+
+# ── v2.21.0 Phase A：繁簡殘留詞組清理（opencc 沒轉乾淨的）──────────────────────
+#
+# 鐵律：**禁單字**。影子驗證抓到「一隻美股」的「隻」是量詞、若做單字「隻→只」
+#   會誤改成「一只美股」。所以只放長度 ≥2 且上下文唯一的詞組。
+_FANJIAN_FIXES: dict[str, str] = {
+    "隻有": "只有",
+    "隻要": "只要",
+    "隻是": "只是",
+    "隻能": "只能",
+    "隻不過": "只不過",
+    "熒幕": "螢幕",
+}
+
+
+def _apply_tw_vocab_fix(text: str) -> str:
+    """opencc 之後的台灣詞彙偏好修正：救「優化」+ 清繁簡殘留詞組。
+
+    全程確定性查表 / regex、< 1ms、失敗回原文不拋例外。
+    """
+    if not _OPENCC_OVERRIDE_ENABLED or not text:
+        return text
+    out = text
+    try:
+        for pattern, repl in _OPENCC_OVERRIDE_RULES:
+            out = pattern.sub(repl, out)
+        for wrong, right in _FANJIAN_FIXES.items():
+            if wrong in out:
+                out = out.replace(wrong, right)
+    except Exception:
+        log_error("tw_vocab_fix_failed")
+        return text
+    return out
+
+
 def _apply_opencc(text: str, variant: str) -> str:
-    """套用 opencc 轉換到 text；任何失敗回原文不拋例外。"""
+    """套用 opencc 轉換到 text；任何失敗回原文不拋例外。
+
+    v2.21.0：opencc 轉完後再過一層 _apply_tw_vocab_fix（救「優化」+ 繁簡殘留）。
+    """
     if not text or variant == "off" or not variant:
         return text
     cc = _get_opencc_converter(variant)
     if cc is None:
         return text
     try:
-        return cc.convert(text)
+        converted = cc.convert(text)
     except Exception:
         log_error("opencc_convert_failed", variant=variant)
         return text
+    return _apply_tw_vocab_fix(converted)
 
 
 # ── 靜音偵測與幻覺防護 ────────────────────────────────────────────────────────

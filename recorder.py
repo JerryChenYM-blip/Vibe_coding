@@ -93,6 +93,19 @@ class AudioRecorder:
         self._device_index: Optional[int] = None  # None = 系統預設麥克風
         self._monitor_thread: Optional[threading.Thread] = None
 
+        # 熱插拔偵測（v2.21）：
+        # PortAudio 在初始化時把麥克風清單「拍快照」，之後 query_devices() 都回舊快照。
+        # 插/拔麥克風時快照不更新 → 必須 sd._terminate()/_initialize() 重新初始化才看得到。
+        #
+        # _device_name 存「目前選定裝置的名字」（不是 index）——index 在 re-init 後會變，
+        # 名字才能穩定比對。set_device_by_name() 成功時記下，is_active_device_present() 用它比對。
+        self._device_name: Optional[str] = None
+        # CoreAudio 裝置變動監聽相關 handle（用 ctypes 直呼 CoreAudio.framework）
+        self._ca_lib = None          # CoreAudio.framework 的 CDLL handle
+        self._ca_listener = None     # CFUNCTYPE callback 物件——必須存成 attribute 防 GC（否則 segfault）
+        self._ca_addr = None         # AudioObjectPropertyAddress 實例（remove 時要傳回去）
+        self._ca_on_change = None    # 上層傳入的 on_change callable
+
         # D2-S1（v2.9.0）：generation counter 防 stale callback。
         # 流程：每次 start() bump +1；stop() 也 bump +1。callback 在進入時帶
         # 入「當時的 gen」snapshot，寫 frame 前比對 self._capture_gen 是否相符；
@@ -116,8 +129,10 @@ class AudioRecorder:
         for dev in devices:
             if name == dev["name"]:
                 self._device_index = dev["id"]
+                self._device_name = dev["name"]   # 記下名字供 is_active_device_present() 比對
                 return True
         self._device_index = None   # 找不到就回退到系統預設
+        self._device_name = None    # 系統預設沒有固定名字
         return False
 
     def start(self) -> bool:
@@ -275,6 +290,158 @@ class AudioRecorder:
         except Exception:
             log_error("query_audio_devices_failed")
             return []
+
+    # ── 麥克風熱插拔偵測（v2.21）────────────────────────────────────────────────
+
+    def refresh_portaudio(self) -> list[dict]:
+        """重新初始化 PortAudio、回最新輸入裝置清單。
+
+        為什麼要 re-init：PortAudio 在啟動時把裝置清單拍成快照，之後 query_devices()
+        都回舊快照；插/拔麥克風後唯一拿到新清單的方法就是 _terminate() + _initialize()。
+
+        關鍵安全限制：正在錄音時 re-init 會打斷串流（硬體資源被釋放重抓），
+        所以錄音中一律「跳過」re-init，直接回目前的 list_devices()（仍是舊快照）。
+        """
+        if sd is None:
+            return []
+        with self._lock:
+            if self._is_recording:
+                log.info("RECORD: refresh_portaudio skipped (recording in progress)")
+                return self.list_devices()
+            try:
+                sd._terminate()
+                sd._initialize()
+                log.info("RECORD: PortAudio re-initialized for device refresh")
+            except Exception:
+                log_error("portaudio_reinit_failed")
+        return self.list_devices()
+
+    def is_active_device_present(self) -> bool:
+        """檢查目前選定的裝置是否還在（插著）。
+
+        _device_name 為 None（系統預設麥克風）時一律回 True——系統預設永遠存在，
+        macOS 會自動 fallback 到當下可用的內建/外接麥克風。
+
+        有指定名字時，用名字比對 list_devices() 結果（不用 index，因為 re-init 後 index 會變）。
+        注意：本方法只讀目前快照；要拿到拔除後的真實狀態，呼叫端應先 refresh_portaudio()。
+        """
+        if self._device_name is None:
+            return True
+        names = {d["name"] for d in self.list_devices()}
+        return self._device_name in names
+
+    def start_device_monitor(self, on_change) -> bool:
+        """註冊 CoreAudio 裝置變動監聽。
+
+        on_change 是無參數 callable，裝置插/拔時被呼叫。
+        注意：callback 在 CoreAudio 自己的執行緒被呼叫，呼叫端自己負責 marshal
+        到主執行緒（例如用 tkinter 的 master.after(0, ...)）。
+
+        回 True = 註冊成功；失敗（非 macOS / ctypes 載入失敗）回 False、不拋例外。
+        """
+        try:
+            import ctypes.util
+
+            # ── 找到並載入 CoreAudio.framework ──
+            lib_path = ctypes.util.find_library("CoreAudio")
+            if not lib_path:
+                log.info("RECORD: CoreAudio not found (not macOS?), device monitor disabled")
+                return False
+            ca = ctypes.CDLL(lib_path)
+
+            # ── AudioObjectPropertyAddress struct ──
+            # CoreAudio 用這個 3 欄結構描述「要監聽哪個屬性」
+            class AudioObjectPropertyAddress(ctypes.Structure):
+                _fields_ = [
+                    ("mSelector", ctypes.c_uint32),
+                    ("mScope", ctypes.c_uint32),
+                    ("mElement", ctypes.c_uint32),
+                ]
+
+            # ── CoreAudio 四字碼常數（FourCharCode）──
+            # CoreAudio 的常數其實是 4 個 ASCII 字元打包成 uint32（big-endian）。
+            # 例：'dev#' = 0x64657623。用 int.from_bytes(b'dev#', 'big') 算出來。
+            kAudioObjectSystemObject = 1
+            kAudioHardwarePropertyDevices = int.from_bytes(b"dev#", "big")
+            kAudioObjectPropertyScopeGlobal = int.from_bytes(b"glob", "big")
+            kAudioObjectPropertyElementMain = 0
+
+            addr = AudioObjectPropertyAddress(
+                kAudioHardwarePropertyDevices,
+                kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain,
+            )
+
+            # ── callback 型別 + 實體 ──
+            # 簽章對應 AudioObjectPropertyListenerProc：
+            #   OSStatus (AudioObjectID, UInt32 numAddresses, const AudioObjectPropertyAddress*, void* clientData)
+            CALLBACK_TYPE = ctypes.CFUNCTYPE(
+                ctypes.c_int32,    # OSStatus 回傳值
+                ctypes.c_uint32,   # inObjectID
+                ctypes.c_uint32,   # inNumberAddresses
+                ctypes.c_void_p,   # inAddresses（const AudioObjectPropertyAddress*）
+                ctypes.c_void_p,   # inClientData
+            )
+
+            def _ca_callback(obj_id, n_addr, addrs, client_data):
+                # CoreAudio 執行緒呼叫——這裡拋例外會直接炸進程，全部吞掉。
+                try:
+                    on_change()
+                except Exception:
+                    # 連 log_error 都包進 try，極端情況下 logger 也可能在收尾時不可用
+                    try:
+                        log_error("device_monitor_callback_failed")
+                    except Exception:
+                        pass
+                return 0   # OSStatus noErr
+
+            cb = CALLBACK_TYPE(_ca_callback)
+
+            # ── 註冊監聽 ──
+            status = ca.AudioObjectAddPropertyListener(
+                ctypes.c_uint32(kAudioObjectSystemObject),
+                ctypes.byref(addr),
+                cb,
+                None,
+            )
+            if status != 0:
+                log.warning(f"RECORD: AudioObjectAddPropertyListener failed, status={status}")
+                return False
+
+            # ── 存 handle ──
+            # cb（CFUNCTYPE 實體）必須存成 instance attribute，否則離開本函式後被 GC 回收，
+            # CoreAudio 之後回呼一個已釋放的位址 → segfault。addr 同理（remove 時要傳回去）。
+            self._ca_lib = ca
+            self._ca_listener = cb
+            self._ca_addr = addr
+            self._ca_on_change = on_change
+            log.info("RECORD: CoreAudio device monitor registered")
+            return True
+        except Exception:
+            log_error("start_device_monitor_failed")
+            return False
+
+    def stop_device_monitor(self) -> None:
+        """移除 CoreAudio 裝置變動監聽（on_close 時呼叫）。包 try/except，失敗只記錄。"""
+        if self._ca_lib is None or self._ca_listener is None or self._ca_addr is None:
+            return
+        try:
+            kAudioObjectSystemObject = 1
+            self._ca_lib.AudioObjectRemovePropertyListener(
+                ctypes.c_uint32(kAudioObjectSystemObject),
+                ctypes.byref(self._ca_addr),
+                self._ca_listener,
+                None,
+            )
+            log.info("RECORD: CoreAudio device monitor removed")
+        except Exception:
+            log_error("stop_device_monitor_failed")
+        finally:
+            # 清掉 handle，防止重複 remove；callback 物件此時可安全被 GC
+            self._ca_lib = None
+            self._ca_listener = None
+            self._ca_addr = None
+            self._ca_on_change = None
 
     # ── 私有方法 ──────────────────────────────────────────────────────────────
 
