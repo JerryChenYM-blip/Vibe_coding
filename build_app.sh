@@ -210,10 +210,24 @@ xattr -cr "$APP_ROOT" 2>/dev/null || true
 codesign --force --deep --sign - "$APP_ROOT" 2>/dev/null
 echo "  ✓ WhisperPro.app adhoc 簽章完成（com.jerrychen.whisperpro）"
 
-# ─── Step 7：清掉 TCC 舊紀錄（讓對話框首次重跳）──────────────────────
-for service in Microphone Accessibility ListenEvent AppleEvents; do
-    tccutil reset "$service" com.jerrychen.whisperpro.python 2>/dev/null || true
-done
+# ─── Step 7：TCC 權限處理（v2.21.1 改：預設「不」reset）────────────────
+# 為什麼改：bundle id 固定（com.jerrychen.whisperpro.python）、shim 的 Python
+# binary 跨 build 不變、adhoc 簽章對相同內容產生相同 cdhash，所以 TCC 權限本來
+# 就該跨重建保留。原本每次 build 都無條件 tccutil reset、害 user 每次更新都要
+# 重新授權「麥克風 / 輔助使用 / 輸入監控 / 自動化」4 個權限、還很容易漏掉
+# Accessibility（錄音能用就以為都好了、結果 ⌘V 自動貼上默默失效——pynput 送
+# CGEventPost 沒 Accessibility 權限會被系統默默丟掉、不報錯）。
+#
+# 預設：不 reset、保留既有授權。
+# 逃生口：權限歸帳真的亂掉時、跑 `RESET_TCC=1 bash build_app.sh` 強制重置。
+if [[ "${RESET_TCC:-0}" == "1" ]]; then
+    echo "  ⚠ RESET_TCC=1：清掉 TCC 授權（下次啟動會重跳權限對話框）"
+    for service in Microphone Accessibility ListenEvent AppleEvents; do
+        tccutil reset "$service" com.jerrychen.whisperpro.python 2>/dev/null || true
+    done
+else
+    echo "  ✓ 保留既有 TCC 授權（不 reset；要強制重置用 RESET_TCC=1 bash build_app.sh）"
+fi
 
 # ─── Step 8：報告結果 ───────────────────────────────────────────────
 cat <<'REPORT_EOF'
@@ -221,11 +235,15 @@ cat <<'REPORT_EOF'
 ✓ WhisperPro.app 建構完成
 位置：~/Applications/WhisperPro.app
 
-首次啟動：
+【一般更新】既有權限保留、直接重開 App 即可（不用重新授權）。
+
+【首次安裝】才需要授權：
   1. 用 Spotlight 搜 "Whisper Pro"（或從 Finder 雙擊 ~/Applications/WhisperPro.app）
   2. 第一次跳 Gatekeeper 警告：右鍵 → 打開（或系統設定 → 隱私權與安全性 → 允許）
-  3. 按熱鍵開始錄音時會跳 3 個權限對話框，全部「允許」（會以 shim bundle
-     com.jerrychen.whisperpro.python 名義出現）
+  3. 按熱鍵錄音 / 自動貼上時會跳權限對話框，全部「允許」。特別確認這 4 個都開：
+     麥克風、輔助使用(Accessibility, ⌘V 貼上要)、輸入監控(熱鍵要)、自動化(偵測前景 App)
+     （會以 shim bundle com.jerrychen.whisperpro.python 名義出現）
 
-之後不管從哪裡開（Spotlight / Dock / Finder）權限都會延續，不用重複授權。
+之後不管從哪裡開（Spotlight / Dock / Finder）權限都會延續、跨更新也保留。
+（若哪天權限歸帳亂掉、用 RESET_TCC=1 bash build_app.sh 強制重置後重新授權一次。）
 REPORT_EOF
