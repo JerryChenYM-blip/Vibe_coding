@@ -125,6 +125,7 @@ def _audio_position_for_text(
     segments: list[dict],
     text_prefix: str,
     duration_s: float,
+    full_text_len: int = 0,
 ) -> float:
     """用 segments 反推「text_prefix 結束」對應的 audio 時間（秒）。
 
@@ -167,11 +168,19 @@ def _audio_position_for_text(
                 # 內部 30s padding），clamp 到 duration_s
                 return min(end, duration_s)
 
-    # 策略 2：fallback 字元比例
-    # 這只在 segments 為空（backend 沒回時間戳）或 prefix 比所有 segment 加起來
-    # 還長（不該發生、但 defensive）時觸發
-    # 取 result.text 總長近似估計
-    return min(duration_s, duration_s)  # 全部 audio 都算「已對應」、防 underflow
+    # 策略 2：fallback 字元比例（v2.21.0 Phase C 修 over-commit 掉字 bug）
+    #
+    # ⚠️ 原 bug：這裡曾 `return min(duration_s, duration_s)` = 回整段長度。
+    #   當 segments 為空（Qwen3-ASR 某些情況不回時間戳）但 text_prefix 非空時，
+    #   等於說「整段 audio 都已 commit」→ 尾段被當已處理 → **掉字**。
+    #
+    # 修法：用「已 commit 文字佔總轉錄文字的比例」估 audio 位置。保守不超 prefix
+    #   實際佔比——commit 60% 的字就只推進 60% 的 audio、剩下 40% 留到下輪重轉，
+    #   絕不吃掉尾段。full_text_len ≤ 0 時退回 0.0（完全不推進、寧可重轉也不掉字）。
+    if full_text_len and full_text_len > 0:
+        ratio = min(1.0, target_len / full_text_len)
+        return min(duration_s, ratio * duration_s)
+    return 0.0
 
 
 # ── 主類別 ────────────────────────────────────────────────────────────────────
@@ -346,8 +355,11 @@ class LocalAgreementBuffer:
             # prev_hypothesis 裡——直接拿 agreed 當 new_commit 即可。
             new_commit = agreed
             # 用 segments 反推 agreed 結束位置（相對 process_audio）
+            # v2.21.0 Phase C：傳入本輪完整轉錄文字長度、給 segments 為空時的
+            #   char-ratio fallback 用（防 over-commit 掉尾段）
             audio_offset_s = _audio_position_for_text(
                 r.segments or [], agreed, duration_s,
+                full_text_len=len((r.text or "").strip()),
             )
             new_committed_audio_end_s = committed_end_s + audio_offset_s
         # else：兩輪沒有公共前綴 → 還沒同意、不 commit，留到下輪

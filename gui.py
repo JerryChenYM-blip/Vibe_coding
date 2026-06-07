@@ -262,6 +262,19 @@ class AppWindow(ctk.CTkFrame):
     # _run_transcription 等所有 pending chunks 完成的最大時間
     STREAM_CHUNK_JOIN_TIMEOUT_S = 30.0
 
+    # v2.21.0：class-level 預設、防禦性 net。__init__ 會覆蓋成 instance attr。
+    # 保證即使在繞過 __init__ 的情境（如測試 stub AppWindow.__new__）下這些屬性
+    # 也存在、不會在被測方法裡撞 AttributeError。
+    #   _la_buffer (v2.20.0 LA-2)、_pipeline_* (v2.20.3 N3 pipeline timing)、
+    #   _hotkey_health_tick_count (v2.20.3 N6)、_last_ping_at (v2.20.3 N5)
+    _la_buffer = None
+    _pipeline_summary_emitted = False
+    _pipeline_t0 = None
+    _pipeline_defer_emit = False           # v2.18.2 raw-paste defer emit
+    _pipeline_polish_mode = "blocking"     # v2.18.2
+    _hotkey_health_tick_count = 0
+    _last_ping_at = None
+
     def __init__(self, master: ctk.CTk, cfg: Config) -> None:
         super().__init__(master, fg_color=BG, corner_radius=0)
         self.pack(fill="both", expand=True)
@@ -284,6 +297,13 @@ class AppWindow(ctk.CTkFrame):
                     )
             except Exception:
                 log_error("startup_set_device_failed", device=cfg.input_device)
+        # v2.21.0 Phase M：註冊 CoreAudio 麥克風熱插拔監聽。
+        #   _on_audio_devices_changed 在 CoreAudio 執行緒被呼叫 → marshal 回主執行緒。
+        if hasattr(self.recorder, "start_device_monitor"):
+            try:
+                self.recorder.start_device_monitor(self._on_audio_devices_changed)
+            except Exception:
+                log_error("start_device_monitor_failed")
         self.transcriber = Transcriber()
         # v2.19.0：可疑音檔保留設定推給 transcriber（Agent T 還沒寫完時 hasattr 防炸）
         if hasattr(self.transcriber, "set_suspicious_capture"):
@@ -1595,6 +1615,13 @@ class AppWindow(ctk.CTkFrame):
             if prior:
                 tail = result.text if result.text != "（未偵測到語音內容）" else ""
                 combined = "".join(prior) + tail
+                # v2.21.0 Phase B3：盲拼接的接縫會產生重複（都都/一一律/句尾詞重疊）。
+                # 重用 transcriber 既有的 n-gram dedupe（低風險、跟單段轉錄同一套邏輯）。
+                try:
+                    from transcriber import _dedupe_repetitive_ngrams
+                    combined = _dedupe_repetitive_ngrams(combined)
+                except Exception:
+                    log_error("stream_merge_dedupe_failed")
                 result = result.__class__(
                     text=combined.strip() or "（未偵測到語音內容）",
                     language=result.language,
@@ -1758,9 +1785,14 @@ class AppWindow(ctk.CTkFrame):
         # 這種同音錯字）。改用 `is not False` 放寬：None / True 都試一下；
         # 真的 False（確定沒跑）才略過。process() 內部 ConnectionError fallback
         # 自然會降級回原文，使用者不會卡住。
+        # v2.21.0 Phase B4：把 polish_backend="off" 納入判斷。
+        #   舊邏輯只看 ollama_enabled、沒看 polish_backend → off + ollama_enabled=True
+        #   時仍走 polish path、下游 `self.polish or self.ollama` 又 fallback 回
+        #   ollama → off 名存實亡。加 polish_backend != "off" 讓 off 真的不跑 LLM。
         take_polish_path = (
             valid
             and self.cfg.ollama_enabled
+            and getattr(self.cfg, "polish_backend", "local") != "off"
             and self.ollama.health_ok is not False
         )
 
@@ -1905,9 +1937,10 @@ class AppWindow(ctk.CTkFrame):
                 # （length-based、簡單但可能因 corrections / opencc 微差）
                 tail_raw = llm_input[len(streamed_raw):] if len(llm_input) > len(streamed_raw) else ""
 
-                if tail_raw.strip():
-                    # v2.18.0：透過 polish router
-                    client = self.polish or self.ollama
+                if tail_raw.strip() and self.polish is not None:
+                    # v2.21.0 Phase B4：off 模式 self.polish=None、不再 fallback 回
+                    # ollama（take_polish_path 已擋 off、這裡 defensive）
+                    client = self.polish
                     tail_resp = client.process(
                         tail_raw,
                         prompt_template=preset.resolve_prompt(),
@@ -1917,6 +1950,9 @@ class AppWindow(ctk.CTkFrame):
                     tail_polished = tail_resp.text if (
                         tail_resp and tail_resp.text and not tail_resp.error
                     ) else tail_raw
+                elif tail_raw.strip():
+                    # polish=None（off）：直接用原文尾段、不跑 LLM
+                    tail_polished = tail_raw
                 else:
                     tail_polished = ""
 
@@ -1936,14 +1972,22 @@ class AppWindow(ctk.CTkFrame):
                     preset_name=preset_name,
                 )
             else:
-                # v2.18.0：透過 polish router（Ollama / Vertex / fallback Ollama）
-                client = self.polish or self.ollama
-                resp = client.process(
-                    llm_input,
-                    prompt_template=preset.resolve_prompt(),
-                    dictionary_terms=dict_terms,
-                    preset_name=preset_name,
-                )
+                # v2.21.0 Phase B4：透過 polish router；off 模式 self.polish=None
+                # 不再 fallback 回 ollama（take_polish_path 已擋 off、這裡 defensive）
+                client = self.polish
+                if client is None:
+                    from ollama_client import OllamaResponse
+                    resp = OllamaResponse(
+                        text=llm_input, model="", done=True, error=None,
+                        elapsed_seconds=0.0, preset_name=preset_name,
+                    )
+                else:
+                    resp = client.process(
+                        llm_input,
+                        prompt_template=preset.resolve_prompt(),
+                        dictionary_terms=dict_terms,
+                        preset_name=preset_name,
+                    )
             # 把 raw_text（= Whisper 原文）+ target_block 交給 _finish_polish
             self.after(0, self._finish_polish, gen, raw_text, target, resp, target_block)
 
@@ -3119,6 +3163,42 @@ class AppWindow(ctk.CTkFrame):
         log_action("settings_opened")
         SettingsWindow(self, self.cfg, self._on_settings_saved)
 
+    # ── v2.21.0 Phase M：麥克風熱插拔處理 ───────────────────────────────────
+    def _on_audio_devices_changed(self) -> None:
+        """CoreAudio 裝置變動回呼（在 CoreAudio 執行緒）。marshal 回主執行緒處理。"""
+        try:
+            self.after(0, self._handle_device_change)
+        except Exception:
+            pass   # App 關閉中、root 已銷毀
+
+    def _handle_device_change(self) -> None:
+        """主執行緒：麥克風插/拔後的處理。
+
+        - 重新初始化 PortAudio 拿最新清單（錄音中會自動跳過）
+        - 若使用者選定的裝置（cfg.input_device）已不在 → 退回系統預設 + 提示
+        錄音中不動裝置（避免打斷當下錄音）、等這次錄完下次生效。
+        """
+        try:
+            if self.recorder.is_recording():
+                return
+            devices = self.recorder.refresh_portaudio()
+            names = {d["name"] for d in devices}
+            # v2.21.0：用 recorder「當下實際在用」的裝置名判斷（不是 cfg），
+            #   這樣只在錄音用的那支被拔時 fallback、且 fallback 後 _device_name=None
+            #   不會在後續裝置變動時重複跳 toast。
+            active = getattr(self.recorder, "_device_name", None)
+            if active and active not in names:
+                # 使用中的裝置被拔 → runtime 退回系統預設（但**不**寫死 config，
+                #   保留使用者偏好：下次啟動 / 重新插回時仍會用回原裝置）
+                log_action("mic_device_removed_fallback", device=active)
+                self.recorder._device_index = None
+                self.recorder._device_name = None
+                self._show_toast(f"⚠ 麥克風「{active}」已移除，已切回系統預設")
+            else:
+                log_action("mic_device_changed", count=len(devices))
+        except Exception:
+            log_error("handle_device_change_failed")
+
     def _do_theme_relaunch(self, on_failure=None) -> None:
         """v2.6.0 主題切換後執行：[pre-flight] → toast → 800ms → cleanup → spawn → exit。
 
@@ -4123,6 +4203,12 @@ class AppWindow(ctk.CTkFrame):
             self.hotkey_mgr.stop()
         except Exception:
             log_error("hotkey_mgr_stop_on_close_failed")
+        # v2.21.0 Phase M：撤除 CoreAudio 麥克風監聽（防 dangling listener）
+        if hasattr(self.recorder, "stop_device_monitor"):
+            try:
+                self.recorder.stop_device_monitor()
+            except Exception:
+                log_error("stop_device_monitor_on_close_failed")
         if self.recorder.is_recording():
             log.info("GUI: recorder still active on close — stopping")
             try:
@@ -4344,7 +4430,15 @@ class SettingsWindow(ctk.CTkToplevel):
         # 第一筆固定為「（系統預設）」對應 input_device=None。
         from recorder import AudioRecorder as _AR
         try:
-            self._available_devices = _AR.list_devices()
+            # v2.21.0 Phase M：用 app window 的 recorder.refresh_portaudio() 重新初始化
+            #   PortAudio 拿「最新」裝置清單——這樣插了新麥克風只要開設定就看得到、
+            #   不必重啟整個 App（PortAudio 啟動時會把清單拍快照、不 re-init 看不到新裝置）。
+            #   錄音中 refresh_portaudio 會自動跳過（回舊快照）。拿不到 recorder 就退回 static。
+            _rec = getattr(self.master, "recorder", None)
+            if _rec is not None and hasattr(_rec, "refresh_portaudio"):
+                self._available_devices = _rec.refresh_portaudio()
+            else:
+                self._available_devices = _AR.list_devices()
         except Exception:
             self._available_devices = []
             log_error("settings_list_devices_failed")
