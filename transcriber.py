@@ -412,12 +412,23 @@ def _is_dict_terms_hallucination(text: str, dict_terms: Optional[list[str]] = No
     """
     if not text or not dict_terms or len(dict_terms) < 10:
         return False
+
+    # v2.21.1：framing 前綴鐵證。format_qwen3_context 把字典包成「專有名詞：A、B…。」
+    #   餵給 Qwen3。沒有人會口述「專有名詞：」再列一串詞——所以輸出含這個 framing
+    #   前綴 = 100% 字典 dump。最高優先、直接判定（不受覆蓋率門檻影響）。
+    if text.lstrip().startswith("專有名詞"):
+        return True
+
     # 拼湊出 dict 全部詞的「總字元集」（聯集去重）
     dict_char_set = set("".join(dict_terms))
     if not dict_char_set:
         return False
     # 算 text 裡有多少 char 屬於 dict_char_set
-    text_clean = text.replace(" ", "").replace("\n", "").replace("　", "")
+    # v2.21.1：去掉中文標點再算覆蓋率。原本只去空白/換行、但 framing 的「、。：」
+    #   會被算進分母、把 dump 的覆蓋率從真實 ~96% 稀釋到 80.5% < 門檻 → 漏網
+    #   （v2.21.0 字典加到 48 詞後復現的 regression）。
+    _PUNCT = "、，。：；！？「」『』（）,.!?:;\"'()　 \n\t"
+    text_clean = "".join(c for c in text if c not in _PUNCT)
     if len(text_clean) < 15:
         return False  # 短文字不夠 sample、跳過避免誤殺
     in_dict_chars = sum(1 for c in text_clean if c in dict_char_set)
@@ -1002,7 +1013,31 @@ class Transcriber:
         dict_dump_detected = False
         blacklist_hit = False
 
-        if result.segments:
+        # v2.21.1：整段 dict-dump 守門（最優先）。
+        #   字典 dump 常被 Qwen3-ASR 切成許多小 segment、每段個別字數少 / 覆蓋率低、
+        #   過不了 per-segment 門檻 → 全部 kept → 重組後變成完整 dump 漏網
+        #   （22:15:17 真實 case：「專有名詞：潤飾、辨識…大臺北」）。
+        #   先對「整段重組文字」做 dump 檢查、命中就整段砍掉、跳過 per-segment。
+        if _is_dict_terms_hallucination(result.text, dict_terms_snapshot):
+            dict_dump_detected = True
+            before_text = result.text
+            log.warning(
+                f"WHISPER: Guard - 整段字典 dump 偵測、砍除: '{result.text[:60]}...'"
+            )
+            result.text = "（未偵測到語音內容）"
+            result.segments = []
+            try:
+                if _audit_log is not None:
+                    _audit_log.write_event(
+                        "post_filter_applied",
+                        _safe_pipeline_id(),
+                        filter="dict_dump_whole_text",
+                        is_dict_dump=True,
+                        before_text=before_text[:200],
+                    )
+            except Exception:
+                pass
+        elif result.segments:
             kept = [
                 s for s in result.segments
                 if not _is_any_hallucination(s.get("text", "").strip())
