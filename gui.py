@@ -1614,7 +1614,14 @@ class AppWindow(ctk.CTkFrame):
             prior = list(self._stream_chunks)
             if prior:
                 tail = result.text if result.text != "（未偵測到語音內容）" else ""
-                combined = "".join(prior) + tail
+                # v2.21.3 接縫縫合：移除 10 秒切窗在接縫補的假句號（實測 14/14 接縫
+                #   的句號都是假的、甚至把「三千六」切成「月三。千六」）。tail 原樣保留。
+                try:
+                    from transcriber import stitch_streaming_seams
+                    combined = stitch_streaming_seams(prior, tail)
+                except Exception:
+                    log_error("stream_seam_stitch_failed")
+                    combined = "".join(prior) + tail
                 # v2.21.0 Phase B3：盲拼接的接縫會產生重複（都都/一一律/句尾詞重疊）。
                 # 重用 transcriber 既有的 n-gram dedupe（低風險、跟單段轉錄同一套邏輯）。
                 try:

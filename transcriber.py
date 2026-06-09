@@ -506,6 +506,39 @@ _DEDUPE_PATTERNS = [
 ]
 
 
+def stitch_streaming_seams(chunks: list[str], tail: str = "") -> str:
+    """v2.21.3：streaming chunk 合併時移除「接縫假句號」。
+
+    根因：fixed_chunk streaming 把長語音切成 10 秒一段、每段各自獨立轉錄、各自在
+    結尾補句末標點。但 10 秒切點幾乎不可能剛好落在真正的句末——實測 162 組多-chunk
+    錄音、14/14 接縫的句號都是假的，甚至把「三千六」切成「月三。千六」、把「辦法」
+    切成「辦。法」、把「如果我每個月」切成「果我。每個月」。
+
+    修法：每個 chunk（= 非最後一段）結尾若是 。！？ 就移除再接；**保留 chunk 內部
+    的句號**（那是模型偵測到的真實停頓）。tail（使用者真正講完的最後一段）原樣保留、
+    提供整段真正的結尾標點。
+
+    安全性（為何不會誤接真實兩句）：固定 10 秒切點是任意的、與語意無關，所以接縫
+    的句號本質上就是模型對「被硬切的半句」勉強補的假結尾。即使極少數 chunk 剛好在
+    10 秒結束一句、移除那個句號也只是少一個斷句點（大語言/讀者仍可解析）、遠優於
+    目前 100% 假句號把每句話腰斬。
+
+    Args:
+        chunks: streaming 期間累積的 chunk 文字（非最後一段）
+        tail:   放開 hotkey 後最後一段的轉錄（真正的結尾、原樣保留）
+    """
+    if not chunks:
+        return tail or ""
+    parts = []
+    for c in chunks:
+        c = (c or "").rstrip()
+        # 只移除「結尾」的句末標點（。！？），保留逗號與 chunk 內部標點
+        while c and c[-1] in "。！？":
+            c = c[:-1].rstrip()
+        parts.append(c)
+    return "".join(parts) + (tail or "")
+
+
 def _dedupe_repetitive_ngrams(text: str) -> str:
     """砍掉「2-5 字 unit 連續重複 ≥ 3 次」的退化輸出，保留首次出現。
 
