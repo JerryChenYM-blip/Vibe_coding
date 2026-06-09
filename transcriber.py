@@ -911,7 +911,13 @@ class Transcriber:
         # 兩層加起來把 ASR 暴露在「無真實 voice」的機率壓到接近 0。
         # 觸發時走 audit_log 的 silero_vad_block event（非 transcribe entry）；
         # transcribe entry 的 gates 不會出現這次、不衝突。
-        if self._silero_vad_enabled and _silero_no_voice(audio, self._silero_vad_threshold):
+        # v2.21.4：長音逃生門——音檔 > 4s 即使 Silero 回 no_voice 也照送 ASR。
+        #   實測 21 筆被擋的音長 [0.4..3.6, 4.4, 4.4, 5.4]，其中 5.4s（普通話可講
+        #   ~38 字）極可能是真語音被誤殺（Silero 對小聲/口音/遠場偶爾誤判）。長音
+        #   被當「純雜音」的機率極低、誤殺成本遠高於放水（多跑一次 ASR 而已）。
+        #   短音（≤4s 的鍵盤/紙張/冷氣聲）維持照擋。
+        if (self._silero_vad_enabled and duration <= 4.0
+                and _silero_no_voice(audio, self._silero_vad_threshold)):
             log.info(
                 f"WHISPER: Guard - Silero VAD detected no speech "
                 f"(threshold={self._silero_vad_threshold}, duration={duration:.2f}s), "
@@ -1918,6 +1924,21 @@ class Transcriber:
                 from mlx_qwen3_asr import Session
                 self._qwen3_session = Session(model=hf_repo)
                 self._qwen3_loaded_model = model_size
+                # v2.21.4：MLX Metal buffer cache 上限 2GB。實測長 session（71hr 連跑）
+                #   cache 從 1.8GB 一路漲到 6.25GB 從不回收、在 16GB Mac 約佔 39% RAM、
+                #   擠壓 system page cache → 誘發 keepalive 偶發 14.5s 的 page-in。
+                #   設上限讓 MLX 把超量 cache 還給 OS。2GB > 單次推論工作集、< 囤積量。
+                #   （若觀察到 RTF 退化＝cache 太小、可調高；比定期 clear_cache 安全）。
+                try:
+                    import mlx.core as mx
+                    _limit = 2 * 1024 * 1024 * 1024
+                    # 新版 MLX：mx.set_cache_limit；舊版：mx.metal.set_cache_limit
+                    if hasattr(mx, "set_cache_limit"):
+                        mx.set_cache_limit(_limit)
+                    else:
+                        mx.metal.set_cache_limit(_limit)
+                except Exception:
+                    pass
                 elapsed = time.perf_counter() - t_start
                 log.info(f"WHISPER: Qwen3-ASR session loaded in {elapsed:.2f}s.")
                 return self._qwen3_session

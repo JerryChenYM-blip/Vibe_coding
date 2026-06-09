@@ -160,24 +160,30 @@ class AudioRecorder:
             # 每個 callback 接收的 sample 數 = 採樣率 × 時間塊
             blocksize = int(BLOCK_MS / 1000 * SAMPLE_RATE)
 
+            # D2-S1：closure 帶入當前 gen snapshot，callback 只在 gen 仍匹配時寫
+            def _open_stream(device):
+                def _cb(indata, frames, time_info, status, _gen=my_gen):
+                    self._audio_callback(indata, frames, time_info, status, _gen)
+                stream = sd.InputStream(
+                    samplerate=SAMPLE_RATE,
+                    channels=CHANNELS,
+                    dtype=DTYPE,
+                    blocksize=blocksize,
+                    device=device,
+                    callback=_cb,                    # PortAudio 執行緒呼叫此函式
+                )
+                stream.start()
+                return stream
+
+            # v2.21.4：標記本次是否退回系統預設裝置（gui 端據此提示使用者）
+            self._started_with_fallback = False
             try:
                 log.info(
                     f"RECORD: Attempting to start microphone. "
                     f"Device={self._device_index}, Samplerate={SAMPLE_RATE}, "
                     f"Blocksize={blocksize}, gen={my_gen}"
                 )
-                # D2-S1：closure 帶入當前 gen snapshot，callback 只在 gen 仍匹配時寫
-                def _cb(indata, frames, time_info, status, _gen=my_gen):
-                    self._audio_callback(indata, frames, time_info, status, _gen)
-                self._stream = sd.InputStream(
-                    samplerate=SAMPLE_RATE,
-                    channels=CHANNELS,
-                    dtype=DTYPE,
-                    blocksize=blocksize,
-                    device=self._device_index,
-                    callback=_cb,                    # PortAudio 執行緒呼叫此函式
-                )
-                self._stream.start()
+                self._stream = _open_stream(self._device_index)
                 self._is_recording = True
                 log.info(
                     f"RECORD: Stream active. Latency={self._stream.latency:.4f}s, "
@@ -186,9 +192,28 @@ class AudioRecorder:
                 return True
             except Exception:
                 log_error("recorder_init_failed", device=self._device_index)
-                # 確保狀態乾淨，不讓下次 start() 誤判
                 self._stream = None
                 self._is_recording = False
+                # v2.21.4：指定裝置開串流失敗（AirPods/藍牙耳機剛喚醒或沒連時、
+                #   _device_index 指到的裝置還沒 ready、sd.InputStream 直接 throw）
+                #   → 退回系統預設麥克風重試一次，避免使用者按了快捷鍵整段錄音作廢。
+                #   注意這跟 v2.21 的「錄音中拔線」熱插拔不同——這是錄音開始那一刻
+                #   裝置就還沒 ready。fallback 成功時設旗標、gui 端 toast 告知改用內建。
+                if self._device_index is not None:
+                    try:
+                        log.warning(
+                            "RECORD: 指定裝置開串流失敗、改用系統預設麥克風重試"
+                        )
+                        self._stream = _open_stream(None)
+                        self._is_recording = True
+                        self._started_with_fallback = True
+                        log.info("RECORD: Stream active（已退回系統預設麥克風）。")
+                        return True
+                    except Exception:
+                        log_error("recorder_init_failed_fallback")
+                        self._stream = None
+                        self._is_recording = False
+                        return False
                 return False
 
     def stop(self) -> np.ndarray:
