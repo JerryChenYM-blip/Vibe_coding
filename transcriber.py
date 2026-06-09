@@ -1013,12 +1013,24 @@ class Transcriber:
         dict_dump_detected = False
         blacklist_hit = False
 
+        # v2.21.2：超短音檔 vs 字數比短路（dict-dump 的額外防線）。
+        #   普通話最快也只能 ~7 字/秒。若音檔 < 2.5s 卻吐出 > duration×10 字、
+        #   且含 ≥5 個字典詞 → 物理上不可能是真語音、判定 dump。
+        #   防 framing 前綴被模型丟掉、或覆蓋率剛好卡門檻時的漏網。
+        #   保守：正常極短語句（「好」「對」字數少）不會觸發。
+        _impossible_rate = (
+            0 < duration < 2.5
+            and len(result.text) > max(15, duration * 10)
+            and dict_terms_snapshot
+            and sum(1 for t in dict_terms_snapshot if t and len(t) >= 2 and t in result.text) >= 5
+        )
+
         # v2.21.1：整段 dict-dump 守門（最優先）。
         #   字典 dump 常被 Qwen3-ASR 切成許多小 segment、每段個別字數少 / 覆蓋率低、
         #   過不了 per-segment 門檻 → 全部 kept → 重組後變成完整 dump 漏網
         #   （22:15:17 真實 case：「專有名詞：潤飾、辨識…大臺北」）。
         #   先對「整段重組文字」做 dump 檢查、命中就整段砍掉、跳過 per-segment。
-        if _is_dict_terms_hallucination(result.text, dict_terms_snapshot):
+        if _impossible_rate or _is_dict_terms_hallucination(result.text, dict_terms_snapshot):
             dict_dump_detected = True
             before_text = result.text
             log.warning(
