@@ -959,6 +959,14 @@ class AppWindow(ctk.CTkFrame):
                 pass
             return
 
+        # v2.21.4：若 recorder 因指定裝置（AirPods）未就緒而退回系統預設、提示使用者
+        #   為何不是用 AirPods 收音（避免困惑）。
+        if getattr(self.recorder, "_started_with_fallback", False):
+            try:
+                self._show_toast("指定麥克風未就緒，已改用系統預設裝置錄音")
+            except Exception:
+                pass
+
         # v2.19.0：錄音真正開始 → 生成新 pipeline_id，貫穿整條 pipeline。
         # （錄音啟動失敗時就不生 pid、避免 dead pid 污染 log）
         _pipe_new_id()
@@ -3491,6 +3499,11 @@ class AppWindow(ctk.CTkFrame):
             except Exception:
                 log_error("vertex_apply_app_config_failed")
         self._refresh_polish_backend()
+        # v2.21.4：存檔後若選了 Vertex 但 Project ID 空、明確告知（否則使用者會
+        #   「以為開了 AI 潤飾、其實每次都靜默降回原文」完全感知不到）。
+        if (getattr(cfg, "polish_backend", "local") == "vertex"
+                and not (getattr(cfg, "vertex_project_id", "") or "").strip()):
+            self._show_toast("Vertex 潤飾需要 Project ID，目前未設定、潤飾已停用")
         self._refresh_ollama_health()
 
         # v2.19.0：可疑音檔保留設定也同步推給 transcriber
@@ -4014,8 +4027,19 @@ class AppWindow(ctk.CTkFrame):
         """
         backend = getattr(self.cfg, "polish_backend", "local")
         if backend == "vertex" and self.vertex is not None:
-            self.polish = self.vertex
-            log.info(f"POLISH: backend = vertex (model={self.cfg.vertex_model})")
+            # v2.21.4 防呆：純 Vertex 後端必須有 project_id，否則每次潤飾都會在
+            #   vertex_polish._ensure_client raise RuntimeError、靜默降級回原文——
+            #   使用者「以為開了 AI 潤飾、其實每次都沒跑」完全感知不到。空 ID 就直接
+            #   停用潤飾、log 標明，避免假性啟用 + 反覆 raise。
+            if not (getattr(self.cfg, "vertex_project_id", "") or "").strip():
+                self.polish = None
+                log.warning(
+                    "POLISH: backend=vertex 但 vertex_project_id 為空、潤飾已停用"
+                    "（請在設定填入 Project ID）"
+                )
+            else:
+                self.polish = self.vertex
+                log.info(f"POLISH: backend = vertex (model={self.cfg.vertex_model})")
         elif backend == "hybrid":
             # v2.19.x：lazy init hybrid client（沒裝 google-genai 也能跑 Layer 1+2）
             if not hasattr(self, "hybrid") or self.hybrid is None:

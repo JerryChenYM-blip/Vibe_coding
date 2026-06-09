@@ -1121,3 +1121,79 @@ def test_d4s6_restart_logs_combo_and_lone_change():
         for msg in captured
     )
     assert found, f"應該 log combo 切換；實際 captured: {captured}"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# v2.21.4 log 全掃優化的回歸測試
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_recorder_falls_back_to_default_device(monkeypatch):
+    """v2.21.4：指定裝置（AirPods）開串流失敗 → 退回系統預設(device=None)重試成功、
+    且標記 _started_with_fallback=True（gui 端據此 toast 提示）。"""
+    import recorder as _rec
+    rec = _rec.AudioRecorder()
+    rec._device_index = 7  # 假 AirPods index、尚未 ready
+
+    class _FakeStream:
+        latency = 0.01
+        cpu_load = 0.1
+        def start(self): pass
+        def stop(self): pass
+        def close(self): pass
+
+    def _fake_input_stream(*args, device=None, **kwargs):
+        if device is not None:
+            raise RuntimeError("device not ready")   # 指定裝置失敗
+        return _FakeStream()                          # 系統預設成功
+
+    monkeypatch.setattr(_rec.sd, "InputStream", _fake_input_stream)
+    ok = rec.start()
+    assert ok is True
+    assert rec._started_with_fallback is True
+    rec.stop()
+
+
+def test_recorder_no_fallback_flag_on_clean_start(monkeypatch):
+    """指定裝置一次就成功時、_started_with_fallback 應為 False（不誤觸 toast）。"""
+    import recorder as _rec
+    rec = _rec.AudioRecorder()
+    rec._device_index = 3
+
+    class _FakeStream:
+        latency = 0.01
+        cpu_load = 0.1
+        def start(self): pass
+        def stop(self): pass
+        def close(self): pass
+
+    monkeypatch.setattr(_rec.sd, "InputStream", lambda *a, **k: _FakeStream())
+    assert rec.start() is True
+    assert rec._started_with_fallback is False
+    rec.stop()
+
+
+def test_vertex_polish_disabled_when_project_id_empty():
+    """v2.21.4：polish_backend=vertex 但 vertex_project_id 空 → self.polish=None
+    （避免「以為開了 AI 潤飾、其實每次靜默降回原文」）。"""
+    from gui import AppWindow
+    win = AppWindow.__new__(AppWindow)
+    win.cfg = types.SimpleNamespace(
+        polish_backend="vertex", vertex_project_id="", vertex_model="x",
+    )
+    win.vertex = MagicMock()   # vertex client 存在、但 project_id 空
+    win.ollama = MagicMock()
+    win._refresh_polish_backend()
+    assert win.polish is None
+
+
+def test_vertex_polish_enabled_when_project_id_set():
+    """project_id 有填時、self.polish 正常指向 vertex。"""
+    from gui import AppWindow
+    win = AppWindow.__new__(AppWindow)
+    win.cfg = types.SimpleNamespace(
+        polish_backend="vertex", vertex_project_id="my-proj", vertex_model="x",
+    )
+    win.vertex = MagicMock()
+    win.ollama = MagicMock()
+    win._refresh_polish_backend()
+    assert win.polish is win.vertex

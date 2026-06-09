@@ -47,7 +47,10 @@ def get_frontmost_app() -> Optional[str]:
                 log.debug(f"AUTO-PASTE: frontmost (NSWorkspace) = '{name}'")
                 return str(name)
     except Exception:
-        log_error("get_frontmost_app_nsworkspace_failed")
+        # v2.21.4：降級成 warning。此 except 後面緊接 osascript fallback、多數
+        #   情況最終成功、不是終局失敗。記成 ERROR 會在告警統計造成假錯誤
+        #   （實測 28 條假 ERROR）。真正的終局失敗在下面 osascript 也掛掉時記。
+        log.warning("get_frontmost_app: NSWorkspace 失敗、改用 osascript fallback")
 
     # Fallback：osascript（保留 D5-S10 容錯處理）
     try:
@@ -193,7 +196,7 @@ def paste_to_app(
             kb.tap("v")
         log.info(
             f"AUTO-PASTE: ⌘V sent → '{app_name}' "
-            f"(text_len={len(text)}, fullscreen={_is_app_fullscreen(app_name) if app_name else 'n/a'})"
+            f"(text_len={len(text)}, fullscreen={is_fullscreen if app_name else 'n/a'})"
         )
         # v2.19.0：pipeline event「paste_done」、觀測性失敗不影響主流程
         try:
