@@ -3209,6 +3209,21 @@ class AppWindow(ctk.CTkFrame):
                 self.recorder._device_index = None
                 self.recorder._device_name = None
                 self._show_toast(f"⚠ 麥克風「{active}」已移除，已切回系統預設")
+            elif active:
+                # v2.21.5 BUGFIX：裝置還在、但 refresh_portaudio 的 PortAudio re-init
+                #   會讓**所有裝置 index 位移**。舊 _device_index 指到錯的裝置 → 下次
+                #   錄音錄到錯裝置、收到雜訊/靜音 → 顯示「未偵測到語音內容」且不報錯
+                #   （串流有開成功、不丟例外，fallback 也不會觸發）。這正是「插新裝置
+                #   後沒重選就一直錄音失敗」的根因。必須用名字重新解析回正確 index
+                #   （這就是當初存 _device_name 的目的、見 recorder.py 註解）。
+                if self.recorder.set_device_by_name(active):
+                    log_action("mic_device_reindexed", device=active,
+                               index=self.recorder._device_index)
+                else:
+                    # 理論上不會走到（active 已在 names 內）；保險退回系統預設。
+                    self.recorder._device_index = None
+                    self.recorder._device_name = None
+                    log_action("mic_device_reindex_failed_fallback", device=active)
             else:
                 log_action("mic_device_changed", count=len(devices))
         except Exception:

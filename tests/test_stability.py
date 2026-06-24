@@ -1197,3 +1197,62 @@ def test_vertex_polish_enabled_when_project_id_set():
     win.ollama = MagicMock()
     win._refresh_polish_backend()
     assert win.polish is win.vertex
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# v2.21.5 麥克風熱插拔 index 位移 bug 回歸測試
+# ─────────────────────────────────────────────────────────────────────────
+
+def _fake_recorder_for_device_change(device_name, stale_index, new_list):
+    """造一個 recorder stub：_device_name 已設、_device_index 是位移前的舊值，
+    refresh_portaudio/list_devices 回傳新清單（index 已位移）。"""
+    import recorder as _rec
+    rec = _rec.AudioRecorder()
+    rec._device_name = device_name
+    rec._device_index = stale_index
+    rec.refresh_portaudio = lambda: new_list
+    rec.list_devices = lambda: new_list   # set_device_by_name 會用這個重新解析
+    return rec
+
+
+def test_device_change_reresolves_stale_index_when_device_present():
+    """v2.21.5：插新裝置後 PortAudio re-init 使 index 位移、但選定裝置仍在 →
+    _handle_device_change 必須用名字把 index 重新解析回正確值（不是放著不管）。"""
+    from gui import AppWindow
+    win = AppWindow.__new__(AppWindow)
+    # AirPods 原本 index=2，插新裝置後位移到 5
+    new_list = [{"id": 0, "name": "Built-in"},
+                {"id": 3, "name": "Wired"},
+                {"id": 5, "name": "AirPods"}]
+    win.recorder = _fake_recorder_for_device_change("AirPods", 2, new_list)
+    win._show_toast = MagicMock()
+    win._handle_device_change()
+    # 修好後：index 應從舊的 2 被重新解析成 5（指回真正的 AirPods）
+    assert win.recorder._device_index == 5
+    assert win.recorder._device_name == "AirPods"
+    win._show_toast.assert_not_called()   # 裝置沒被拔、不該跳移除 toast
+
+
+def test_device_change_falls_back_when_device_removed():
+    """選定裝置被拔（不在新清單）→ 退回系統預設 + 跳 toast（既有行為不可壞）。"""
+    from gui import AppWindow
+    win = AppWindow.__new__(AppWindow)
+    new_list = [{"id": 0, "name": "Built-in"}, {"id": 1, "name": "Wired"}]
+    win.recorder = _fake_recorder_for_device_change("AirPods", 2, new_list)
+    win._show_toast = MagicMock()
+    win._handle_device_change()
+    assert win.recorder._device_index is None      # 退回系統預設
+    assert win.recorder._device_name is None
+    win._show_toast.assert_called_once()
+
+
+def test_device_change_noop_on_system_default():
+    """使用者用系統預設（_device_name=None）→ 裝置變動不需重新解析、也不跳 toast。"""
+    from gui import AppWindow
+    win = AppWindow.__new__(AppWindow)
+    new_list = [{"id": 0, "name": "Built-in"}, {"id": 1, "name": "AirPods"}]
+    win.recorder = _fake_recorder_for_device_change(None, None, new_list)
+    win._show_toast = MagicMock()
+    win._handle_device_change()
+    assert win.recorder._device_index is None
+    win._show_toast.assert_not_called()
