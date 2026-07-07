@@ -176,6 +176,14 @@ class Config:
     streaming_la_min_chunk_s: float = 5.0    # 未 commit 尾段至少多長才重轉（秒）
     streaming_la_max_buffer_s: int   = 120   # audio buffer 上限、超過 force commit（秒）
 
+    # ── v2.22.0 VAD 對齊切窗（fixed_chunk streaming 專用）───────────────────
+    # 治「fixed_chunk 每 10s 硬切、切點與語意無關」的根：切點改選在使用者
+    # 真正停頓處（簡單 RMS 法找靜音，非完整 Silero VAD）。
+    #   "vad_aligned"（預設）= buffer 滿 10s 後先在最後 2.5s 找靜音切點，
+    #                          找不到就延後到 hard cap 12s 強制切
+    #   "fixed"              = 退回舊行為（滿 10s 就無腦切，逃生門）
+    chunk_cut_mode: str = "vad_aligned"
+
     # ── v2.18.0 Polish backend 選擇（本地 Ollama / 雲端 Vertex AI Gemini）─
     # "local"  = Ollama（地端 GPU、隱私 100% 本地、~5s warm、會 thermal throttle）
     # "vertex" = Google Vertex AI Gemini（雲端、不佔本地 GPU、~3-10s 含網路、需 GCP 帳號）

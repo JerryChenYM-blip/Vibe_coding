@@ -192,6 +192,81 @@ def resolve_reduce_motion(pref: str) -> bool:
     return system_reduce_motion()
 
 
+# v2.22.0 VAD 對齊切窗（治 streaming 腰斬詞的根）─────────────────────────────
+# fixed_chunk streaming 每滿 10s 就硬切一段送轉錄，切點與語意無關（實測 195 個
+# 接縫 100% 落在句中）。這裡不跑完整 Silero VAD（太重、每秒 tick 都要跑不划算），
+# 改用簡單 RMS 法：只在「最後 SEARCH_WINDOW_S 秒」裡找一個能量最低的靜音窗，
+# 找到就把切點挪去那裡（該點之後的音留給下一段開頭，一個 sample 都不丟）。
+STREAM_CUT_SEARCH_WINDOW_S = 2.5   # 只在 buffer 最後 2.5s 內找靜音切點
+STREAM_CUT_RMS_WINDOW_MS = 80      # RMS 計算視窗
+STREAM_CUT_RMS_THRESHOLD_RATIO = 0.3   # 視窗 RMS < 全段中位數 × 此比例 → 判定靜音
+
+
+def find_silence_cut_point(
+    audio,
+    sample_rate: int = 16_000,
+    search_window_s: float = STREAM_CUT_SEARCH_WINDOW_S,
+    rms_window_ms: int = STREAM_CUT_RMS_WINDOW_MS,
+    threshold_ratio: float = STREAM_CUT_RMS_THRESHOLD_RATIO,
+) -> Optional[int]:
+    """在 audio 最後 search_window_s 秒內找「能量最低的靜音窗」當切點。
+
+    純函式、不碰任何 Tk / 狀態，方便單元測試。
+
+    做法：
+      1. 把 audio 切成 rms_window_ms 大小的小視窗，逐一算 RMS。
+      2. 全段（不只搜尋窗）RMS 中位數當作「講話音量」基準。
+      3. 只在最後 search_window_s 秒對應的視窗裡，找 RMS 最低、且低於
+         中位數 × threshold_ratio 的視窗，回傳該視窗中點的 sample index。
+      4. 找不到符合門檻的視窗 → 回傳 None（呼叫端 fallback 到 hard cap 硬切）。
+
+    Args:
+        audio: 1-D numpy float32 陣列。
+        sample_rate: 取樣率（Hz）。
+        search_window_s: 只在音訊尾端這麼多秒內找切點。
+        rms_window_ms: 逐視窗 RMS 計算的視窗大小。
+        threshold_ratio: 判定「安靜」的門檻（相對全段中位數 RMS）。
+
+    Returns:
+        切點的 sample index（int），或 None（找不到夠安靜的地方）。
+    """
+    import numpy as np
+
+    n = len(audio)
+    win = max(1, int(sample_rate * rms_window_ms / 1000))
+    if n < win * 2:
+        return None   # 太短，不夠切兩個視窗
+
+    # 逐視窗 RMS（不重疊、簡單快速）
+    n_windows = n // win
+    trimmed = audio[: n_windows * win].reshape(n_windows, win)
+    rms = np.sqrt(np.mean(trimmed.astype(np.float64) ** 2, axis=1))
+
+    median_rms = float(np.median(rms))
+    if median_rms <= 0:
+        return None   # 全段靜音之類的異常情況，不特別處理
+
+    threshold = median_rms * threshold_ratio
+
+    # 只看最後 search_window_s 秒對應的視窗範圍
+    search_samples = int(sample_rate * search_window_s)
+    search_start_window = max(0, (n - search_samples) // win)
+
+    candidate_windows = rms[search_start_window:]
+    if len(candidate_windows) == 0:
+        return None
+
+    best_local_idx = int(np.argmin(candidate_windows))
+    best_rms = candidate_windows[best_local_idx]
+    if best_rms >= threshold:
+        return None   # 最安靜的地方都不夠安靜 → 沒有真正的停頓
+
+    best_window_idx = search_start_window + best_local_idx
+    # 切點取該視窗中點
+    cut_point = best_window_idx * win + win // 2
+    return int(cut_point)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  AppWindow
 # ─────────────────────────────────────────────────────────────────────────────
@@ -261,6 +336,11 @@ class AppWindow(ctk.CTkFrame):
     STREAM_MIN_ENABLE_SAMPLES = 12 * 16_000   # 12 秒
     # _run_transcription 等所有 pending chunks 完成的最大時間
     STREAM_CHUNK_JOIN_TIMEOUT_S = 30.0
+
+    # v2.22.0 VAD 對齊切窗：buffer 滿 10s 後不立刻硬切，先在最後 2.5s 內找
+    # 靜音切點；連續講話找不到停頓 → 延後到 hard cap 12s 強制切（保底、
+    # 行為同 chunk_cut_mode="fixed" 的舊路徑）。
+    STREAM_HARD_CAP_SAMPLES = 12 * 16_000   # 12s × 16kHz
 
     # v2.21.0：class-level 預設、防禦性 net。__init__ 會覆蓋成 instance attr。
     # 保證即使在繞過 __init__ 的情境（如測試 stub AppWindow.__new__）下這些屬性
@@ -1257,6 +1337,9 @@ class AppWindow(ctk.CTkFrame):
             wait 確保最終合併前所有 chunks 完成。
           • 短錄音 (< STREAM_MIN_ENABLE_SAMPLES = 12s) 完全不 dispatch、
             直接走原 end-to-end 路徑（streaming overhead > 收益）。
+          • v2.22.0 VAD 對齊切窗：累積 ≥10s 後不再無腦硬切，交給
+            _decide_stream_cut_length() 判斷（詳見該方法 docstring）。
+            cfg.chunk_cut_mode="fixed" 可退回舊的「滿 10s 就切」行為。
         """
         self._stream_tick_id = None
         if self._state != "recording":
@@ -1284,18 +1367,78 @@ class AppWindow(ctk.CTkFrame):
             )
             return
 
-        # 累積 ≥ 10s 新 audio？ → dispatch chunk
+        # 累積 ≥ 10s 新 audio？ → 決定切點（VAD 對齊 or 舊 fixed 行為）
         if available >= self.STREAM_CHUNK_SAMPLES:
-            chunk_end = self._stream_samples + self.STREAM_CHUNK_SAMPLES
-            chunk = snap[self._stream_samples:chunk_end]
-            self._stream_samples = chunk_end
-            self._dispatch_stream_chunk(chunk)
+            cut_len = self._decide_stream_cut_length(snap, available)
+            if cut_len is not None:
+                chunk_end = self._stream_samples + cut_len
+                chunk = snap[self._stream_samples:chunk_end]
+                self._stream_samples = chunk_end
+                self._dispatch_stream_chunk(chunk)
+            # cut_len is None → 還沒到 hard cap、且沒找到靜音，繼續累積等下次 tick
 
         # 排下次 tick
         if self._state == "recording":
             self._stream_tick_id = self.after(
                 self.STREAM_TICK_MS, self._stream_tick
             )
+
+    def _decide_stream_cut_length(self, snap, available: int) -> Optional[int]:
+        """v2.22.0 VAD 對齊切窗：決定這次要切多長（相對 _stream_samples 的
+        sample 數），或回傳 None 表示這次先不切、繼續累積。
+
+        邏輯（chunk_cut_mode 讀自 self.cfg，預設 "vad_aligned"）：
+          • "fixed"：完全比照舊行為 —— 累積 ≥ 10s 就切滿 10s，不找靜音。
+          • "vad_aligned"（預設）：
+              - 還沒到 hard cap（12s）：在目前累積的音訊「最後 2.5 秒」內找
+                能量最低的靜音窗；找到就切在那裡（切點後的音留給下一段）。
+                找不到就回 None，讓 _stream_tick 繼續累積等下一秒。
+              - 已達 hard cap（12s）：不能再等了，最後再試一次找靜音、
+                找不到就強制在 hard cap 處切（保底、行為同舊 fixed path）。
+
+        audit log：每次真正切下去都記一筆 chunk_cut（cut_at_s / mode /
+        found_silence），方便日後驗收「切點有沒有落在真正的停頓」。
+        """
+        mode = getattr(self.cfg, "chunk_cut_mode", "vad_aligned")
+
+        if mode == "fixed":
+            cut_len = self.STREAM_CHUNK_SAMPLES
+            log_action(
+                "chunk_cut",
+                cut_at_s=round((self._stream_samples + cut_len) / 16_000, 2),
+                mode="fixed",
+                found_silence=False,
+            )
+            return cut_len
+
+        # vad_aligned：只在目前累積範圍（從 _stream_samples 開始）搜尋
+        buffer_tail = snap[self._stream_samples:self._stream_samples + available]
+        hard_cap_reached = available >= self.STREAM_HARD_CAP_SAMPLES
+
+        cut_point = find_silence_cut_point(buffer_tail, sample_rate=16_000)
+
+        if cut_point is not None:
+            log_action(
+                "chunk_cut",
+                cut_at_s=round((self._stream_samples + cut_point) / 16_000, 2),
+                mode="vad_aligned",
+                found_silence=True,
+            )
+            return cut_point
+
+        if not hard_cap_reached:
+            # 連續講話沒停頓、還沒到 hard cap → 先不切，等下一秒累積更多
+            return None
+
+        # 到 hard cap 仍找不到停頓 → 強制切在 hard cap（保底、同舊行為）
+        cut_len = self.STREAM_HARD_CAP_SAMPLES
+        log_action(
+            "chunk_cut",
+            cut_at_s=round((self._stream_samples + cut_len) / 16_000, 2),
+            mode="vad_aligned",
+            found_silence=False,
+        )
+        return cut_len
 
     def _dispatch_stream_chunk(self, audio) -> None:
         """送一個 chunk 到背景 thread 跑 transcribe，結果寫進 _stream_chunks[idx]。
