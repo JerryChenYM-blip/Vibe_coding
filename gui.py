@@ -1,3 +1,4 @@
+# Mac/Windows 雙棲 — 移植自 macOS v2.21.6
 """
 主應用程式視窗——Apple MacBook Pro 美學設計。
 
@@ -50,6 +51,7 @@ from transcriber import Transcriber, TranscriptionResult
 from icons import get_icon, get_canvas_icon
 from animation import blend, breathe, ease_in_out_cubic, Ripple
 import auto_paste as _ap
+from platform_util import IS_MAC, IS_WINDOWS
 
 log = get_logger("gui")
 
@@ -94,6 +96,21 @@ def _pipe_record_paste_latency(latency_s: float):
         session_summary.record_paste_latency(latency_s=latency_s)
     except Exception:
         pass
+
+
+def _open_path_in_os_default(path) -> None:
+    """用作業系統預設方式開啟檔案／資料夾（Finder / 檔案總管 / 預設編輯器）。
+
+    mac：`open` 指令（既有行為不變）。
+    Windows：`os.startfile`（Windows 內建 API，行為等同雙擊該路徑）。
+    """
+    if IS_MAC:
+        subprocess.run(["open", str(path)])
+    elif IS_WINDOWS:
+        os.startfile(str(path))  # type: ignore[attr-defined]
+    else:
+        # Linux 等其他平台：桌面環境慣例是 xdg-open
+        subprocess.run(["xdg-open", str(path)])
 
 # ── 強制套用 Apple 深色美學 ───────────────────────────────────────────────────
 ctk.set_appearance_mode("Dark")
@@ -160,19 +177,26 @@ PROC_PARTICLE_RADIUS  = 4   # 每個粒子的半徑（像素）
 # ─────────────────────────────────────────────────────────────────────────────
 
 def system_reduce_motion() -> bool:
-    """讀取 macOS「減少動態效果」系統偏好設定（啟動時讀取一次）。
+    """讀取系統「減少動態效果」偏好設定（啟動時讀取一次）。
 
     依 macOS 慣例，偏好設定變更需要重新啟動 App 才生效。
-    任何錯誤（鍵不存在、超時、非 Darwin 平台）都回傳 False（不限制動畫）。
+    任何錯誤（鍵不存在、超時）都回傳 False（不限制動畫）。
+
+    Windows 分支：Windows 的對應設定在登錄檔（Registry）
+    `SPI_GETCLIENTAREAANIMATION`，屬錦上添花、非必要，這裡先回 False
+    （不限制動畫）而非硬造登錄檔讀取邏輯。
     """
-    try:
-        r = subprocess.run(
-            ["defaults", "read", "com.apple.universalaccess", "reduceMotion"],
-            capture_output=True, text=True, timeout=0.5,
-        )
-        return r.stdout.strip() == "1"
-    except Exception:
-        return False
+    if IS_MAC:
+        try:
+            r = subprocess.run(
+                ["defaults", "read", "com.apple.universalaccess", "reduceMotion"],
+                capture_output=True, text=True, timeout=0.5,
+            )
+            return r.stdout.strip() == "1"
+        except Exception:
+            return False
+    # Windows/Linux：尚未實作系統偏好讀取，預設不限制動畫
+    return False
 
 
 def resolve_reduce_motion(pref: str) -> bool:
@@ -559,31 +583,36 @@ class AppWindow(ctk.CTkFrame):
         self.after(self.HOTKEY_WATCHDOG_INTERVAL_MS, self._hotkey_watchdog)
         # Fix 10 / 2026-05-23：tap poller —— 詳見 _hotkey_tap docstring。
         self.after(self.PENDING_TAP_POLL_MS, self._poll_pending_tap)
-        # Fix 17 / 2026-05-23：Cocoa observer poller —— 詳見 _cocoa_pending_actions。
-        self.after(self.COCOA_POLL_MS, self._poll_cocoa_pending_actions)
-        # 穩定性（Fix 5 / 2026-05-22）：macOS Dock icon 點擊把最小化的視窗叫回來。
-        # 兩條保險絲（Apple Event 處理在 shim Python.app 上可能不完整）：
-        #   1. ::tk::mac::ReopenApplication — Tk-on-macOS 的官方 idiom，但需要
-        #      AppleEvent handler 註冊完整才會觸發
-        #   2. <<Activate>> 虛擬事件 — App 取得焦點時觸發，較可靠的 fallback
-        #      （只在 iconic 狀態才 deiconify，避免每次 focus 都干擾）
-        try:
-            self.createcommand('::tk::mac::ReopenApplication', self._on_dock_reopen)
-        except Exception:
-            pass
-        self.bind("<<Activate>>", self._on_app_activate)
-        # Fix 5c / 2026-05-22：實測診斷顯示 NSApp delegate 為 None — Tk 沒設好
-        # NSApplicationDelegate，AppleEvent kAEReopenApplication 沒人接收，所以
-        # 上面兩條（::tk::mac::ReopenApplication + <<Activate>>）都不會觸發。
-        # 改用 PyObjC 直接掛 Cocoa 層的 NSApplicationDidBecomeActiveNotification，
-        # 不依賴 Tk 中介。失敗只 log，不阻擋啟動。
-        self._install_cocoa_activation_observer()
-        # Plan C / Fix 5c v3：終極保險絲 — 每 500ms 輪詢 NSApp.isActive 狀態轉換。
-        # 若上面 4 層（Tk createcommand / <<Activate>> / Cocoa Did+Will Active）
-        # 都沒觸發，這層會在 user 重新 focus 我們時最多 500ms 內恢復視窗。
-        # 純 Python 計時器，不依賴任何 macOS 通知 — 連通知系統壞掉都救得到。
-        self._last_nsapp_active = False  # boot 時非 active
-        self.after(500, self._poll_window_visibility)
+        # IS_MAC：以下整段（Dock icon 恢復視窗的 4 層保險絲）都是 macOS 專屬。
+        # Windows 沒有 Dock、沒有 Space 概念，工作列（taskbar）點圖示的視窗
+        # 恢復行為由 Windows 視窗管理員原生處理，Tk 的 deiconify/lift/focus_force
+        # 已經足夠，這整段 Cocoa observer 邏輯 Windows 分支直接跳過（no-op）。
+        if IS_MAC:
+            # Fix 17 / 2026-05-23：Cocoa observer poller —— 詳見 _cocoa_pending_actions。
+            self.after(self.COCOA_POLL_MS, self._poll_cocoa_pending_actions)
+            # 穩定性（Fix 5 / 2026-05-22）：macOS Dock icon 點擊把最小化的視窗叫回來。
+            # 兩條保險絲（Apple Event 處理在 shim Python.app 上可能不完整）：
+            #   1. ::tk::mac::ReopenApplication — Tk-on-macOS 的官方 idiom，但需要
+            #      AppleEvent handler 註冊完整才會觸發
+            #   2. <<Activate>> 虛擬事件 — App 取得焦點時觸發，較可靠的 fallback
+            #      （只在 iconic 狀態才 deiconify，避免每次 focus 都干擾）
+            try:
+                self.createcommand('::tk::mac::ReopenApplication', self._on_dock_reopen)
+            except Exception:
+                pass
+            self.bind("<<Activate>>", self._on_app_activate)
+            # Fix 5c / 2026-05-22：實測診斷顯示 NSApp delegate 為 None — Tk 沒設好
+            # NSApplicationDelegate，AppleEvent kAEReopenApplication 沒人接收，所以
+            # 上面兩條（::tk::mac::ReopenApplication + <<Activate>>）都不會觸發。
+            # 改用 PyObjC 直接掛 Cocoa 層的 NSApplicationDidBecomeActiveNotification，
+            # 不依賴 Tk 中介。失敗只 log，不阻擋啟動。
+            self._install_cocoa_activation_observer()
+            # Plan C / Fix 5c v3：終極保險絲 — 每 500ms 輪詢 NSApp.isActive 狀態轉換。
+            # 若上面 4 層（Tk createcommand / <<Activate>> / Cocoa Did+Will Active）
+            # 都沒觸發，這層會在 user 重新 focus 我們時最多 500ms 內恢復視窗。
+            # 純 Python 計時器，不依賴任何 macOS 通知 — 連通知系統壞掉都救得到。
+            self._last_nsapp_active = False  # boot 時非 active
+            self.after(500, self._poll_window_visibility)
         self.after(1500, self._warmup_model)
         # 開啟著的話再去探 Ollama；即使 Ollama 離線也不會卡 UI 建構。
         self.after(2000, self._refresh_ollama_health)
@@ -2903,33 +2932,37 @@ class AppWindow(ctk.CTkFrame):
         """
         # Snapshot frontmost app BEFORE 任何 UI / activation 動作
         # （NSWorkspace.frontmostApplication() 是 in-process call、無 osascript 開銷）
+        # IS_MAC 專屬：Windows 沒有 Space 概念，不需要 frontmost snapshot / re-activate。
         prev_app = None
-        try:
-            from AppKit import NSWorkspace
-            app = NSWorkspace.sharedWorkspace().frontmostApplication()
-            if app:
-                name = (app.localizedName() or "")
-                # 排除自我（避免 self-reactivate 變成 no-op、或下方 deactivate 後反而把自己拉回來）
-                if "WhisperPro" not in name and "Whisper Pro" not in name:
-                    prev_app = app
-        except Exception:
-            log_error("hotkey_snapshot_frontmost_failed")
+        if IS_MAC:
+            try:
+                from AppKit import NSWorkspace
+                app = NSWorkspace.sharedWorkspace().frontmostApplication()
+                if app:
+                    name = (app.localizedName() or "")
+                    # 排除自我（避免 self-reactivate 變成 no-op、或下方 deactivate 後反而把自己拉回來）
+                    if "WhisperPro" not in name and "Whisper Pro" not in name:
+                        prev_app = app
+            except Exception:
+                log_error("hotkey_snapshot_frontmost_failed")
 
         log_action("hotkey_triggered_toggle", combo=self.cfg.hotkey, state=self._state)
         self._on_record_btn()
 
         # 雙保險：deactivate 自己 + 主動 reactivate 原 app
         # 後者是關鍵——macOS 看到另一個 app 被明確 activate 才會取消對我們的 Space switch
-        try:
-            from AppKit import NSApplication
-            NSApplication.sharedApplication().deactivate()
-            if prev_app is not None:
-                # NSApplicationActivateAllWindows = 1 << 0 = 1（帶所有視窗回前）
-                # 0 表示不帶（更乾淨）；用 0 避免把 user app 額外視窗也拉前
-                prev_app.activateWithOptions_(0)
-                log.debug(f"BG_RECORD: re-activated '{prev_app.localizedName()}' to prevent Space switch")
-        except Exception:
-            log_error("nsapp_deactivate_failed")
+        # IS_MAC 專屬：Windows 沒有 Space 切換問題，跳過。
+        if IS_MAC:
+            try:
+                from AppKit import NSApplication
+                NSApplication.sharedApplication().deactivate()
+                if prev_app is not None:
+                    # NSApplicationActivateAllWindows = 1 << 0 = 1（帶所有視窗回前）
+                    # 0 表示不帶（更乾淨）；用 0 避免把 user app 額外視窗也拉前
+                    prev_app.activateWithOptions_(0)
+                    log.debug(f"BG_RECORD: re-activated '{prev_app.localizedName()}' to prevent Space switch")
+            except Exception:
+                log_error("nsapp_deactivate_failed")
 
     def _try_stop(self) -> None:
         """延遲後真的停錄音。只在仍為 recording 狀態才執行（防重入）。"""
@@ -3746,23 +3779,32 @@ class AppWindow(ctk.CTkFrame):
         self.hotkey_mgr.restart(self.cfg.hotkey)
 
     def _hotkey_watchdog(self) -> None:
-        """週期性檢查 NSEvent monitor 還活著嗎；死了就 restart。
+        """週期性檢查熱鍵監聽器還活著嗎；死了就 restart（Layer 1，跨平台）。
 
-        Fix 7 / 2026-05-22：pynput Listener 已換成 NSEvent
-        addGlobal/LocalMonitorForEventsMatchingMask_handler_。NSEvent 不會自己死、
-        不會被 idle timeout disable、不會被 TCC race 殺掉，watchdog 幾乎不會 fire；
-        但仍保留作為極端情境兜底（系統權限被使用者中途撤銷、PyObjC 內部異常等）。
+        存活判斷依後端分流：
+          • macOS（NSEvent 後端）：monitor 物件不為 None 視為活著。
+          • Windows（pynput Listener 後端）：_pynput_listener 存在且 is_alive()。
 
-        Layer 2（CGEventTap re-enable）+ Layer 3（定時 force restart）已隨
-        pynput 一併移除——NSEvent 不需要這兩層補救。
+        Layer 2（10 分鐘定時 force-restart）+ Layer 3（靜默診斷）是 macOS NSEvent
+        專屬補救（monitor 閒置 ~60min 後 ObjC block 失效但物件仍非 None，靠定時
+        force-restart 兜底）；Windows 的 pynput Listener 沒有這個失效問題，只跑
+        Layer 1。詳見下方 monitor_alive 分流與 `elif IS_MAC` 註解。
         """
         try:
             mgr = self.hotkey_mgr
-            # NSEvent backend：monitor 物件不為 None 視為活著
-            monitor_alive = (
-                getattr(mgr, "_monitor_global", None) is not None
-                or getattr(mgr, "_monitor_local", None) is not None
-            )
+            # 監聽器存活判斷依後端平台分流（Mac 分支表達式維持 byte-identical）：
+            #   • Windows（pynput Listener 後端）：listener 物件存在且背景執行緒還活著。
+            #     Windows 後端從不設 _monitor_global/_monitor_local（那是 NSEvent 專屬），
+            #     若沿用舊判斷會恆判為「死」→ watchdog 每 5s 無限重啟熱鍵（真 bug）。
+            #   • macOS（NSEvent 後端）：monitor 物件不為 None 視為活著（原邏輯不變）。
+            if IS_WINDOWS:
+                listener = getattr(mgr, "_pynput_listener", None)
+                monitor_alive = listener is not None and listener.is_alive()
+            else:
+                monitor_alive = (
+                    getattr(mgr, "_monitor_global", None) is not None
+                    or getattr(mgr, "_monitor_local", None) is not None
+                )
 
             # v2.20.3 N6：每 5 分鐘（60 ticks × 5s）寫一筆 hotkey_health snapshot 給
             # audit log，記下 monitor 是否還活著、目前 pressed 集合、ns held modifiers、
@@ -3805,11 +3847,16 @@ class AppWindow(ctk.CTkFrame):
                 except Exception:
                     log_error("hotkey_health_snapshot_failed")
             if not monitor_alive:
-                log.warning("HOTKEY: watchdog restarting NSEvent monitor (reason=monitor_missing)")
+                log.warning("HOTKEY: watchdog restarting hotkey listener (reason=monitor_missing)")
                 log_action("hotkey_listener_auto_restarted", reason="monitor_missing")
                 mgr.restart(self.cfg.hotkey)
                 self._last_hotkey_force_restart = time.monotonic()
-            else:
+            elif IS_MAC:
+                # Layer 2（10 分鐘定時 force-restart）+ Layer 3（靜默診斷）是 macOS
+                # NSEvent 後端專屬的補救：monitor 物件閒置 ~60min 後 ObjC block 會失效但
+                # 物件仍非 None（is_not_None 偵測不到）→ 只能靠定時 force-restart 兜底。
+                # Windows 的 pynput Listener（SetWindowsHookEx）沒有這個失效問題，不需要
+                # 這兩層；Windows watchdog 只保留上面的 Layer 1（listener 死了才重啟）。
                 now = time.monotonic()
 
                 # Fix 18 / 2026-05-23（Layer 2）：每 10 分鐘 force-restart。
@@ -3941,7 +3988,11 @@ class AppWindow(ctk.CTkFrame):
 
         當任何方式讓本 App 取得焦點（Dock 圖示／視窗縮圖、Cmd+Tab、Mission
         Control、Spotlight）→ 通知抵達 → 主執行緒 deiconify。
+
+        IS_MAC 專屬：PyObjC/Cocoa 通知系統，Windows 無對應概念（no-op）。
         """
+        if not IS_MAC:
+            return
         try:
             import objc
             from Foundation import NSObject, NSNotificationCenter, NSBundle
@@ -5160,8 +5211,8 @@ class SettingsWindow(ctk.CTkToplevel):
             hover_color=SURF_2,
             font=ctk.CTkFont("SF Pro Text", 12),
             corner_radius=8,
-            command=lambda: subprocess.run(
-                ["open", os.path.expanduser("~/.whisper_app")]
+            command=lambda: _open_path_in_os_default(
+                os.path.expanduser("~/.whisper_app")
             ),
         ).pack(anchor="w", padx=SPACE_LG, pady=(0, 8))
 
@@ -5657,7 +5708,7 @@ class SettingsWindow(ctk.CTkToplevel):
         path = _P(path_str).expanduser()
         _dictionary.ensure_file(path)
         try:
-            subprocess.run(["open", str(path)])
+            _open_path_in_os_default(path)
             self._dict_status_label.configure(
                 text=f"已開啟 {path.name}（編輯後存檔自動生效）", text_color=TEXT_3,
             )
@@ -6209,11 +6260,16 @@ class AccessibilityDialog(ctk.CTkToplevel):
         ).pack(side="left", padx=6)
 
     def _open_prefs(self) -> None:
-        """以 macOS URL scheme 直接跳到「隱私權 > 輔助使用」設定頁，然後關閉對話框。"""
-        subprocess.run([
-            "open",
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
-        ])
+        """以 macOS URL scheme 直接跳到「隱私權 > 輔助使用」設定頁，然後關閉對話框。
+
+        IS_MAC 專屬：Windows 沒有對應的「輔助使用」權限系統，此對話框
+        目前只在 macOS 流程被觸發（見 main.py），Windows 分支直接關閉、no-op。
+        """
+        if IS_MAC:
+            subprocess.run([
+                "open",
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+            ])
         self.destroy()
 
 
@@ -6825,7 +6881,15 @@ class MiniRecordingWindow(tk.Toplevel):
         多螢幕座標換算：NSScreen.frame 用左下原點、Tk geometry 用左上原點，
         且 origin 不是 (0,0)（副螢幕可能在主螢幕左 / 右 / 上）。
         Tk 的 y 是相對「主螢幕（screens[0]）」的左上座標。
+
+        IS_MAC 專屬邏輯（游標所在螢幕追蹤）在 Windows 分支直接跳過，走
+        `_position_primary_screen_bottom` 簡化版（永遠顯示在主螢幕中下方）。
+        WINDOWS_PORT_PLAN.md：多螢幕跟隨游標列為 Phase 2（需要
+        `ctypes.windll.user32.MonitorFromPoint`），本輪先簡化。
         """
+        if not IS_MAC:
+            self._position_primary_screen_bottom()
+            return
         try:
             from AppKit import NSScreen, NSEvent  # type: ignore
 
@@ -6859,15 +6923,23 @@ class MiniRecordingWindow(tk.Toplevel):
         except Exception as e:
             # 取游標螢幕失敗 → fallback：主螢幕中下方（用 Tk 原生 API）
             log_error(f"mini_hud_position_failed: {e}")
-            try:
-                self.update_idletasks()
-                sw = self.winfo_screenwidth()
-                sh = self.winfo_screenheight()
-                x = (sw - self.WIN_W) // 2
-                y = sh - self.WIN_H - self.BOTTOM_MARGIN
-                self.geometry(f"{self.WIN_W}x{self.WIN_H}+{x}+{y}")
-            except Exception:
-                pass
+            self._position_primary_screen_bottom()
+
+    def _position_primary_screen_bottom(self) -> None:
+        """把 HUD 移到主螢幕（Tk `winfo_screenwidth/height`）中下方。
+
+        跨平台 fallback：mac 的 AppKit 游標定位失敗時、以及 Windows 分支
+        （尚未實作多螢幕游標追蹤）都走這條路徑。
+        """
+        try:
+            self.update_idletasks()
+            sw = self.winfo_screenwidth()
+            sh = self.winfo_screenheight()
+            x = (sw - self.WIN_W) // 2
+            y = sh - self.WIN_H - self.BOTTOM_MARGIN
+            self.geometry(f"{self.WIN_W}x{self.WIN_H}+{x}+{y}")
+        except Exception:
+            pass
 
     # ── PyObjC NSPanel-level 升級 ──────────────────────────────────────────
     # NSStatusWindowLevel = 25（高於一般視窗、低於螢幕保護程式）
@@ -6897,7 +6969,14 @@ class MiniRecordingWindow(tk.Toplevel):
 
         失敗時靜默 fallback；HUD 仍能用，只是缺「跨 Space / 全螢幕可見」。
         Bug A（v2.12.0）：升級失敗時加 `-topmost` 兜底，至少同 Space 在最頂。
+
+        IS_WINDOWS 分支：Windows 沒有 Space 概念，NSWindow level 升級這套
+        機制完全不適用，直接用 Tk `-topmost` 讓 HUD 置頂即可（`_fallback_topmost`
+        本來就是跨平台實作）。
         """
+        if IS_WINDOWS:
+            self._fallback_topmost()
+            return
         try:
             from AppKit import NSApp  # type: ignore
 

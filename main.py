@@ -1,3 +1,4 @@
+# Mac/Windows 雙棲 — 移植自 macOS v2.21.6
 """
 Whisper Pro 應用程式進入點。
 
@@ -7,7 +8,8 @@ Whisper Pro 應用程式進入點。
   3. 檢查 Python 套件依賴，缺少則提示安裝指令並退出
   4. 讀取 ~/.whisper_app/config.json 使用者設定
   5. 建立 tkinter 根視窗並啟動 AppWindow
-  6. 非同步確認 macOS 輔助使用權限，不足時顯示引導對話框
+  6. 非同步確認 macOS 輔助使用權限（Windows 上此權限概念不存在，直接視為已授權），
+     不足時顯示引導對話框
   7. 進入 tkinter 主迴圈（mainloop）直到視窗關閉
 """
 
@@ -22,6 +24,8 @@ import sys
 import threading
 import time
 import traceback
+
+from platform_util import IS_MAC, IS_WINDOWS
 
 # ── v2.20.3：STARTUP phase tracking ──────────────────────────────────────────
 # 5/25 23:42 那次 silent crash burst：4 次 NEW SESSION 後完全沒後續 CONFIG /
@@ -218,7 +222,9 @@ def _disable_app_nap() -> None:
     詳見 plan：docs/superpowers/plans/2026-05-22-hotkey-idle-resilience.md §3 Step 2。
     """
     global _APP_NAP_TOKEN
-    if sys.platform != "darwin":
+    if not IS_MAC:
+        # Windows 沒有 App Nap 這個省電機制（不會針對背景 GUI 程式降低事件
+        # 迴圈頻率），不需要對應實作，直接 no-op 返回。
         return
     try:
         from Foundation import NSProcessInfo
@@ -244,7 +250,15 @@ _PID_FILE = os.path.expanduser("~/.whisper_app/whisper_pro.pid")
 
 
 def _is_pid_alive(pid: int) -> bool:
-    """用 signal 0 探測 PID 是否仍活著（不真的送訊號）。"""
+    """用 signal 0 探測 PID 是否仍活著（不真的送訊號）。
+
+    Windows 沒有 POSIX signal 概念，`os.kill(pid, 0)` 在 Windows Python 上
+    不支援 signal 0 探活語意（會直接嘗試終止該 PID，不是我們要的行為）。
+    改用 psutil.pid_exists()，跨平台語意一致（純查詢、不送訊號）。
+    """
+    if IS_WINDOWS:
+        import psutil
+        return psutil.pid_exists(pid)
     try:
         os.kill(pid, 0)
     except OSError:
@@ -253,7 +267,44 @@ def _is_pid_alive(pid: int) -> bool:
 
 
 def _kill_stale_process(pid: int, timeout: float = 3.0) -> None:
-    """SIGTERM 舊 process，最多等 timeout 秒；沒死就 SIGKILL。"""
+    """終止舊 process，最多等 timeout 秒；沒死就強制終止。
+
+    Windows：`os.kill(pid, signal.SIGTERM)` 在 Windows 上等同直接
+    `TerminateProcess`（非優雅關閉），且 `signal.SIGKILL` 在 Windows 上
+    不存在（AttributeError，會直接讓 single-instance lock 機制 crash）。
+    改用 psutil：`terminate()` / `kill()` 內部會依平台自動轉成正確 API
+    （Windows 用 TerminateProcess），邏輯結構跟 mac 版一致。
+    """
+    if IS_WINDOWS:
+        import psutil
+        try:
+            log.warning(f"SINGLE_INSTANCE: stale PID {pid} alive — terminating (psutil)")
+            proc = psutil.Process(pid)
+            proc.terminate()
+        except psutil.NoSuchProcess:
+            log.info(f"SINGLE_INSTANCE: stale PID {pid} already gone")
+            return
+        except Exception as e:
+            log.warning(f"SINGLE_INSTANCE: terminate PID {pid} failed: {e}")
+            return
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not _is_pid_alive(pid):
+                log.info(f"SINGLE_INSTANCE: stale PID {pid} exited gracefully")
+                return
+            time.sleep(0.1)
+
+        # 還沒死 → 強制終止
+        try:
+            log.warning(f"SINGLE_INSTANCE: PID {pid} did not exit in {timeout}s — killing (psutil)")
+            psutil.Process(pid).kill()
+        except psutil.NoSuchProcess:
+            pass
+        except Exception as e:
+            log.warning(f"SINGLE_INSTANCE: kill PID {pid} failed: {e}")
+        return
+
     try:
         log.warning(f"SINGLE_INSTANCE: stale PID {pid} alive — sending SIGTERM")
         os.kill(pid, signal.SIGTERM)
