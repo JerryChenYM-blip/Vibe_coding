@@ -4108,11 +4108,31 @@ class AppWindow(ctk.CTkFrame):
                     # v2.20.3 N5：量 ping 自身耗時（≈ 模型 warmup 推論時間）
                     _t_start = time.perf_counter()
                     try:
+                        # v2.21.6：非阻塞探測 _transcription_lock——拿不到就跳過這次
+                        #   ping（90s 後還有下一次）。舊行為是 ping 跟使用者「先搶先贏」
+                        #   平等競爭：實測 26813 筆 ping 佔鎖中位 1.5s、最糟 49s，
+                        #   使用者停止錄音撞上 ping 就得排隊等（碰撞率 ~1.7%）。
+                        #   背景保養永遠讓位給使用者輸入。
+                        #   （lock 是 threading.Lock 非 RLock、probe 後必須先放掉
+                        #   再呼叫 warmup——中間的微小 race 視窗可接受。）
+                        _lk = getattr(self.transcriber, "_transcription_lock", None)
+                        if _lk is not None:
+                            if not _lk.acquire(blocking=False):
+                                log.info("MLX_KEEPALIVE: lock busy, skip this ping")
+                                return
+                            _lk.release()
                         # v2.20.2：沿用 transcriber.warmup() —— 內部已換成
                         # _make_keepalive_audio()（1.5s formant-based 假人聲、低音量）。
                         # 走 session.transcribe() 直呼叫、不過 Transcriber.transcribe()
                         # 外層的 RMS gate / Silero VAD，所以不會被擋掉。
                         self.transcriber.warmup(model)
+                        # v2.21.6：補呼叫 mark_keepalive_ping()——此方法 v2.20.3 定義後
+                        #   從未被呼叫、audit 的 seconds_since_last_keepalive_ping 欄位
+                        #   一直是 None（壞掉的觀測性、151 筆離群分析全失真）。
+                        try:
+                            self.transcriber.mark_keepalive_ping()
+                        except Exception:
+                            pass
                         elapsed_ms = int((time.perf_counter() - _t_start) * 1000)
                         log.info(
                             f"MLX_KEEPALIVE: ping done (model={model}, "
@@ -4125,14 +4145,28 @@ class AppWindow(ctk.CTkFrame):
                             import psutil       # noqa: PLC0415
                             proc = psutil.Process()
                             rss_mb = proc.memory_info().rss / 1024 / 1024
-                            # MLX Metal cache（VRAM 駐留量）—— 非 Apple Silicon
-                            # / 沒裝 mlx 時 graceful fallback 成 None
+                            # v2.21.6 量測修正：舊版把 get_active_memory()（模型權重
+                            #   常駐量、~3.5GB 恆定）誤標成 "cache"，導致 v2.21.4 的
+                            #   cache 上限「看起來沒生效」其實是量錯東西。現在分開記：
+                            #   cache = 可回收暫存池（set_cache_limit 管的）、
+                            #   active = 權重常駐量（set_wired_limit 釘的）。
                             metal_mb: Optional[float] = None
+                            active_mb: Optional[float] = None
                             try:
                                 import mlx.core as mx  # noqa: PLC0415
-                                metal_mb = mx.metal.get_active_memory() / 1024 / 1024
+                                metal_mb = (
+                                    mx.get_cache_memory() / 1024 / 1024
+                                    if hasattr(mx, "get_cache_memory")
+                                    else mx.metal.get_cache_memory() / 1024 / 1024
+                                )
+                                active_mb = (
+                                    mx.get_active_memory() / 1024 / 1024
+                                    if hasattr(mx, "get_active_memory")
+                                    else mx.metal.get_active_memory() / 1024 / 1024
+                                )
                             except Exception:
                                 metal_mb = None
+                                active_mb = None
                             # since_last_ping_s：首次 ping 為 None（不知道間隔）
                             now_pc = time.perf_counter()
                             prev = self._last_ping_at
@@ -4147,6 +4181,9 @@ class AppWindow(ctk.CTkFrame):
                                 process_rss_mb=round(rss_mb, 1),
                                 mlx_metal_cache_mb=(
                                     round(metal_mb, 1) if metal_mb is not None else None
+                                ),
+                                mlx_active_mb=(
+                                    round(active_mb, 1) if active_mb is not None else None
                                 ),
                                 since_last_ping_s=since_last,
                                 model=model,

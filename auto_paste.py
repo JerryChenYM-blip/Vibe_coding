@@ -121,7 +121,21 @@ def paste_to_app(
         return False
 
     # ── 步驟 2：把目標 App 拉到前景 + 等 Space 切換 ─────────────────────────
+    # v2.21.6 fast-path：目標 App 已經在前景（使用者口述時通常沒切走、且錄音中
+    #   gui 已有 BG_RECORD re-activate 保持前景）→ activate / 全螢幕偵測（osascript
+    #   subprocess ~92ms）/ sleep(delay) / frontmost poll 整段都不需要，直接送 ⌘V。
+    #   實測貼上階段中位 ~700ms、此常見情境可降到 <50ms。
+    _already_front = False
     if app_name:
+        try:
+            _already_front = get_frontmost_app() == app_name
+        except Exception:
+            _already_front = False
+        if _already_front:
+            is_fullscreen = False   # 已在前景、不涉跨 Space 切換
+            log.info(f"AUTO-PASTE: '{app_name}' already frontmost — fast-path (skip activate)")
+
+    if app_name and not _already_front:
         # Bug 2（v2.8.0 / 2026-05-23）：先偵測目標 App 是否在全螢幕 Space。
         # 全螢幕 App 的 NSWindow 屬於獨立 Space，activate 觸發 OS 跨 Space 動畫
         # （~0.5s）；0.18s 太短，⌘V 還在原 Space 觸發 → 落到錯誤的 App。
