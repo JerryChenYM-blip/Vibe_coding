@@ -1921,6 +1921,19 @@ class Transcriber:
             # v2.19.0：顯式標記為 cold-load、方便 grep / 對應 audit 上的高 RTF 異常
             log.info(f"WHISPER: qwen3 cold-load (model={model_size}, repo={hf_repo})")
             try:
+                # v2.21.6：載入「前」設 wired limit——把模型權重釘在實體記憶體、
+                #   不被 macOS page out（macOS 15+）。這才是「閒置後冷載入 12-16s」
+                #   的對症 API：v2.21.4 的 set_cache_limit 管的是「可回收暫存池」、
+                #   跟權重常駐量（get_active_memory ~3.5GB）是兩個計數器，防不了
+                #   swap-out（audit 實證：8941 筆 ping 權重駐留量與 cache 上限完全
+                #   脫鉤）。必須在 Session 載入前設定、權重配置時才會被 wire。
+                try:
+                    import mlx.core as mx
+                    if hasattr(mx, "set_wired_limit"):
+                        mx.set_wired_limit(4 * 1024 * 1024 * 1024)
+                        log.info("WHISPER: MLX wired limit set to 4GB (pin weights in RAM)")
+                except Exception:
+                    log_error("mlx_set_wired_limit_failed")
                 from mlx_qwen3_asr import Session
                 self._qwen3_session = Session(model=hf_repo)
                 self._qwen3_loaded_model = model_size

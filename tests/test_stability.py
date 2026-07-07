@@ -1256,3 +1256,79 @@ def test_device_change_noop_on_system_default():
     win._handle_device_change()
     assert win.recorder._device_index is None
     win._show_toast.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# v2.21.6 架構健檢 quick wins 回歸測試
+# ─────────────────────────────────────────────────────────────────────────
+
+def _run_paste(monkeypatch, frontmost_returns):
+    """跑 paste_to_app、攔截副作用；回傳 (result, called 記錄 dict)。"""
+    import sys
+    import auto_paste as _ap
+    called = {"fullscreen": 0, "sleep": 0, "tap": 0}
+
+    monkeypatch.setattr(_ap, "get_frontmost_app", lambda: frontmost_returns)
+    def _fake_fullscreen(name):
+        called["fullscreen"] += 1
+        return False
+    monkeypatch.setattr(_ap, "_is_app_fullscreen", _fake_fullscreen)
+    monkeypatch.setattr(_ap.time, "sleep", lambda s: called.__setitem__("sleep", called["sleep"] + 1))
+    fake_clip = types.SimpleNamespace(copy=lambda t: None)
+    monkeypatch.setitem(sys.modules, "pyperclip", fake_clip)
+
+    # 假 pynput：攔 ⌘V 模擬（不真的送按鍵）
+    class _FakeKB:
+        class _Ctx:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        def pressed(self, *a): return self._Ctx()
+        def tap(self, k): called.__setitem__("tap", called["tap"] + 1)
+    fake_mod = types.SimpleNamespace(Controller=lambda: _FakeKB(), Key=types.SimpleNamespace(cmd="cmd"))
+    monkeypatch.setitem(sys.modules, "pynput.keyboard", fake_mod)
+
+    ok = _ap.paste_to_app("hello", "Claude")
+    return ok, called
+
+
+def test_paste_fast_path_when_already_frontmost(monkeypatch):
+    """v2.21.6：目標 App 已在前景 → 跳過 activate/全螢幕偵測/sleep、直接 ⌘V。"""
+    ok, called = _run_paste(monkeypatch, frontmost_returns="Claude")
+    assert ok is True
+    assert called["fullscreen"] == 0   # 不該再呼叫 osascript 全螢幕偵測
+    assert called["sleep"] == 0        # 不該再等 activate delay
+    assert called["tap"] == 1          # ⌘V 有送
+
+
+def test_paste_normal_path_when_not_frontmost(monkeypatch):
+    """目標 App 不在前景 → 走原本 activate + 偵測路徑（行為不可壞）。"""
+    ok, called = _run_paste(monkeypatch, frontmost_returns="OtherApp")
+    assert ok is True
+    assert called["fullscreen"] == 1   # 有做全螢幕偵測
+    assert called["tap"] == 1
+
+
+def test_keepalive_ping_skips_when_lock_busy():
+    """v2.21.6：_transcription_lock 被占用時、keepalive ping 應跳過不排隊。"""
+    import threading
+    from gui import AppWindow
+    win = AppWindow.__new__(AppWindow)
+    lock = threading.Lock()
+    warmup_called = []
+    win.transcriber = types.SimpleNamespace(
+        _transcription_lock=lock,
+        warmup=lambda m: warmup_called.append(m),
+        mark_keepalive_ping=lambda: None,
+    )
+    win._state = "idle"
+    win._model_var = types.SimpleNamespace(get=lambda: "qwen3-asr")
+    win._last_ping_at = None
+    win.after = MagicMock()
+    lock.acquire()   # 模擬使用者轉錄中、鎖被占用
+    try:
+        win._mlx_keepalive_tick()
+        # _ping 在 daemon thread 跑、等它結束
+        time.sleep(0.3)
+        assert warmup_called == []   # 鎖忙 → 跳過、沒去排隊跑 warmup
+    finally:
+        lock.release()
