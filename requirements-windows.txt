@@ -1,0 +1,58 @@
+# Mac/Windows 雙棲 — 移植自 macOS v2.21.6
+#
+# Windows 專用依賴清單。從 requirements.txt 拆出、移除 Apple 專屬套件
+# （mlx / mlx-whisper / mlx-qwen3-asr 需要 Apple Silicon GPU，Windows 沒有對應硬體），
+# 加入 Windows 專屬套件（pywin32）。
+#
+# 語音辨識在 Windows 上固定走 faster-whisper（CTranslate2 CPU 推論），
+# 對應 WINDOWS_PORT_PLAN.md 第 4 節「asr cluster」的結論：
+# 相容性完全不用改，transcriber.py 已用 platform.machine() 正確 gate，
+# Windows 會自動 fallback 到這條本來就跨平台的路。
+#
+# System dependencies（安裝前）：
+#   - 安裝 ffmpeg 並確保在 PATH 中（faster-whisper 需要）
+#     建議用 https://www.gyan.dev/ffmpeg/builds/ 下載並手動加入 PATH，
+#     或用 choco: choco install ffmpeg
+#   - PortAudio：Windows 上 sounddevice 的 wheel 已內建 PortAudio DLL，
+#     不需要像 Mac 一樣另外用 brew 裝
+
+customtkinter==5.2.2
+sounddevice==0.5.1
+numpy==2.2.4
+faster-whisper==1.2.1
+pyperclip==1.9.0
+pynput==1.8.1
+requests==2.32.3
+webrtcvad==2.0.10
+
+# v2.14.0 簡↔繁字體轉換（Qwen3-ASR 預設輸出簡體、用 s2twp 轉繁體 + 台灣慣用語）
+# Windows 沒有 Qwen3-ASR 後端（mlx-qwen3-asr 是 Apple 專屬），但 OpenCC 本身跨平台、
+# 若日後 Windows 也想要簡繁轉換功能可以保留；目前無 mlx 後端可產生簡體輸出時用不到，
+# 但先保留避免其他模組 import 失敗
+OpenCC==1.3.1
+
+# v2.18.0 雲端 polish backend（Google Vertex AI Gemini、選用）
+# 認證走 ADC：跑一次 `gcloud auth application-default login` 即可（跨平台一致）
+google-genai>=1.0.0
+
+# v2.19.x Silero VAD v5 神經前置過濾（擋鍵盤/背景音/雜音、抑制 ASR 幻覺）
+# 放在 RMS gate 之後、ASR 之前；用神經網路判斷音檔是否含人聲（跨平台一致）
+silero-vad>=5.0.0
+
+# v2.19.x Pinyin guard（拼音 fuzzy match 修中文 ASR 同音/近音誤辨）
+pypinyin>=0.50.0
+
+# v2.20.3 N5：keepalive ping 記憶體 snapshot 用（RSS / VM size）
+# 對應 WINDOWS_PORT_PLAN.md 第 5 節：os.kill(pid, SIGTERM/SIGKILL) 在 Windows 上
+# 行為不同（SIGKILL 甚至不存在），單一實例鎖機制需改用 psutil.Process().terminate()/.kill()
+psutil>=5.9.0
+
+# ── Windows 專屬套件 ──────────────────────────────────────────────
+# pywin32：提供 Windows API 存取（win32api / win32gui / win32con 等），
+# 對應 WINDOWS_PORT_PLAN.md 盤點出的幾個需求：
+#   - 多螢幕游標所在螢幕判斷（MonitorFromPoint + GetMonitorInfo，HUD 定位用）
+#   - 視窗置頂 / 任務列互動（若 Tk `-topmost` 不夠用時的備援）
+#   - os.startfile 之外，若需要更細緻的程序重啟/視窗操作可用
+# 注意：若移植過程中發現 Tk 原生 API（-topmost、winfo_screenwidth 等）已夠用，
+# 這個套件可能整個用不到，屆時可以再拿掉——先加入以防 hidden import 找不到。
+pywin32>=306; sys_platform == "win32"

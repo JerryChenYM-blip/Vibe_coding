@@ -1,5 +1,6 @@
+# Mac/Windows 雙棲 — 移植自 macOS v2.21.6
 """
-macOS 全域快捷鍵管理器。
+全域快捷鍵管理器（Mac/Windows 雙棲）。
 
 功能：
   • HotkeyManager：監聽可設定的組合鍵，觸發時呼叫 callback
@@ -11,26 +12,42 @@ macOS 全域快捷鍵管理器。
   • 只按部分組合（例如 cmd+alt 沒按 r）→ 不 fire
   • 由呼叫端（GUI）依目前狀態決定 tap 對應的動作（開始或停止錄音）
 
-後端（2026-05-22 改）：
-  根治 pynput 1.7.7 在 macOS 26.4+ 的所有 crash（TSM 主執行緒斷言、
-  SLEventTapIsEnabled PAC violation、idle timeout disable）。
-  改用 macOS 原生 NSEvent.addGlobalMonitorForEventsMatchingMask_handler_
-  + addLocalMonitorForEventsMatchingMask_handler_。
-    • handler 永遠在主執行緒（Cocoa main runloop）執行；無 thread、無 ctypes、
-      無 TSM 同步問題
-    • global monitor：其他 App 焦點時收事件
-    • local monitor：本 App 焦點時收事件（global 不會發給自己）
-    • NSEvent 不會被 idle 自動 disable（不是 CGEventTap），無需 re-enable
-  pynput 仍 import 用於：
-    • parse_hotkey() 公開介面的 Key 物件回傳值
-    • auto_paste.py 的 keyboard.Controller（送 ⌘V，主執行緒呼叫安全）
-  若 PyObjC 不可用，退化用 pynput Listener 作為 fallback（舊行為）。
+後端（依平台二選一，platform_util.IS_MAC / IS_WINDOWS 判斷）：
+
+  macOS（2026-05-22 改，行為完全不變 byte-identical）：
+    根治 pynput 1.7.7 在 macOS 26.4+ 的所有 crash（TSM 主執行緒斷言、
+    SLEventTapIsEnabled PAC violation、idle timeout disable）。
+    改用 macOS 原生 NSEvent.addGlobalMonitorForEventsMatchingMask_handler_
+    + addLocalMonitorForEventsMatchingMask_handler_。
+      • handler 永遠在主執行緒（Cocoa main runloop）執行；無 thread、無 ctypes、
+        無 TSM 同步問題
+      • global monitor：其他 App 焦點時收事件
+      • local monitor：本 App 焦點時收事件（global 不會發給自己）
+      • NSEvent 不會被 idle 自動 disable（不是 CGEventTap），無需 re-enable
+    pynput 仍 import 用於：
+      • parse_hotkey() 公開介面的 Key 物件回傳值
+      • auto_paste.py 的 keyboard.Controller（送 ⌘V，主執行緒呼叫安全）
+    若 PyObjC 不可用，退化用 pynput Listener 作為 fallback（舊行為）。
+
+  Windows（新增）：
+    Windows 沒有 TSM/PAC 那些 macOS 專屬安全機制，pynput.keyboard.Listener
+    在 Windows 上走 SetWindowsHookEx 底層鉤子，成熟穩定，不需要 NSEvent 那套
+    workaround。直接用 pynput Listener 的 on_press/on_release callback，
+    背景執行緒呼叫既有的 _on_p/_on_r/_on_p_lone/_on_r_lone（這些函式本來就是
+    純狀態機邏輯、與後端無關，可直接共用）。
+    pynput 在 Windows 上天生分開回報 Key.ctrl_l/ctrl_r、Key.alt_l/alt_r 等
+    側別鍵（不像 macOS NSEvent 的 modifierFlags() 左右共用同一個 bit），
+    不需要 macOS 那套 _ns_held_modifiers state machine，也不需要自製鍵碼表。
+    Windows 沒有「輔助使用」權限概念，check_accessibility() 直接回傳 True。
 
 執行緒安全要點：
-  1. NSEvent handler 在主執行緒呼叫，可直接動 Tk widget（不需 self.after marshal）
-  2. handler 內仍包 try/except，意外 exception 不可外洩到 Cocoa runtime
-  3. stop() 先在鎖內取出 monitor 參照、清空狀態，再在鎖外 removeMonitor:
-  4. 自我修復機制：combo_active 卡住超過 _STALE_COMBO_SEC 秒視為漏收事件，下次 press 自動重置
+  1. macOS：NSEvent handler 在主執行緒呼叫，可直接動 Tk widget（不需 self.after marshal）
+  2. Windows：pynput Listener callback 在背景執行緒呼叫，若要動 Tk widget
+     呼叫端需自行 `master.after(0, ...)` marshal 回主執行緒（既有 GUI callback
+     已透過 log_action / on_tap_cb 這層做，不需要在本檔案處理）
+  3. handler 內仍包 try/except，意外 exception 不可外洩到底層事件迴圈
+  4. stop() 先在鎖內取出後端參照、清空狀態，再在鎖外做後端專屬的停止動作
+  5. 自我修復機制：combo_active 卡住超過 _STALE_COMBO_SEC 秒視為漏收事件，下次 press 自動重置
 """
 
 from __future__ import annotations
@@ -39,8 +56,10 @@ import threading
 import time
 from typing import Callable, Optional, Set
 
-# pynput 在 macOS 上需要「輔助使用」權限才能監聽全域按鍵
-# 如果沒安裝或沒權限，所有功能靜默降級（App 不崩潰）
+from platform_util import IS_MAC, IS_WINDOWS
+
+# pynput 在 macOS 上需要「輔助使用」權限才能監聽全域按鍵；在 Windows 上是主監聽後端，
+# 不需要額外系統權限。如果沒安裝，所有功能靜默降級（App 不崩潰）。
 try:
     from pynput import keyboard as _kb
     from pynput.keyboard import Key, KeyCode
@@ -48,21 +67,26 @@ try:
 except ImportError:
     _PYNPUT_AVAILABLE = False
 
-# NSEvent 後端（PyObjC）。需要：pip install pyobjc-framework-Cocoa（已隨 PyObjC 一併安裝）
-# 載入失敗時自動退化到 pynput fallback（保留舊行為）。
-try:
-    from AppKit import (
-        NSEvent,
-        NSEventMaskFlagsChanged,
-        NSEventMaskKeyDown,
-        NSEventMaskKeyUp,
-        NSEventModifierFlagCommand,
-        NSEventModifierFlagOption,
-        NSEventModifierFlagControl,
-        NSEventModifierFlagShift,
-    )
-    _NSEVENT_AVAILABLE = True
-except ImportError:
+# NSEvent 後端（PyObjC，macOS-only）。需要：pip install pyobjc-framework-Cocoa
+# （已隨 PyObjC 一併安裝）。載入失敗時自動退化到 pynput fallback（保留舊行為）。
+# 用 IS_MAC 先擋一層：Windows 上不嘗試 import AppKit（本來就會 ImportError，
+# 但明確擋更清楚，也避免任何 IDE/打包工具誤判依賴）。
+if IS_MAC:
+    try:
+        from AppKit import (
+            NSEvent,
+            NSEventMaskFlagsChanged,
+            NSEventMaskKeyDown,
+            NSEventMaskKeyUp,
+            NSEventModifierFlagCommand,
+            NSEventModifierFlagOption,
+            NSEventModifierFlagControl,
+            NSEventModifierFlagShift,
+        )
+        _NSEVENT_AVAILABLE = True
+    except ImportError:
+        _NSEVENT_AVAILABLE = False
+else:
     _NSEVENT_AVAILABLE = False
 
 from logger import get_logger, log_action, log_error
@@ -118,6 +142,9 @@ def _sided_name_to_pynput_key(sided_name: str):
 
     用於把 NSEvent 收到的 modifier 事件對齊到 _pressed 集合的型別，
     讓 `_hotkeys.issubset(_pressed)` 等既有邏輯不必改。
+
+    僅 macOS NSEvent 後端使用（Windows 後端直接拿 pynput Listener 原生回傳的
+    Key 物件，不需要這層 keycode → 名稱 → Key 的橋接）。
     """
     if not _PYNPUT_AVAILABLE:
         return sided_name   # 退化：拿名稱當識別符（不會有匹配，但不會崩）
@@ -131,6 +158,19 @@ def _sided_name_to_pynput_key(sided_name: str):
         "shift_r": Key.shift_r,
         "shift_l": Key.shift_l,
     }.get(sided_name, sided_name)
+
+
+# ── Windows：pynput Key 物件 → 側別感知 modifier 名稱 ───────────────────────────
+# Windows 不需要 macOS 那套「keycode → 名稱 → Key」橋接表（_KEYCODE_TO_SIDED_MOD /
+# _sided_name_to_pynput_key）：pynput 在 Windows 上（SetWindowsHookEx 底層）
+# 原生就會分別回報 Key.cmd_l/cmd_r（Windows 鍵）、Key.ctrl_l/ctrl_r、
+# Key.alt_l/alt_r、Key.shift_l/shift_r，callback 收到的 key 參數本身就是
+# pynput Key 物件，不需要任何轉換。這份表只用於 lone-modifier 偵測
+# （`_is_lone_modifier_key` 已跨平台共用，見下方），此處不需要重複定義。
+#
+# Windows 鍵盤沒有 Cmd 鍵；lone-modifier 設定字串裡的 right_cmd/left_cmd
+# 在 Windows 上對應「Windows 鍵」（Key.cmd_l / Key.cmd_r），parse_hotkey() /
+# format_hotkey() 的既有 _LONE_MOD_MAP 已經是同一份、不需要拆平台版本。
 
 
 # ── 系統查詢 ──────────────────────────────────────────────────────────────────
@@ -151,11 +191,12 @@ def is_nsevent_available() -> bool:
 def check_accessibility() -> bool:
     """檢查目前 process 是否已取得 macOS 輔助使用權限。
 
-    非 macOS 平台永遠回傳 True（不需要此權限）。
+    非 macOS 平台（Windows / Linux）永遠回傳 True——Windows 全域鍵盤鉤子
+    （SetWindowsHookEx）預設就有權限，不需要像 macOS「輔助使用」這樣
+    額外跟使用者要一次授權。
     """
-    import platform
-    if platform.system() != "Darwin":
-        return True   # 非 macOS 無需檢查
+    if not IS_MAC:
+        return True   # Windows/Linux 無需檢查
     try:
         from ApplicationServices import AXIsProcessTrusted
         return AXIsProcessTrusted()
@@ -396,7 +437,9 @@ class HotkeyManager:
 
         Args:
             on_tap_cb: 組合鍵 tap（完整按下後放開）時的回呼；
-                       NSEvent 後端在主執行緒呼叫；pynput fallback 後端在背景執行緒。
+                       macOS NSEvent 後端在主執行緒呼叫；
+                       Windows pynput Listener 後端在背景執行緒呼叫
+                       （呼叫端若要動 Tk widget 需自行 marshal 回主執行緒）。
         """
         self._on_tap_cb      = on_tap_cb
         self._hotkeys:       set  = set()            # 目前監聽的鍵值集合
@@ -414,7 +457,8 @@ class HotkeyManager:
         # _monitor_global is not None 仍成立）。改成 instance attr 強引用根治。
         self._ns_handler_global = None
         self._ns_handler_local  = None
-        self._backend:       str = "none"              # "nsevent" / "none"
+        self._pynput_listener = None                    # Windows 後端：pynput.keyboard.Listener 實例
+        self._backend:       str = "none"              # "nsevent" / "pynput_win" / "none"
         self._lock = threading.Lock()
         # Fix 9 / 2026-05-22（P1-A）：FlagsChanged 專用「sided keycode hold」集合。
         # 用來判定每個 modifier keycode 是 press 還是 release，**不**依賴
@@ -438,7 +482,10 @@ class HotkeyManager:
     def restart(self, combo: str) -> None:
         """停止舊的監聽器並以新組合鍵啟動新監聽器。
 
-        後端優先序：NSEvent（PyObjC 可用時，預設）→ pynput Listener（fallback）。
+        後端依平台選擇：
+          • macOS：NSEvent（PyObjC 可用時，預設）→ pynput Listener（fallback）。
+          • Windows：pynput.keyboard.Listener（SetWindowsHookEx 底層鉤子，穩定
+            成熟，不需要 macOS 那套 TSM/PAC workaround）。
 
         Args:
             combo: 組合鍵字串，例如 "cmd+alt+r" 或 lone modifier "right_cmd"。
@@ -474,21 +521,46 @@ class HotkeyManager:
                 f"(lone {prev_lone!r} → {self._lone_target_key!r})"
             )
 
-        # ── 後端：NSEvent only ─────────────────────────────────────
+        # ── 後端：macOS = NSEvent only ─────────────────────────────
         # 2026-05-22 起 pynput Listener 完全砍除（macOS 26.4+ 連環 crash）。
         # PyObjC 不可用時靜默降級，App 不崩潰但快捷鍵不工作。
-        if _NSEVENT_AVAILABLE:
-            self._backend = "nsevent"
-            log.info(
-                f"HOTKEY: Starting NSEvent monitor for combo='{combo}' "
-                f"keys={self._hotkeys} mode={mode}"
-            )
-            self._start_nsevent_monitors()
-            log.info(f"HOTKEY: listener fully started at t={time.monotonic():.3f}")
+        if IS_MAC:
+            if _NSEVENT_AVAILABLE:
+                self._backend = "nsevent"
+                log.info(
+                    f"HOTKEY: Starting NSEvent monitor for combo='{combo}' "
+                    f"keys={self._hotkeys} mode={mode}"
+                )
+                self._start_nsevent_monitors()
+                log.info(f"HOTKEY: listener fully started at t={time.monotonic():.3f}")
+                return
+
+            self._backend = "none"
+            log.warning("HOTKEY: NSEvent backend unavailable; global hotkey disabled")
             return
 
+        # ── 後端：Windows = pynput.keyboard.Listener ───────────────
+        # Windows 沒有 macOS 的 TSM/PAC crash 問題，pynput Listener 在 Windows 上
+        # 走 SetWindowsHookEx 底層鉤子，穩定成熟，直接當主監聽後端用（不像 macOS
+        # 只當 fallback）。也不需要「輔助使用」權限這關。
+        if IS_WINDOWS:
+            if _PYNPUT_AVAILABLE:
+                self._backend = "pynput_win"
+                log.info(
+                    f"HOTKEY: Starting pynput Listener for combo='{combo}' "
+                    f"keys={self._hotkeys} mode={mode}"
+                )
+                self._start_pynput_listener()
+                log.info(f"HOTKEY: listener fully started at t={time.monotonic():.3f}")
+                return
+
+            self._backend = "none"
+            log.warning("HOTKEY: pynput backend unavailable; global hotkey disabled")
+            return
+
+        # ── 其他平台（Linux 等）：目前無對應後端 ─────────────────────
         self._backend = "none"
-        log.warning("HOTKEY: NSEvent backend unavailable; global hotkey disabled")
+        log.warning("HOTKEY: no hotkey backend available on this platform")
 
     # ── NSEvent 後端 ────────────────────────────────────────────────────────
 
@@ -605,14 +677,36 @@ class HotkeyManager:
             pass
         return f"keycode_{keycode}"
 
+    # ── Windows 後端：pynput.keyboard.Listener ─────────────────────────────
+
+    def _start_pynput_listener(self) -> None:
+        """啟動 pynput Listener（Windows 主監聽後端）。
+
+        pynput 在 Windows 上是單一 callback 就能收到全域按鍵事件（不管哪個
+        App 有焦點），不像 macOS NSEvent 需要 global + local 兩個 monitor
+        分開處理焦點內/外的情況。callback 在 pynput 內部背景執行緒呼叫，
+        直接餵給既有的 _on_p / _on_r（純狀態機邏輯、與後端無關，跟 macOS
+        NSEvent 分支共用同一套 tap-toggle / lone-modifier 判定）。
+
+        on_press/on_release 內都包 try/except（透過 _on_p/_on_r 本身已包），
+        任何例外都不能讓 Listener 執行緒死掉。
+        """
+        self._pynput_listener = _kb.Listener(
+            on_press=self._on_p,
+            on_release=self._on_r,
+        )
+        self._pynput_listener.start()
+
     def stop(self) -> None:
         """停止監聽器並清空所有狀態。
 
-        設計重點：先在鎖內取出 monitor 參照、清空狀態，
-        再在鎖外呼叫 removeMonitor:，避免持鎖時死鎖。
+        設計重點：先在鎖內取出後端參照、清空狀態，
+        再在鎖外做後端專屬的停止動作（NSEvent removeMonitor: / pynput
+        Listener.stop()），避免持鎖時死鎖。
         """
         mon_global = None
         mon_local  = None
+        pynput_listener = None
         with self._lock:
             mon_global       = self._monitor_global
             mon_local        = self._monitor_local
@@ -621,6 +715,8 @@ class HotkeyManager:
             # Fix 18 / 2026-05-23（Layer 1）：清空 handler 強引用
             self._ns_handler_global = None
             self._ns_handler_local  = None
+            pynput_listener       = self._pynput_listener
+            self._pynput_listener = None
             self._pressed.clear()
             self._ns_held_modifiers.clear()
             self._combo_active = False
@@ -636,6 +732,14 @@ class HotkeyManager:
                     NSEvent.removeMonitor_(mon_local)
             except Exception:
                 log_error("hotkey_ns_remove_failed")
+
+        # pynput Listener（Windows）：在鎖外 stop()
+        if pynput_listener is not None:
+            log.info("HOTKEY: Stopping pynput Listener...")
+            try:
+                pynput_listener.stop()
+            except Exception:
+                log_error("hotkey_pynput_stop_failed")
 
     def _normalize(self, key) -> object:
         """正規化左右修飾鍵（委派給模組層函式）。"""

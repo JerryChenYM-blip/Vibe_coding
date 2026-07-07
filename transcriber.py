@@ -1,15 +1,25 @@
+# Mac/Windows 雙棲 — 移植自 macOS v2.21.6
 """
 Whisper 語音轉文字封裝器。
 
 後端自動偵測（啟動時判斷一次）：
-  • Apple Silicon (arm64) + mlx_whisper 已安裝 → mlx-whisper（Metal GPU / Neural Engine）
-  • 其他情況                                   → faster-whisper（CPU int8）
+  • macOS + Apple Silicon (arm64) + mlx_whisper 已安裝 → mlx-whisper（Metal GPU / Neural Engine）
+  • Windows（或其他情況）                              → faster-whisper（CPU int8 / CUDA）
 
 模型快取位置：~/.cache/huggingface/hub/（兩種後端共用同一目錄）
 
 防護機制：
   • 靜音偵測：RMS < _MIN_RMS 直接跳過推論，避免空白音訊觸發幻覺
   • 幻覺過濾：比對已知幻覺字串列表，比對到就替換為「未偵測到語音」
+
+雙棲備註（Windows 移植）：
+  • mlx / mlx_whisper / mlx_qwen3_asr / mlx.core 全是 Apple GPU 專屬套件，Windows
+    上無法 import。`_detect_backend()` 對 Windows 直接短路回 "ctranslate"，
+    不會嘗試 import mlx 系列。
+  • Qwen3-ASR（mlx_qwen3_asr）本來就只有 MLX 實作、無 CPU fallback，既有
+    `BACKEND != "mlx"` 防呆已涵蓋 Windows（見 `_ensure_qwen3_session` 呼叫端）。
+  • `mx.set_wired_limit` 是 macOS 15+ 專屬 API（釘記憶體避免 page-out），額外包
+    `IS_MAC` 判斷；Windows 完全不會走到（BACKEND != "mlx" 時 Qwen3 路徑直接擋）。
 """
 
 from __future__ import annotations
@@ -25,6 +35,7 @@ from typing import Optional
 import prompts
 
 from logger import get_logger, log_error
+from platform_util import IS_MAC, IS_WINDOWS
 
 log = get_logger("transcriber")
 
@@ -94,9 +105,15 @@ def _audio_quality(audio) -> dict:
 def _detect_backend() -> str:
     """偵測最佳推論後端：Apple Silicon + mlx 已安裝則用 mlx，否則用 ctranslate2。
 
+    Windows 一律回 "ctranslate"（faster-whisper CPU/CUDA）——mlx / mlx_whisper
+    是 Apple GPU 專屬套件，Windows 上完全無法 import，所以連嘗試都不嘗試，
+    直接短路，避免任何情況下踩到 import mlx 系列。
+
     Returns:
         "mlx" 或 "ctranslate"。
     """
+    if IS_WINDOWS:
+        return "ctranslate"  # Windows 沒有 mlx，一律走 faster-whisper CPU/CUDA
     if platform.machine() != "arm64":
         return "ctranslate"   # 非 Apple Silicon，只能跑 CPU 版
     try:
@@ -1927,13 +1944,18 @@ class Transcriber:
                 #   跟權重常駐量（get_active_memory ~3.5GB）是兩個計數器，防不了
                 #   swap-out（audit 實證：8941 筆 ping 權重駐留量與 cache 上限完全
                 #   脫鉤）。必須在 Session 載入前設定、權重配置時才會被 wire。
-                try:
-                    import mlx.core as mx
-                    if hasattr(mx, "set_wired_limit"):
-                        mx.set_wired_limit(4 * 1024 * 1024 * 1024)
-                        log.info("WHISPER: MLX wired limit set to 4GB (pin weights in RAM)")
-                except Exception:
-                    log_error("mlx_set_wired_limit_failed")
+                # v2.21.6：set_wired_limit 是 macOS 15+ 專屬 API（釘記憶體避免
+                #   page-out）。這段本來就在 BACKEND == "mlx" 分支內（Windows
+                #   一律 BACKEND == "ctranslate"、不會走到這裡），額外加 IS_MAC
+                #   判斷雙重防呆，避免任何情境下在非 mac 平台呼叫 mlx.core。
+                if IS_MAC:
+                    try:
+                        import mlx.core as mx
+                        if hasattr(mx, "set_wired_limit"):
+                            mx.set_wired_limit(4 * 1024 * 1024 * 1024)
+                            log.info("WHISPER: MLX wired limit set to 4GB (pin weights in RAM)")
+                    except Exception:
+                        log_error("mlx_set_wired_limit_failed")
                 from mlx_qwen3_asr import Session
                 self._qwen3_session = Session(model=hf_repo)
                 self._qwen3_loaded_model = model_size

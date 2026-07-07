@@ -231,6 +231,106 @@ def test_hotkey_watchdog_swallows_exception_and_reschedules():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  Windows watchdog — pynput Listener 後端存活判斷（雙棲移植）
+#
+#  Mac 分支（上面 Fix 7 那三個 test）維持不動、跑真實 IS_MAC=True。
+#  這裡 monkeypatch gui.IS_WINDOWS/IS_MAC 模擬 Windows 後端：watchdog 改看
+#  _pynput_listener.is_alive()，而不是 NSEvent 的 _monitor_global。
+#
+#  真 bug（移植後才會踩到）：Windows 後端從不設 _monitor_global/_monitor_local
+#  → 若沿用 NSEvent 判斷會恆判為「死」→ watchdog 每 5s 無限重啟熱鍵。
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _make_stub_appwindow_for_watchdog_win():
+    """Windows 後端 watchdog stub：監聽器是 pynput Listener（_pynput_listener），
+    存活判斷靠 is_alive()；NSEvent monitor 一律 None（Windows 不設）。"""
+    from gui import AppWindow
+    win = AppWindow.__new__(AppWindow)
+    win.cfg = types.SimpleNamespace(hotkey="ctrl+alt+r")
+    win.hotkey_mgr = MagicMock()
+    # Windows 後端不設 NSEvent monitor（保持 None，模擬真實狀態）
+    win.hotkey_mgr._monitor_global = None
+    win.hotkey_mgr._monitor_local = None
+    win.hotkey_mgr._last_event_at = time.monotonic()
+    win.hotkey_mgr._pressed = set()
+    win.hotkey_mgr._combo_active = False
+    win._state = "idle"
+    win._last_hotkey_force_restart = time.monotonic()
+    win.after = MagicMock()
+    return win
+
+
+def test_hotkey_watchdog_win_noop_when_listener_alive(monkeypatch):
+    """Windows：_pynput_listener.is_alive()==True → 不 restart，但要排下一次。"""
+    import gui
+    monkeypatch.setattr(gui, "IS_WINDOWS", True)
+    monkeypatch.setattr(gui, "IS_MAC", False)
+    win = _make_stub_appwindow_for_watchdog_win()
+    listener = MagicMock()
+    listener.is_alive.return_value = True
+    win.hotkey_mgr._pynput_listener = listener
+
+    win._hotkey_watchdog()
+
+    win.hotkey_mgr.restart.assert_not_called()
+    win.after.assert_called_once()
+
+
+def test_hotkey_watchdog_win_restarts_when_listener_dead(monkeypatch):
+    """Windows：listener 物件在、但 is_alive()==False（執行緒死了）→ restart。"""
+    import gui
+    monkeypatch.setattr(gui, "IS_WINDOWS", True)
+    monkeypatch.setattr(gui, "IS_MAC", False)
+    win = _make_stub_appwindow_for_watchdog_win()
+    listener = MagicMock()
+    listener.is_alive.return_value = False
+    win.hotkey_mgr._pynput_listener = listener
+
+    win._hotkey_watchdog()
+
+    win.hotkey_mgr.restart.assert_called_once_with("ctrl+alt+r")
+    win.after.assert_called_once()
+
+
+def test_hotkey_watchdog_win_restarts_when_listener_missing(monkeypatch):
+    """Windows：_pynput_listener is None（還沒起來 / 掛了）→ restart。"""
+    import gui
+    monkeypatch.setattr(gui, "IS_WINDOWS", True)
+    monkeypatch.setattr(gui, "IS_MAC", False)
+    win = _make_stub_appwindow_for_watchdog_win()
+    win.hotkey_mgr._pynput_listener = None
+
+    win._hotkey_watchdog()
+
+    win.hotkey_mgr.restart.assert_called_once_with("ctrl+alt+r")
+    win.after.assert_called_once()
+
+
+def test_hotkey_watchdog_win_no_periodic_force_restart(monkeypatch):
+    """Windows：Layer 2（10 分鐘定時 force-restart）是 macOS NSEvent 專屬。
+
+    這個 test 同時守兩件事：
+      1. 真 bug 已修：listener 活著時 watchdog 是 no-op（不再每 5s 無限重啟）。
+      2. Mac 專屬的 periodic force-restart 沒有洩漏到 Windows：就算閒置超過
+         10 分鐘門檻、listener 仍活著，也不該 restart（會白白拔掉 SetWindowsHookEx
+         鉤子、製造漏鍵空窗）。"""
+    import gui
+    monkeypatch.setattr(gui, "IS_WINDOWS", True)
+    monkeypatch.setattr(gui, "IS_MAC", False)
+    win = _make_stub_appwindow_for_watchdog_win()
+    listener = MagicMock()
+    listener.is_alive.return_value = True
+    win.hotkey_mgr._pynput_listener = listener
+    win._last_hotkey_force_restart = time.monotonic() - 660.0   # > 10 min
+    win._state = "idle"
+
+    win._hotkey_watchdog()
+
+    win.hotkey_mgr.restart.assert_not_called()
+    win.after.assert_called_once()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  Fix 6 Step 2 — App Nap 抑制（NSEvent backend 仍保留，主執行緒 responsive）
 # ═════════════════════════════════════════════════════════════════════════════
 

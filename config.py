@@ -1,3 +1,4 @@
+# Mac/Windows 雙棲 — 移植自 macOS v2.21.6
 """
 應用程式設定管理。
 
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Optional
 
 from logger import get_logger, log_error
+from platform_util import IS_MAC, DEFAULT_HOTKEY
 
 log = get_logger("config")
 
@@ -68,7 +70,8 @@ class Config:
 
     # ── 基本操作設定 ──────────────────────────────────────────────────────────
 
-    hotkey:       str           = "right_cmd"        # 全域錄音快捷鍵（單按右 Cmd）
+    # mac 預設「right_cmd」（單按右 Cmd）、Windows 預設「ctrl+alt+r」（見 platform_util.DEFAULT_HOTKEY）
+    hotkey:       str           = DEFAULT_HOTKEY
     # v2.15.1：預設改 qwen3-asr-large（SOTA 開源、競爭商用 API、中文最強）
     # 舊使用者既有 config.json 不受影響；只影響新使用者首次啟動。
     # 首次啟動會自動下載 ~3.4GB（splash 顯示「暖機中」、約 2-8 分鐘看網速）。
@@ -265,12 +268,24 @@ class Config:
             cfg = cls(**valid_data)
 
             # 安全檢查：cmd+shift+space 與 macOS 輸入法熱鍵衝突，強制重設
-            if cfg.hotkey == "cmd+shift+space":
+            # 這是 macOS 專屬歷史遺留值（Windows 沒有 cmd 鍵、config.json 裡
+            # 不會自然出現這個字串）；gate 在 IS_MAC 下維持 mac 行為 byte-identical。
+            if IS_MAC and cfg.hotkey == "cmd+shift+space":
                 log.warning(
                     "CONFIG: Detecting unstable hotkey 'cmd+shift+space', "
                     "auto-resetting to 'cmd+alt+r'"
                 )
                 cfg.hotkey = "cmd+alt+r"
+                cfg.save()
+            elif not IS_MAC and cfg.hotkey == "cmd+shift+space":
+                # 理論上不會發生（此值是 mac 專屬），但若使用者手動改壞 config.json
+                # 帶進這個 mac-only 字串，仍用平台對應預設值救回，避免 Windows
+                # 上出現一個帶 "cmd" 的無效熱鍵字串。
+                log.warning(
+                    f"CONFIG: Detecting mac-only hotkey 'cmd+shift+space' on non-mac "
+                    f"platform, auto-resetting to {DEFAULT_HOTKEY!r}"
+                )
+                cfg.hotkey = DEFAULT_HOTKEY
                 cfg.save()
 
             return cfg
