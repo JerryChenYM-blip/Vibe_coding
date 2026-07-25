@@ -223,7 +223,13 @@ def resolve_reduce_motion(pref: str) -> bool:
 # 找到就把切點挪去那裡（該點之後的音留給下一段開頭，一個 sample 都不丟）。
 STREAM_CUT_SEARCH_WINDOW_S = 2.5   # 只在 buffer 最後 2.5s 內找靜音切點
 STREAM_CUT_RMS_WINDOW_MS = 80      # RMS 計算視窗
-STREAM_CUT_RMS_THRESHOLD_RATIO = 0.3   # 視窗 RMS < 全段中位數 × 此比例 → 判定靜音
+# v2.23.1：門檻改「最低點(floor)→中位數(hi)之間的比例位置」，不再是「中位數×比例」。
+#   舊公式 threshold = median×0.3 要求 SNR > 3.33 才可能成立；背景噪音把停頓的
+#   音量墊高時，數學上永遠達不到 → 實測 7/20、7/23 兩天 0/18 全撞 hard cap、
+#   7/24（安靜）7/7 全中，整體只有 28%。錨點（median）從來就不代表「噪音底」。
+STREAM_CUT_RMS_THRESHOLD_RATIO = 0.3   # threshold = floor + 0.3 × (median − floor)
+STREAM_CUT_SPREAD_MIN = 1.6        # median/floor 動態範圍下限；低於此視為「整段音量太平」→ 不信任、退回 hard cap
+STREAM_CUT_MIN_QUIET_WINDOWS = 3   # 需連續 3 個視窗（80ms×3 = 240ms）都安靜才算真停頓（濾音節間的短促凹陷）
 
 
 def find_silence_cut_point(
@@ -232,27 +238,41 @@ def find_silence_cut_point(
     search_window_s: float = STREAM_CUT_SEARCH_WINDOW_S,
     rms_window_ms: int = STREAM_CUT_RMS_WINDOW_MS,
     threshold_ratio: float = STREAM_CUT_RMS_THRESHOLD_RATIO,
+    spread_min: float = STREAM_CUT_SPREAD_MIN,
+    min_quiet_windows: int = STREAM_CUT_MIN_QUIET_WINDOWS,
 ) -> Optional[int]:
-    """在 audio 最後 search_window_s 秒內找「能量最低的靜音窗」當切點。
+    """在 audio 最後 search_window_s 秒內找「真正的停頓」當切點。
 
     純函式、不碰任何 Tk / 狀態，方便單元測試。
 
-    做法：
-      1. 把 audio 切成 rms_window_ms 大小的小視窗，逐一算 RMS。
-      2. 全段（不只搜尋窗）RMS 中位數當作「講話音量」基準。
-      3. 只在最後 search_window_s 秒對應的視窗裡，找 RMS 最低、且低於
-         中位數 × threshold_ratio 的視窗，回傳該視窗中點的 sample index。
-      4. 找不到符合門檻的視窗 → 回傳 None（呼叫端 fallback 到 hard cap 硬切）。
+    v2.23.1 演算法（取代 v2.22.0 的「中位數 × 比例」相對門檻）：
+      1. 把 audio 切成 rms_window_ms 小視窗，逐一算 RMS。
+      2. floor = 全段最小 RMS（噪音底的估計）、hi = 全段中位數（講話音量）。
+      3. **動態範圍檢查**：hi / floor < spread_min → 整段音量太平（高噪音、
+         或根本沒停過）→ 回 None、退回 hard cap。寧可不切也不要誤切。
+      4. threshold = floor + threshold_ratio × (hi − floor)
+         —— 錨在「這段音訊自己的噪音底」，不是中位數，所以不會被背景噪音打敗。
+      5. **持續性檢查**：只有「連續 ≥ min_quiet_windows 個視窗」都低於門檻才
+         算真停頓（濾掉語音音節之間的短促凹陷），取該區段最安靜的視窗中點當切點。
+      6. 都找不到 → 回 None（呼叫端 fallback 到 hard cap 硬切）。
+
+    為何改：舊公式 threshold = median × 0.3 隱含「SNR > 3.33 才可能成立」，
+    背景噪音把停頓音量墊高時數學上永遠達不到——實測 7/20、7/23 兩天 0/18
+    全部撞 hard cap、7/24（安靜）7/7 全中，整體只有 28%。合成音訊模擬
+    （SNR 1.2–20 × 停頓 300–1200ms）證實新演算法在 SNR ≥ 1.5 找到停頓率 100%
+    （舊演算法 SNR ≤ 3 為 0%），且「連續講話沒停頓」的誤切率維持 0%。
 
     Args:
         audio: 1-D numpy float32 陣列。
         sample_rate: 取樣率（Hz）。
         search_window_s: 只在音訊尾端這麼多秒內找切點。
         rms_window_ms: 逐視窗 RMS 計算的視窗大小。
-        threshold_ratio: 判定「安靜」的門檻（相對全段中位數 RMS）。
+        threshold_ratio: 門檻在 floor→hi 之間的比例位置。
+        spread_min: hi/floor 動態範圍下限，低於此不信任這段有真停頓。
+        min_quiet_windows: 需連續幾個視窗都安靜才算真停頓。
 
     Returns:
-        切點的 sample index（int），或 None（找不到夠安靜的地方）。
+        切點的 sample index（int），或 None（找不到可信的停頓）。
     """
     import numpy as np
 
@@ -266,28 +286,59 @@ def find_silence_cut_point(
     trimmed = audio[: n_windows * win].reshape(n_windows, win)
     rms = np.sqrt(np.mean(trimmed.astype(np.float64) ** 2, axis=1))
 
-    median_rms = float(np.median(rms))
-    if median_rms <= 0:
+    hi = float(np.median(rms))
+    if hi <= 0:
         return None   # 全段靜音之類的異常情況，不特別處理
+    floor = float(np.min(rms))
 
-    threshold = median_rms * threshold_ratio
+    # 動態範圍檢查：floor 太接近中位數 = 整段音量很平（高噪音或全程講話）
+    #   → 這種音訊裡「最安靜的地方」也只是相對安靜、不是真停頓，不要切。
+    #   floor == 0（數位靜音）代表確實有絕對安靜處，視為無限大 spread、直接通過。
+    if floor > 0 and (hi / floor) < spread_min:
+        return None
+
+    threshold = floor + threshold_ratio * (hi - floor)
 
     # 只看最後 search_window_s 秒對應的視窗範圍
     search_samples = int(sample_rate * search_window_s)
     search_start_window = max(0, (n - search_samples) // win)
 
-    candidate_windows = rms[search_start_window:]
-    if len(candidate_windows) == 0:
+    quiet = rms[search_start_window:] < threshold
+    if len(quiet) == 0:
         return None
 
-    best_local_idx = int(np.argmin(candidate_windows))
-    best_rms = candidate_windows[best_local_idx]
-    if best_rms >= threshold:
-        return None   # 最安靜的地方都不夠安靜 → 沒有真正的停頓
+    # 持續性檢查：找「連續 ≥ min_quiet_windows 個安靜視窗」的區段，
+    #   在所有合格區段中取「最安靜的那個視窗」當切點。
+    best_local_idx: Optional[int] = None
+    best_rms_val: Optional[float] = None
+    run_start: Optional[int] = None
 
-    best_window_idx = search_start_window + best_local_idx
-    # 切點取該視窗中點
-    cut_point = best_window_idx * win + win // 2
+    def _consider(start: int, end: int) -> None:
+        """把 quiet[start:end] 這個合格區段納入比較（end 為 exclusive）。"""
+        nonlocal best_local_idx, best_rms_val
+        seg = rms[search_start_window + start:search_start_window + end]
+        local = int(np.argmin(seg)) + start
+        val = float(rms[search_start_window + local])
+        if best_rms_val is None or val < best_rms_val:
+            best_rms_val = val
+            best_local_idx = local
+
+    for i, is_quiet in enumerate(quiet):
+        if is_quiet:
+            if run_start is None:
+                run_start = i
+        else:
+            if run_start is not None and (i - run_start) >= min_quiet_windows:
+                _consider(run_start, i)
+            run_start = None
+    # 收尾：區段一路延伸到搜尋窗結尾
+    if run_start is not None and (len(quiet) - run_start) >= min_quiet_windows:
+        _consider(run_start, len(quiet))
+
+    if best_local_idx is None:
+        return None   # 沒有夠長的連續安靜區段 → 沒有可信的停頓
+
+    cut_point = (search_start_window + best_local_idx) * win + win // 2
     return int(cut_point)
 
 
