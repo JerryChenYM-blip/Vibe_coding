@@ -214,3 +214,92 @@ def test_find_silence_cut_point_empty_array_returns_none():
     """空陣列 → 回 None，不該 crash。"""
     audio = np.zeros(0, dtype=np.float32)
     assert find_silence_cut_point(audio, sample_rate=SR) is None
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# v2.23.1 噪音環境切窗回歸測試
+#   實測 7/20、7/23（較吵）0/18 全撞 hard cap、7/24（安靜）7/7 全中 = 舊的
+#   「中位數×0.3」相對門檻在 SNR ≤ 3.33 時數學上永遠不可能成立。
+#   新演算法錨在「這段音訊自己的噪音底」，噪音環境也能找到停頓。
+# ─────────────────────────────────────────────────────────────────────────
+
+def _speech_with_pause(speech_rms, noise_rms, pause_s=0.9, sr=16_000, seed=0):
+    """合成「語音 + 中間停頓 + 語音」，停頓處只剩背景噪音。"""
+    import numpy as np
+    rng = np.random.default_rng(seed)
+
+    def _speech(n):
+        # 用帶包絡的雜訊模擬語音（有起伏、rms ≈ speech_rms）
+        base = rng.normal(0, 1.0, n)
+        env = 0.5 + 0.5 * np.abs(np.sin(np.linspace(0, 40, n)))
+        sig = base * env
+        return (sig / (np.sqrt(np.mean(sig ** 2)) + 1e-12)) * speech_rms
+
+    def _noise(n):
+        return rng.normal(0, noise_rms, n)
+
+    a = _speech(int(7.5 * sr)) + _noise(int(7.5 * sr))
+    p = _noise(int(pause_s * sr))                     # 停頓：只有背景噪音
+    b = _speech(int(1.6 * sr)) + _noise(int(1.6 * sr))
+    return np.concatenate([a, p, b]).astype("float32"), len(a), len(a) + len(p)
+
+
+def test_finds_pause_in_noisy_environment():
+    """v2.23.1 核心修復：SNR≈2（吵雜環境）仍要找得到停頓。
+
+    舊演算法（median×0.3）在此 SNR 下數學上必然失敗（需 SNR>3.33），
+    正是實測 7/20、7/23 兩天 0/18 全撞 hard cap 的原因。
+    """
+    from gui import find_silence_cut_point
+    audio, p_start, p_end = _speech_with_pause(speech_rms=0.08, noise_rms=0.04, seed=1)
+    cut = find_silence_cut_point(audio)
+    assert cut is not None, "吵雜環境（SNR≈2）應該仍找得到停頓"
+    # 切點要落在停頓區間內（容許 ±1 個 RMS 視窗的邊界誤差）
+    win = int(16_000 * 0.08)
+    assert p_start - win <= cut <= p_end + win, (
+        f"切點 {cut} 應落在停頓區間 [{p_start}, {p_end}] 內"
+    )
+
+
+def test_finds_pause_in_quiet_environment_still_works():
+    """安靜環境（SNR≈20）本來就會過，新演算法不能讓它退步。"""
+    from gui import find_silence_cut_point
+    audio, p_start, p_end = _speech_with_pause(speech_rms=0.08, noise_rms=0.004, seed=2)
+    cut = find_silence_cut_point(audio)
+    assert cut is not None
+    win = int(16_000 * 0.08)
+    assert p_start - win <= cut <= p_end + win
+
+
+def test_no_false_cut_on_continuous_speech_even_when_noisy():
+    """連續講話（沒有真停頓）→ 絕不能誤切。
+
+    新演算法放寬了門檻，必須靠「動態範圍檢查 + 連續 240ms」兩道安全閥
+    擋住誤切；否則會製造比原本更嚴重的「切在句子中間」問題。
+    """
+    import numpy as np
+    from gui import find_silence_cut_point
+    rng = np.random.default_rng(3)
+    n = int(12 * 16_000)
+    base = rng.normal(0, 1.0, n)
+    env = 0.5 + 0.5 * np.abs(np.sin(np.linspace(0, 200, n)))   # 全程講話、只有音節起伏
+    sig = base * env
+    sig = (sig / np.sqrt(np.mean(sig ** 2))) * 0.08
+    audio = (sig + rng.normal(0, 0.04, n)).astype("float32")   # 吵雜 + 無停頓
+    assert find_silence_cut_point(audio) is None, "連續講話不該被誤切"
+
+
+def test_short_dip_between_syllables_is_not_a_pause():
+    """音節之間的短促凹陷（< 240ms）不算停頓、不該切。"""
+    import numpy as np
+    from gui import find_silence_cut_point
+    rng = np.random.default_rng(4)
+    sr = 16_000
+    speech = lambda n: (rng.normal(0, 1.0, n) / 1.0) * 0.08
+    parts = [speech(int(7.0 * sr))]
+    # 尾端塞 3 個各 100ms 的短凹陷（未達 240ms 門檻）
+    for _ in range(3):
+        parts.append(rng.normal(0, 0.004, int(0.10 * sr)))   # 100ms 安靜
+        parts.append(speech(int(0.6 * sr)))
+    audio = np.concatenate(parts).astype("float32")
+    assert find_silence_cut_point(audio) is None, "100ms 短凹陷不該被當成停頓"
