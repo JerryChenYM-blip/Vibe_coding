@@ -1432,3 +1432,64 @@ def test_keepalive_ping_skips_when_lock_busy():
         assert warmup_called == []   # 鎖忙 → 跳過、沒去排隊跑 warmup
     finally:
         lock.release()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# v2.24.0 錄音看門狗回歸測試
+#   實案：8/2 錄了 10h07m（睡著忘記關、結束時當機）、8/5 錄了 97 分鐘
+#   （旁人對話整段進資料庫）。兩段式：8 分鐘無語音提醒、15 分鐘自動停止。
+# ─────────────────────────────────────────────────────────────────────────
+
+def _make_watchdog_win(quiet_s, warned=False, watchdog_on=True, la=None):
+    """造一個只夠跑 _recording_watchdog_check 的 AppWindow 殼。"""
+    from gui import AppWindow
+    win = AppWindow.__new__(AppWindow)
+    win.cfg = types.SimpleNamespace(recording_watchdog=watchdog_on)
+    win._la_buffer = la
+    win._last_voice_at = time.perf_counter() - quiet_s
+    win._watchdog_warned = warned
+    win._show_toast = MagicMock()
+    win._notify_system = MagicMock()
+    win._try_stop = MagicMock()
+    return win
+
+
+def test_watchdog_stops_after_15min_no_voice():
+    """連續 15 分鐘無語音 → 自動停止（走 _try_stop 標準路徑）。"""
+    win = _make_watchdog_win(quiet_s=15 * 60 + 5)
+    win._recording_watchdog_check()
+    win._try_stop.assert_called_once()
+    win._notify_system.assert_called_once()
+
+
+def test_watchdog_warns_once_at_8min():
+    """8 分鐘無語音 → 提醒一次（不停止）；再次檢查不重複提醒。"""
+    win = _make_watchdog_win(quiet_s=8 * 60 + 5)
+    win._recording_watchdog_check()
+    win._try_stop.assert_not_called()
+    win._notify_system.assert_called_once()
+    assert win._watchdog_warned is True
+    win._recording_watchdog_check()   # 第二次 tick
+    win._notify_system.assert_called_once()   # 仍只有一次
+
+
+def test_watchdog_quiet_below_threshold_noop():
+    """語音間隔正常（<8 分鐘）→ 什麼都不做。"""
+    win = _make_watchdog_win(quiet_s=3 * 60)
+    win._recording_watchdog_check()
+    win._try_stop.assert_not_called()
+    win._notify_system.assert_not_called()
+
+
+def test_watchdog_disabled_by_config():
+    """config.recording_watchdog=False → 完全不動作（逃生門）。"""
+    win = _make_watchdog_win(quiet_s=60 * 60, watchdog_on=False)
+    win._recording_watchdog_check()
+    win._try_stop.assert_not_called()
+
+
+def test_watchdog_skips_la_path():
+    """LA 路徑（_la_buffer 非 None）訊號機制不同 → 跳過、不誤停。"""
+    win = _make_watchdog_win(quiet_s=60 * 60, la=object())
+    win._recording_watchdog_check()
+    win._try_stop.assert_not_called()

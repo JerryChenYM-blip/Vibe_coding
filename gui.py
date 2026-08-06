@@ -221,7 +221,11 @@ def resolve_reduce_motion(pref: str) -> bool:
 # 接縫 100% 落在句中）。這裡不跑完整 Silero VAD（太重、每秒 tick 都要跑不划算），
 # 改用簡單 RMS 法：只在「最後 SEARCH_WINDOW_S 秒」裡找一個能量最低的靜音窗，
 # 找到就把切點挪去那裡（該點之後的音留給下一段開頭，一個 sample 都不丟）。
-STREAM_CUT_SEARCH_WINDOW_S = 2.5   # 只在 buffer 最後 2.5s 內找靜音切點
+# v2.24.0：2.5 → 4.0。實測 v2.23.1 後 206 筆切窗、所有命中切點都 ≥7.64s（理論下限
+#   10s 觸發 − 2.5s 窗 = 7.5s 幾乎完全吻合）——演算法只看得到每個 12s 週期的最後
+#   37.5%、前段的自然停頓根本沒機會被檢查，這是命中率卡在 41.5% 的結構主因。
+#   拉到 4s 讓可視範圍擴到 6–12s；再往前要動「開始搜尋的時機」屬更大改動、先不做。
+STREAM_CUT_SEARCH_WINDOW_S = 4.0   # 只在 buffer 最後 4s 內找靜音切點
 STREAM_CUT_RMS_WINDOW_MS = 80      # RMS 計算視窗
 # v2.23.1：門檻改「最低點(floor)→中位數(hi)之間的比例位置」，不再是「中位數×比例」。
 #   舊公式 threshold = median×0.3 要求 SNR > 3.33 才可能成立；背景噪音把停頓的
@@ -422,6 +426,14 @@ class AppWindow(ctk.CTkFrame):
     # 也存在、不會在被測方法裡撞 AttributeError。
     #   _la_buffer (v2.20.0 LA-2)、_pipeline_* (v2.20.3 N3 pipeline timing)、
     #   _hotkey_health_tick_count (v2.20.3 N6)、_last_ping_at (v2.20.3 N5)
+    # v2.24.0 錄音看門狗：連續無語音太久 → 提醒 → 自動停止（防忘記關錄音）。
+    #   8/2 實案：凌晨按下錄音去睡、錄了 10h07m（97.7% 寂靜）、停止瞬間 MLX 當機、
+    #   App 停擺 10 小時；8/5 實案：忘記關 97 分鐘、旁人對話整段進了資料庫。
+    WATCHDOG_WARN_NO_VOICE_S = 8 * 60    # 連續 8 分鐘無語音 → 系統通知提醒
+    WATCHDOG_STOP_NO_VOICE_S = 15 * 60   # 連續 15 分鐘無語音 → 自動停止（內容保留）
+
+    _last_voice_at = None        # v2.24.0：最近一次偵測到語音的 perf_counter 時間
+    _watchdog_warned = False     # v2.24.0：本輪錄音是否已發過 8 分鐘提醒
     _la_buffer = None
     _pipeline_summary_emitted = False
     _pipeline_t0 = None
@@ -1145,6 +1157,9 @@ class AppWindow(ctk.CTkFrame):
         self._stream_chunks    = []
         self._ripples.clear()
         self._prev_rms         = 0.0
+        # v2.24.0 看門狗：錄音起點視為「最後聽到語音」的起算點
+        self._last_voice_at    = time.perf_counter()
+        self._watchdog_warned  = False
 
         # Capture frontmost app —— 背景執行緒執行，避免 2 秒 osascript timeout
         # 卡住 recorder.start()。此資訊同時被 preset 路由（A1）與 auto-paste 用；
@@ -1425,6 +1440,11 @@ class AppWindow(ctk.CTkFrame):
         if self._state != "recording":
             return
 
+        # v2.24.0 錄音看門狗（每秒 tick 順路檢查、零額外成本）
+        self._recording_watchdog_check()
+        if self._state != "recording":
+            return   # 看門狗剛自動停止 → 本輪 tick 到此為止
+
         # v2.19.x LocalAgreement-2 path：route 到 _stream_tick_la()。
         # _la_buffer 非 None 表示這輪錄音用 LA 演算法、fixed-chunk 邏輯整段跳過。
         if self._la_buffer is not None:
@@ -1462,6 +1482,73 @@ class AppWindow(ctk.CTkFrame):
             self._stream_tick_id = self.after(
                 self.STREAM_TICK_MS, self._stream_tick
             )
+
+    def _recording_watchdog_check(self) -> None:
+        """v2.24.0 錄音看門狗：連續無語音太久 → 提醒 → 自動停止（防忘記關錄音）。
+
+        訊號來源：fixed_chunk streaming 的 chunk 轉錄結果——有內容就刷新
+        `_last_voice_at`（`_dispatch_stream_chunk` 內）。任何超過 8 分鐘的錄音
+        必然已進入 streaming（12s 就啟動），所以訊號一定存在。
+
+        兩段式（參數依近 2.5 週實測：最長合法錄音 15 分鐘、多數 <5 分鐘）：
+          • 連續 8 分鐘無語音 → 系統通知 + toast 提醒（只發一次）。用系統通知
+            是因為兩次實案（8/2 睡著、8/5 在別的 App 工作）都證明 Mini HUD 的
+            被動顯示不夠——人根本不在看。
+          • 連續 15 分鐘無語音 → 自動停止。走 `_try_stop()` 標準停止路徑、
+            已錄內容照常轉錄存檔（不丟棄），使用者要繼續只需再按一次熱鍵。
+
+        只在 fixed_chunk 路徑生效：LA 路徑（`_la_buffer` 非 None、預設關）的
+        chunk 訊號機制不同、`_last_voice_at` 不會被刷新，直接跳過避免誤停。
+        """
+        try:
+            if not getattr(self.cfg, "recording_watchdog", True):
+                return
+            if self._la_buffer is not None:
+                return
+            last = self._last_voice_at
+            if last is None:
+                return
+            quiet_s = time.perf_counter() - last
+
+            if quiet_s >= self.WATCHDOG_STOP_NO_VOICE_S:
+                log_action("watchdog_auto_stop", quiet_min=round(quiet_s / 60, 1))
+                self._notify_system(
+                    "Whisper Pro",
+                    "太久沒偵測到語音，已自動停止錄音（已錄內容有保留）",
+                )
+                self._show_toast("⚠ 太久沒偵測到語音，已自動停止錄音")
+                self._try_stop()
+            elif (
+                quiet_s >= self.WATCHDOG_WARN_NO_VOICE_S
+                and not self._watchdog_warned
+            ):
+                self._watchdog_warned = True
+                log_action("watchdog_warn", quiet_min=round(quiet_s / 60, 1))
+                self._notify_system(
+                    "Whisper Pro",
+                    "麥克風還在錄音中——已 8 分鐘未偵測到語音（忘記關了嗎？）",
+                )
+                self._show_toast("🎙 還在錄音中（久未偵測到語音）")
+        except Exception:
+            log_error("recording_watchdog_failed")
+
+    def _notify_system(self, title: str, message: str) -> None:
+        """發系統通知（使用者不在本 App / 不在電腦前也看得到）。
+
+        mac 用 osascript display notification（Popen 射後不理、不卡主執行緒）；
+        Windows 暫無實作（toast 仍會顯示）。失敗靜默——通知是輔助、非關鍵路徑。
+        """
+        try:
+            if IS_MAC:
+                safe_t = title.replace('"', '\\"')
+                safe_m = message.replace('"', '\\"')
+                subprocess.Popen(
+                    ["osascript", "-e",
+                     f'display notification "{safe_m}" with title "{safe_t}"'],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+        except Exception:
+            pass
 
     def _decide_stream_cut_length(self, snap, available: int) -> Optional[int]:
         """v2.22.0 VAD 對齊切窗：決定這次要切多長（相對 _stream_samples 的
@@ -1548,6 +1635,10 @@ class AppWindow(ctk.CTkFrame):
                 # 否則寫進 index（單一 writer per slot、不需鎖）
                 if self._stream_generation == gen:
                     self._stream_chunks[idx] = text
+                    # v2.24.0 看門狗：這個 chunk 有真實語音 → 刷新「最後聽到語音」
+                    #   時間戳（float 賦值原子、背景執行緒直接寫安全）。
+                    if text:
+                        self._last_voice_at = time.perf_counter()
                     log.info(
                         f"STREAMING: chunk[{idx}] done "
                         f"({len(text)} chars, RTF={(r.elapsed_seconds or 0)/(r.duration_seconds or 1):.2f})"
