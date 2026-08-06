@@ -187,6 +187,13 @@ class Config:
     #   "fixed"              = 退回舊行為（滿 10s 就無腦切，逃生門）
     chunk_cut_mode: str = "vad_aligned"
 
+    # ── v2.24.0 錄音看門狗 ──────────────────────────────────────────────────
+    # 防「按了錄音忘記關」：8/2 實案錄了 10 小時（97.7% 是寂靜、結束時 App 當機、
+    # 停擺整個白天）、8/5 實案錄了 97 分鐘（把旁人對話整段錄進資料庫）。
+    # 連續 8 分鐘無語音 → 系統通知提醒；連續 15 分鐘無語音 → 自動停止並保留內容。
+    # （近 2.5 週實測最長合法錄音 15 分鐘、多數 <5 分鐘、且中間都有語音。）
+    recording_watchdog: bool = True
+
     # ── v2.18.0 Polish backend 選擇（本地 Ollama / 雲端 Vertex AI Gemini）─
     # "local"  = Ollama（地端 GPU、隱私 100% 本地、~5s warm、會 thermal throttle）
     # "vertex" = Google Vertex AI Gemini（雲端、不佔本地 GPU、~3-10s 含網路、需 GCP 帳號）
