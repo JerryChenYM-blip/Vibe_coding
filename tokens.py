@@ -191,6 +191,85 @@ WAVE_LIVE_COL = _P["WAVE_LIVE"]    # 錄音中波形：強對比、強調「活�
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  能量色溫斜坡（Aperture D2）— 音量 0→1 映射成色溫
+#  深色主題：石板灰→青→冰藍→白熾；淺色主題反轉成墨水濃度
+#  （白底上「越亮」讀不出「越大聲」，改用「越深」表達能量）
+#  規格來源：/tmp/aperture_engine.js 的 RAMP_DARK / RAMP_LIGHT 常數（唯一權威，照抄數值）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ENERGY_RAMP_DARK: list[tuple[float, tuple[int, int, int]]] = [
+    (0.00, (63, 74, 85)),
+    (0.30, (8, 145, 178)),
+    (0.55, (34, 211, 238)),
+    (0.80, (165, 243, 252)),
+    (1.00, (255, 255, 255)),
+]
+
+ENERGY_RAMP_LIGHT: list[tuple[float, tuple[int, int, int]]] = [
+    (0.00, (148, 163, 184)),
+    (0.40, (14, 116, 144)),
+    (0.72, (11, 74, 92)),
+    (1.00, (6, 42, 54)),
+]
+
+
+def _energy_ramp_at(
+    stops: list[tuple[float, tuple[int, int, int]]], v: float
+) -> tuple[int, int, int]:
+    """在 stops 上做分段線性內插，回傳 (r,g,b)。
+
+    Port 自 aperture_engine.js 的 rampAt()，數學不變。v 超出 [0,1] 會 clamp。
+    """
+    v = 0.0 if v < 0 else 1.0 if v > 1 else v
+    for i in range(1, len(stops)):
+        p1, c1 = stops[i]
+        if v <= p1 or i == len(stops) - 1:
+            p0, c0 = stops[i - 1]
+            t = 0.0 if p1 == p0 else (v - p0) / (p1 - p0)
+            return (
+                round(c0[0] + (c1[0] - c0[0]) * t),
+                round(c0[1] + (c1[1] - c0[1]) * t),
+                round(c0[2] + (c1[2] - c0[2]) * t),
+            )
+    return stops[-1][1]
+
+
+_ENERGY_LUT_SIZE = 64  # 預先算 64 階快取：46 bar × 20fps 每幀呼叫，不能每次都做浮點內插搜尋
+
+
+def _build_energy_lut(
+    stops: list[tuple[float, tuple[int, int, int]]],
+) -> list[tuple[int, int, int]]:
+    """把 ramp 離散成 64 階（含頭尾兩端點），供 energy_color() O(1) 查表 + 相鄰兩階內插。"""
+    return [
+        _energy_ramp_at(stops, i / (_ENERGY_LUT_SIZE - 1))
+        for i in range(_ENERGY_LUT_SIZE)
+    ]
+
+
+# LUT 跟著既有的 theme 鎖定機制走（_THEME / _P 同一個來源），不額外讀設定檔
+_ENERGY_LUT = _build_energy_lut(ENERGY_RAMP_LIGHT if _THEME == "light" else ENERGY_RAMP_DARK)
+
+
+def energy_color(v: float) -> str:
+    """音量 0→1 → 色溫 hex 色碼（依 import 時鎖定的 theme 走 dark/light 斜坡）。
+
+    64 階 LUT 查表 + 相鄰兩階內插，避免每幀對 5 個 stop 做浮點搜尋。
+    v 超出 [0,1] 會 clamp。
+    """
+    v = 0.0 if v < 0 else 1.0 if v > 1 else v
+    pos = v * (_ENERGY_LUT_SIZE - 1)
+    i0 = int(pos)
+    i1 = i0 + 1 if i0 < _ENERGY_LUT_SIZE - 1 else i0
+    frac = pos - i0
+    c0, c1 = _ENERGY_LUT[i0], _ENERGY_LUT[i1]
+    r = round(c0[0] + (c1[0] - c0[0]) * frac)
+    g = round(c0[1] + (c1[1] - c0[1]) * frac)
+    b = round(c0[2] + (c1[2] - c0[2]) * frac)
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  以下 token 與 theme 無關（字型 / 間距 / 圓角 / 動畫），不需要 palette variant
 # ═══════════════════════════════════════════════════════════════════════════════
 
