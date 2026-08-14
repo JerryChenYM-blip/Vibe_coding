@@ -241,6 +241,16 @@ class LocalAgreementBuffer:
         with self._lock:
             return self._audio_buffer_samples / self._sample_rate
 
+    @property
+    def committed_audio_end_s(self) -> float:
+        """已 commit（兩輪 ASR 都同意）對應的 audio 結束時間點（秒）。
+
+        v2.27.0 Aperture 三態統一：處理態掠掃光帶用這個邊界當「真實進度」——
+        哪段已經確認、哪段還在浮動，不用另外猜。
+        """
+        with self._lock:
+            return self._committed_audio_end_s
+
     # ── 公開 API ─────────────────────────────────────────────────────────────
 
     def add_audio(self, new_audio) -> None:

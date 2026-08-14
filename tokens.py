@@ -44,15 +44,18 @@ _PALETTES: dict[str, dict[str, str]] = {
         "TEXT_3":      "#A1A1AA",   # ~55% — 說明
         "TEXT_4":      "#71717A",   # ~35% — 停用
         # ── 語意色 ───────────────────────────────────────
+        # ACCENT：Aperture 第二輪（語意收窄）用途收窄為互動色（選取列/焦點/連結）
         "ACCENT":      "#06B6D4",   # Cyan 500
         "ACCENT_HV":   "#22D3EE",
         "ACCENT_BG":   "#164E63",
+        # SUCCESS：Aperture 第二輪（語意收窄）只給「已貼上」toast 與權限已授權，從閒置態撤出
         "SUCCESS":     "#22C55E",
         "SUCCESS_HV":  "#16A34A",
         "SUCCESS_DIM": "#14532D",
         "DANGER":      "#EF4444",
         "DANGER_HV":   "#DC2626",
         "DANGER_DIM":  "#7F1D1D",
+        # WARN：Aperture 第二輪（語意收窄）只給削波（clipping），從處理態撤出
         "WARN":        "#F59E0B",
         "WARN_HV":     "#D97706",
         "WARN_DIM":    "#78350F",
@@ -64,6 +67,24 @@ _PALETTES: dict[str, dict[str, str]] = {
         "LINK":        "#06B6D4",
         "WAVE_IDLE":   "#3F3F46",   # = SURF_4
         "WAVE_LIVE":   "#FAFAFA",   # = TEXT_1
+        # ── Aperture 第二輪新增（13 key，兩套 palette 的 key 必須完全一致）──
+        # 能量色溫 5 停留點（錄音態，音量 0→1，供 ENERGY_RAMP_DARK 組裝）
+        "WAVE_E0":     "#3F4A55",
+        "WAVE_E1":     "#0891B2",
+        "WAVE_E2":     "#22D3EE",
+        "WAVE_E3":     "#A5F3FC",
+        "WAVE_E4":     "#FFFFFF",
+        # 閒置 2 停留點（呼吸律動）
+        "WAVE_I0":     "#2A2E33",
+        "WAVE_I1":     "#4A525C",
+        # 處理 3 停留點（旋轉弧 / 頻譜掃描）
+        "WAVE_P0":     "#312E81",
+        "WAVE_P1":     "#6366F1",
+        "WAVE_P2":     "#A5B4FC",
+        # 處理態「還沒讀到」的 bar（掃描未到達的部分）
+        "WAVE_DIM":    "#3C424A",
+        # 搜尋高亮底色（歷史紀錄 FTS5 命中）
+        "MARK_BG":     "#164E63",
     },
     "light": {
         # ── 表面層次（Variant C Hybrid）──────────────
@@ -78,15 +99,21 @@ _PALETTES: dict[str, dict[str, str]] = {
         "TEXT_3":      "#6E6E73",   # Apple-cool 灰（刻意冷以平衡暖度）
         "TEXT_4":      "#A8A8AD",   # 停用
         # ── 語意色 ───────────────────────────────────────
-        "ACCENT":      "#D97757",   # Claude coral（主 CTA / active）
+        # ACCENT：Aperture 第二輪（語意收窄）淺色珊瑚 #D97757 退場，
+        # 改用互動色 #0E7490（選取列/焦點/連結），不再兼任主 CTA 色。
+        # 注意：ACCENT_HV / ACCENT_BG 仍是舊珊瑚色系、本輪未列入收窄範圍，
+        # 沿用舊值（hover / chip 底色若要跟進需另開任務）。
+        "ACCENT":      "#0E7490",
         "ACCENT_HV":   "#C66445",
         "ACCENT_BG":   "#F6E8DE",   # 珊瑚 chip 淡底
+        # SUCCESS：Aperture 第二輪（語意收窄）只給「已貼上」toast 與權限已授權，從閒置態撤出
         "SUCCESS":     "#2E8B57",   # balanced green
         "SUCCESS_HV":  "#246E47",
         "SUCCESS_DIM": "#E0EFE5",
         "DANGER":      "#D14B41",   # warm Apple red
         "DANGER_HV":   "#B53A30",
         "DANGER_DIM":  "#F8E2DF",
+        # WARN：Aperture 第二輪（語意收窄）只給削波（clipping），從處理態撤出
         "WARN":        "#C7842B",   # muted amber
         "WARN_HV":     "#A56E22",
         "WARN_DIM":    "#F5E9D4",
@@ -97,6 +124,19 @@ _PALETTES: dict[str, dict[str, str]] = {
         "LINK":        "#007AFF",   # Apple system blue（連結 / info icon）
         "WAVE_IDLE":   "#D4D2C8",   # = SURF_4
         "WAVE_LIVE":   "#1A1612",   # = TEXT_1
+        # ── Aperture 第二輪新增（13 key，兩套 palette 的 key 必須完全一致）──
+        "WAVE_E0":     "#94A3B8",
+        "WAVE_E1":     "#0E7490",
+        "WAVE_E2":     "#0B4A5C",
+        "WAVE_E3":     "#062A36",
+        "WAVE_E4":     "#041C25",
+        "WAVE_I0":     "#C9C7BE",
+        "WAVE_I1":     "#94928F",
+        "WAVE_P0":     "#D6D7FA",
+        "WAVE_P1":     "#6366F1",
+        "WAVE_P2":     "#3730A3",
+        "WAVE_DIM":    "#C4C2BA",
+        "MARK_BG":     "#FDE68A",   # 兩套色相不同是刻意的（深色沿用 cyan-900、淺色用琥珀提亮）
     },
 }
 
@@ -181,6 +221,10 @@ INDIGO_DIM  = _P["INDIGO_DIM"]
 # 淺色主題下分開（Apple 藍 #007AFF），給「珊瑚 = CTA、藍 = 連結」明確語意。
 LINK        = _P["LINK"]
 
+# PROCESS：語意收窄新增——INDIGO 的別名（非另存 hex），轉錄／潤飾／自動貼上
+# 這三個「背景處理中」動作共用同一色相；活 alias 保證永遠跟 INDIGO 同步，不會日後改色時各走各的。
+PROCESS     = INDIGO
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  波形顏色（Waveform）
@@ -189,28 +233,57 @@ LINK        = _P["LINK"]
 WAVE_IDLE_COL = _P["WAVE_IDLE"]    # 閒置時波形：搭配四級表面、不搶眼
 WAVE_LIVE_COL = _P["WAVE_LIVE"]    # 錄音中波形：強對比、強調「活躍」感
 
+# ── Aperture 第二輪新增：13 key 的其餘 12 個（PROCESS 已在上面定義為 INDIGO 別名）──
+
+WAVE_E0  = _P["WAVE_E0"]
+WAVE_E1  = _P["WAVE_E1"]
+WAVE_E2  = _P["WAVE_E2"]
+WAVE_E3  = _P["WAVE_E3"]
+WAVE_E4  = _P["WAVE_E4"]
+
+WAVE_I0  = _P["WAVE_I0"]
+WAVE_I1  = _P["WAVE_I1"]
+
+WAVE_P0  = _P["WAVE_P0"]
+WAVE_P1  = _P["WAVE_P1"]
+WAVE_P2  = _P["WAVE_P2"]
+
+WAVE_DIM = _P["WAVE_DIM"]    # 處理態「還沒讀到」的 bar，搭配 WAVE_P0..P2 掃描色使用
+MARK_BG  = _P["MARK_BG"]     # 搜尋高亮底色（兩套 palette 色相不同是刻意的）
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  能量色溫斜坡（Aperture D2）— 音量 0→1 映射成色溫
 #  深色主題：石板灰→青→冰藍→白熾；淺色主題反轉成墨水濃度
 #  （白底上「越亮」讀不出「越大聲」，改用「越深」表達能量）
-#  規格來源：/tmp/aperture_engine.js 的 RAMP_DARK / RAMP_LIGHT 常數（唯一權威，照抄數值）
+#  Aperture 第二輪：斜坡不再另存一份 hex，改從 _PALETTES 的 WAVE_E0..E4 token 讀，
+#  單一真相來源在 palette 字典。停留點位置固定為 [0, 0.30, 0.55, 0.80, 1.0]
+#  （淺色主題原本只有 4 停留點，第二輪補上 WAVE_E4 #041C25 當第 5 個 100% 端點，
+#  端點顏色因此變得更深——這是刻意的語意收窄，不是 bug）。
 # ═══════════════════════════════════════════════════════════════════════════════
 
-ENERGY_RAMP_DARK: list[tuple[float, tuple[int, int, int]]] = [
-    (0.00, (63, 74, 85)),
-    (0.30, (8, 145, 178)),
-    (0.55, (34, 211, 238)),
-    (0.80, (165, 243, 252)),
-    (1.00, (255, 255, 255)),
-]
+def _hex_to_rgb(h: str) -> tuple[int, int, int]:
+    """`#RRGGBB` → (r,g,b)。"""
+    h = h.lstrip("#")
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
 
-ENERGY_RAMP_LIGHT: list[tuple[float, tuple[int, int, int]]] = [
-    (0.00, (148, 163, 184)),
-    (0.40, (14, 116, 144)),
-    (0.72, (11, 74, 92)),
-    (1.00, (6, 42, 54)),
-]
+
+def _stops_from_tokens(
+    palette: dict[str, str], keys: tuple[str, ...], positions: tuple[float, ...]
+) -> list[tuple[float, tuple[int, int, int]]]:
+    """依 positions 把 palette 裡一串 hex token 組成 ramp stops list（給三條 ramp 共用）。"""
+    return [(pos, _hex_to_rgb(palette[key])) for pos, key in zip(positions, keys)]
+
+
+_ENERGY_STOP_POSITIONS = (0.00, 0.30, 0.55, 0.80, 1.00)
+_ENERGY_KEYS = ("WAVE_E0", "WAVE_E1", "WAVE_E2", "WAVE_E3", "WAVE_E4")
+
+ENERGY_RAMP_DARK: list[tuple[float, tuple[int, int, int]]] = _stops_from_tokens(
+    _PALETTES["dark"], _ENERGY_KEYS, _ENERGY_STOP_POSITIONS
+)
+ENERGY_RAMP_LIGHT: list[tuple[float, tuple[int, int, int]]] = _stops_from_tokens(
+    _PALETTES["light"], _ENERGY_KEYS, _ENERGY_STOP_POSITIONS
+)
 
 
 def _energy_ramp_at(
@@ -219,6 +292,7 @@ def _energy_ramp_at(
     """在 stops 上做分段線性內插，回傳 (r,g,b)。
 
     Port 自 aperture_engine.js 的 rampAt()，數學不變。v 超出 [0,1] 會 clamp。
+    名稱沿用「energy」但實作與 ramp 語意無關，閒置 / 處理兩條 ramp 也共用此函式。
     """
     v = 0.0 if v < 0 else 1.0 if v > 1 else v
     for i in range(1, len(stops)):
@@ -240,7 +314,10 @@ _ENERGY_LUT_SIZE = 64  # 預先算 64 階快取：46 bar × 20fps 每幀呼叫�
 def _build_energy_lut(
     stops: list[tuple[float, tuple[int, int, int]]],
 ) -> list[tuple[int, int, int]]:
-    """把 ramp 離散成 64 階（含頭尾兩端點），供 energy_color() O(1) 查表 + 相鄰兩階內插。"""
+    """把 ramp 離散成 64 階（含頭尾兩端點），供 *_color() O(1) 查表 + 相鄰兩階內插。
+
+    名稱沿用「energy」，但實作通用，閒置 / 處理兩條 ramp 的 LUT 也呼叫這支建。
+    """
     return [
         _energy_ramp_at(stops, i / (_ENERGY_LUT_SIZE - 1))
         for i in range(_ENERGY_LUT_SIZE)
@@ -251,22 +328,74 @@ def _build_energy_lut(
 _ENERGY_LUT = _build_energy_lut(ENERGY_RAMP_LIGHT if _THEME == "light" else ENERGY_RAMP_DARK)
 
 
-def energy_color(v: float) -> str:
-    """音量 0→1 → 色溫 hex 色碼（依 import 時鎖定的 theme 走 dark/light 斜坡）。
+def _lut_color(lut: list[tuple[int, int, int]], v: float) -> str:
+    """v(0→1) 在 64 階 LUT 上查表 + 相鄰兩階內插 → hex 色碼。v 超出 [0,1] 會 clamp。
 
-    64 階 LUT 查表 + 相鄰兩階內插，避免每幀對 5 個 stop 做浮點搜尋。
-    v 超出 [0,1] 會 clamp。
+    energy_color / idle_color / process_color 三個對外函式共用同一段查表邏輯。
     """
     v = 0.0 if v < 0 else 1.0 if v > 1 else v
     pos = v * (_ENERGY_LUT_SIZE - 1)
     i0 = int(pos)
     i1 = i0 + 1 if i0 < _ENERGY_LUT_SIZE - 1 else i0
     frac = pos - i0
-    c0, c1 = _ENERGY_LUT[i0], _ENERGY_LUT[i1]
+    c0, c1 = lut[i0], lut[i1]
     r = round(c0[0] + (c1[0] - c0[0]) * frac)
     g = round(c0[1] + (c1[1] - c0[1]) * frac)
     b = round(c0[2] + (c1[2] - c0[2]) * frac)
     return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def energy_color(v: float) -> str:
+    """音量 0→1 → 色溫 hex 色碼（依 import 時鎖定的 theme 走 dark/light 斜坡）。
+
+    64 階 LUT 查表 + 相鄰兩階內插，避免每幀對 5 個 stop 做浮點搜尋。
+    v 超出 [0,1] 會 clamp。
+    """
+    return _lut_color(_ENERGY_LUT, v)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  閒置態 2 停留點 ramp（呼吸律動）— 同一套 64 階 LUT 機制，跟著 _THEME 鎖定
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_IDLE_STOP_POSITIONS = (0.00, 1.00)
+_IDLE_KEYS = ("WAVE_I0", "WAVE_I1")
+
+IDLE_RAMP_DARK: list[tuple[float, tuple[int, int, int]]] = _stops_from_tokens(
+    _PALETTES["dark"], _IDLE_KEYS, _IDLE_STOP_POSITIONS
+)
+IDLE_RAMP_LIGHT: list[tuple[float, tuple[int, int, int]]] = _stops_from_tokens(
+    _PALETTES["light"], _IDLE_KEYS, _IDLE_STOP_POSITIONS
+)
+
+_IDLE_LUT = _build_energy_lut(IDLE_RAMP_LIGHT if _THEME == "light" else IDLE_RAMP_DARK)
+
+
+def idle_color(v: float) -> str:
+    """閒置態呼吸律動 0→1 → hex 色碼。與 energy_color() 同一套 64 階 LUT 機制。"""
+    return _lut_color(_IDLE_LUT, v)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  處理態 3 停留點 ramp（旋轉弧 / 頻譜掃描）— 同一套 64 階 LUT 機制，跟著 _THEME 鎖定
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_PROCESS_STOP_POSITIONS = (0.00, 0.50, 1.00)
+_PROCESS_KEYS = ("WAVE_P0", "WAVE_P1", "WAVE_P2")
+
+PROCESS_RAMP_DARK: list[tuple[float, tuple[int, int, int]]] = _stops_from_tokens(
+    _PALETTES["dark"], _PROCESS_KEYS, _PROCESS_STOP_POSITIONS
+)
+PROCESS_RAMP_LIGHT: list[tuple[float, tuple[int, int, int]]] = _stops_from_tokens(
+    _PALETTES["light"], _PROCESS_KEYS, _PROCESS_STOP_POSITIONS
+)
+
+_PROCESS_LUT = _build_energy_lut(PROCESS_RAMP_LIGHT if _THEME == "light" else PROCESS_RAMP_DARK)
+
+
+def process_color(v: float) -> str:
+    """處理態掃描進度 0→1 → hex 色碼。與 energy_color() 同一套 64 階 LUT 機制。"""
+    return _lut_color(_PROCESS_LUT, v)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

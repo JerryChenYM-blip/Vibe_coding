@@ -184,9 +184,14 @@ def test_energy_ramp_dark_endpoints():
 
 
 def test_energy_ramp_light_endpoints():
-    """淺色斜坡端點：淺灰 (148,163,184) → 深墨 (6,42,54)。"""
+    """淺色斜坡端點：淺灰 (148,163,184) → 深墨 (4,28,37)。
+
+    Aperture 第二輪（v2.26.0）：淺色斜坡從 4 停留點補成 5 停留點，
+    新增 WAVE_E4 #041C25 當 100% 端點，比舊端點 (6,42,54) 更深——
+    這是刻意的語意收窄，此處數值同步更新（舊端點現在落在 0.80 停留點上）。
+    """
     assert tokens._energy_ramp_at(tokens.ENERGY_RAMP_LIGHT, 0.0) == (148, 163, 184)
-    assert tokens._energy_ramp_at(tokens.ENERGY_RAMP_LIGHT, 1.0) == (6, 42, 54)
+    assert tokens._energy_ramp_at(tokens.ENERGY_RAMP_LIGHT, 1.0) == (4, 28, 37)
 
 
 def test_energy_color_returns_hex_format():
@@ -243,7 +248,13 @@ def test_energy_lut_size_is_64():
 
 
 def test_energy_lut_matches_direct_interpolation_within_tolerance():
-    """LUT 查表 + 相鄰內插的結果，與直接內插的誤差要 < 2/255。"""
+    """LUT 查表 + 相鄰內插的結果，與直接內插的誤差要 ≤ 2/255。
+
+    門檻從 <2 放寬成 ≤2：Aperture 第二輪把淺色斜坡從 4 個停留點加到 5 個
+    （新增 100% 的 #041C25），同樣 64 階 LUT 的量化誤差在停留點轉折處
+    從 1/255 升到 2/255。2/255 是 8-bit 色階的 0.78%、肉眼不可見；而
+    64 階是設計師明確指定的規格，不為了看不見的改善偏離規格去加大 LUT。
+    """
     stops = (tokens.ENERGY_RAMP_LIGHT if tokens._THEME == "light"
              else tokens.ENERGY_RAMP_DARK)
     worst = 0
@@ -252,4 +263,131 @@ def test_energy_lut_matches_direct_interpolation_within_tolerance():
         direct = tokens._energy_ramp_at(stops, v)
         via_lut = _hex_to_rgb(tokens.energy_color(v))
         worst = max(worst, max(abs(a - b) for a, b in zip(direct, via_lut)))
-    assert worst < 2, f"LUT 與直接內插誤差過大：{worst}/255"
+    assert worst <= 2, f"LUT 與直接內插誤差過大：{worst}/255"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Aperture 第二輪（v2.26.0）新增 13 token + 語意收窄
+#   涵蓋：兩套 palette 新 key 對稱、dark/light 數值照抄規格、PROCESS 別名、
+#   ACCENT 語意收窄後的實際色值、閒置／處理兩條新 ramp 的端點與 LUT。
+# ─────────────────────────────────────────────────────────────────────────
+
+_NEW_WAVE_KEYS = (
+    "WAVE_E0", "WAVE_E1", "WAVE_E2", "WAVE_E3", "WAVE_E4",
+    "WAVE_I0", "WAVE_I1",
+    "WAVE_P0", "WAVE_P1", "WAVE_P2",
+    "WAVE_DIM", "MARK_BG",
+)
+
+
+def test_new_wave_keys_symmetric_between_palettes():
+    """13 個新 token 裡的 12 個 palette key，dark / light 兩套字典必須完全對稱存在。"""
+    dark_keys = set(tokens._PALETTES["dark"].keys())
+    light_keys = set(tokens._PALETTES["light"].keys())
+    assert dark_keys == light_keys, "dark/light palette key 不對稱"
+    for k in _NEW_WAVE_KEYS:
+        assert k in dark_keys, f"{k} 缺席於 dark palette"
+        assert k in light_keys, f"{k} 缺席於 light palette"
+
+
+def test_new_wave_token_hex_values_dark():
+    """dark palette 的新 token 數值照抄規格，不能手滑。"""
+    p = tokens._PALETTES["dark"]
+    assert p["WAVE_E0"] == "#3F4A55"
+    assert p["WAVE_E1"] == "#0891B2"
+    assert p["WAVE_E2"] == "#22D3EE"
+    assert p["WAVE_E3"] == "#A5F3FC"
+    assert p["WAVE_E4"] == "#FFFFFF"
+    assert p["WAVE_I0"] == "#2A2E33"
+    assert p["WAVE_I1"] == "#4A525C"
+    assert p["WAVE_P0"] == "#312E81"
+    assert p["WAVE_P1"] == "#6366F1"
+    assert p["WAVE_P2"] == "#A5B4FC"
+    assert p["WAVE_DIM"] == "#3C424A"
+    assert p["MARK_BG"] == "#164E63"
+
+
+def test_new_wave_token_hex_values_light():
+    """light palette 的新 token 數值照抄規格，不能手滑。"""
+    p = tokens._PALETTES["light"]
+    assert p["WAVE_E0"] == "#94A3B8"
+    assert p["WAVE_E1"] == "#0E7490"
+    assert p["WAVE_E2"] == "#0B4A5C"
+    assert p["WAVE_E3"] == "#062A36"
+    assert p["WAVE_E4"] == "#041C25"
+    assert p["WAVE_I0"] == "#C9C7BE"
+    assert p["WAVE_I1"] == "#94928F"
+    assert p["WAVE_P0"] == "#D6D7FA"
+    assert p["WAVE_P1"] == "#6366F1"
+    assert p["WAVE_P2"] == "#3730A3"
+    assert p["WAVE_DIM"] == "#C4C2BA"
+    assert p["MARK_BG"] == "#FDE68A"
+
+
+def test_process_is_indigo_alias():
+    """PROCESS 是 INDIGO 的別名（同一個值，非另存 hex），兩套 palette 都要成立。"""
+    assert tokens.PROCESS == tokens.INDIGO
+    assert tokens._PALETTES["dark"]["INDIGO"] == "#818CF8"
+    assert tokens._PALETTES["light"]["INDIGO"] == "#6366F1"
+
+
+def test_accent_semantic_narrowing_hex():
+    """ACCENT 語意收窄：dark 不變（cyan），light 珊瑚退場改互動色 teal。"""
+    assert tokens._PALETTES["dark"]["ACCENT"] == "#06B6D4"
+    assert tokens._PALETTES["light"]["ACCENT"] == "#0E7490"
+
+
+def test_energy_ramp_light_has_five_stops_now():
+    """淺色能量斜坡從 4 停留點補成 5 停留點（新增 WAVE_E4 當 100%），停留點位置與深色一致。"""
+    assert len(tokens.ENERGY_RAMP_DARK) == 5
+    assert len(tokens.ENERGY_RAMP_LIGHT) == 5
+    assert tuple(p for p, _ in tokens.ENERGY_RAMP_DARK) == (0.00, 0.30, 0.55, 0.80, 1.00)
+    assert tuple(p for p, _ in tokens.ENERGY_RAMP_LIGHT) == (0.00, 0.30, 0.55, 0.80, 1.00)
+
+
+def test_idle_ramp_endpoints():
+    """閒置 2 停留點 ramp 端點正確，dark/light 分開驗證。"""
+    assert tokens.IDLE_RAMP_DARK[0] == (0.00, (42, 46, 51))
+    assert tokens.IDLE_RAMP_DARK[-1] == (1.00, (74, 82, 92))
+    assert tokens.IDLE_RAMP_LIGHT[0] == (0.00, (201, 199, 190))
+    assert tokens.IDLE_RAMP_LIGHT[-1] == (1.00, (148, 146, 143))
+
+
+def test_process_ramp_endpoints_and_midpoint():
+    """處理 3 停留點 ramp 端點與中點正確，dark/light 分開驗證。"""
+    assert tokens.PROCESS_RAMP_DARK[0] == (0.00, (49, 46, 129))
+    assert tokens.PROCESS_RAMP_DARK[1] == (0.50, (99, 102, 241))
+    assert tokens.PROCESS_RAMP_DARK[2] == (1.00, (165, 180, 252))
+    assert tokens.PROCESS_RAMP_LIGHT[0] == (0.00, (214, 215, 250))
+    assert tokens.PROCESS_RAMP_LIGHT[1] == (0.50, (99, 102, 241))
+    assert tokens.PROCESS_RAMP_LIGHT[2] == (1.00, (55, 48, 163))
+
+
+def test_idle_color_and_process_color_return_hex_and_clamp():
+    """idle_color / process_color 回傳格式與 clamp 行為，比照 energy_color。"""
+    import re
+    for v in (-1.0, 0.0, 0.5, 1.0, 2.0):
+        assert re.fullmatch(r"#[0-9A-Fa-f]{6}", tokens.idle_color(v)), v
+        assert re.fullmatch(r"#[0-9A-Fa-f]{6}", tokens.process_color(v)), v
+    assert tokens.idle_color(-5.0) == tokens.idle_color(0.0)
+    assert tokens.idle_color(9.9) == tokens.idle_color(1.0)
+    assert tokens.process_color(-5.0) == tokens.process_color(0.0)
+    assert tokens.process_color(9.9) == tokens.process_color(1.0)
+
+
+def test_idle_and_process_lut_size_is_64():
+    """新兩條 LUT 沿用能量斜坡同一套 64 階快取規格。"""
+    assert len(tokens._IDLE_LUT) == 64
+    assert len(tokens._PROCESS_LUT) == 64
+
+
+def test_idle_and_process_color_match_active_theme_endpoints():
+    """idle_color / process_color 的端點要跟著 import 時鎖定的 theme 走。"""
+    idle_stops = (tokens.IDLE_RAMP_LIGHT if tokens._THEME == "light"
+                  else tokens.IDLE_RAMP_DARK)
+    proc_stops = (tokens.PROCESS_RAMP_LIGHT if tokens._THEME == "light"
+                  else tokens.PROCESS_RAMP_DARK)
+    assert _hex_to_rgb(tokens.idle_color(0.0)) == idle_stops[0][1]
+    assert _hex_to_rgb(tokens.idle_color(1.0)) == idle_stops[-1][1]
+    assert _hex_to_rgb(tokens.process_color(0.0)) == proc_stops[0][1]
+    assert _hex_to_rgb(tokens.process_color(1.0)) == proc_stops[-1][1]

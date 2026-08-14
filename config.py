@@ -321,6 +321,16 @@ class Config:
         先寫 .tmp 再 replace()，確保即使寫到一半斷電，舊設定檔仍完整可讀。
         任何 I/O 失敗只 print 不拋例外，避免 UI 因設定儲存失敗而卡死。
         """
+        # v2.26.0 防護：pytest 執行期間一律不寫真實設定檔。
+        #   事故 2026-08-14：設定視窗改寫時，sub agent 為了「實測」而實例化
+        #   SettingsWindow 並觸發存檔，把一份預設 Config() 寫進使用者的
+        #   ~/.whisper_app/config.json——40 個欄位有 39 個被打回出廠值
+        #   （模型、主題、潤飾後端、Ollama 模型全部被重置）。
+        #   自動化測試沒有任何正當理由改使用者的真實設定，直接在源頭擋掉。
+        if "PYTEST_CURRENT_TEST" in os.environ:
+            log.warning("CONFIG: save() skipped — pytest 執行中，不寫真實設定檔")
+            return
+
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             temp_path = CONFIG_PATH.with_suffix(".tmp")
