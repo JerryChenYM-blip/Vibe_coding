@@ -223,6 +223,13 @@ class Config:
     # 只在 model=qwen3-asr 時生效；Whisper backend 不受影響
     chinese_variant: str = "traditional_tw"
 
+    # ── v2.25.0 Aperture 波形視覺（逃生門）─────────────────────────────────
+    # "waveform" = 錄音態改用 46(主視窗)/13(mini HUD) bar 的 Spectral Bands
+    #              能量色溫視覺（預設）
+    # "chamber"  = 完全退回舊版三態光場（青呼吸／紅脈衝+漣漪／琥珀弧），
+    #              新程式碼路徑一行都不執行——出問題時的逃生門
+    record_visual: str = "waveform"
+
     # ── 讀寫介面 ──────────────────────────────────────────────────────────────
 
     @classmethod

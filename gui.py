@@ -50,6 +50,7 @@ from recorder import AudioRecorder
 from transcriber import Transcriber, TranscriptionResult
 from icons import get_icon, get_canvas_icon
 from animation import blend, breathe, ease_in_out_cubic, Ripple
+from waveform import WaveformEngine
 import auto_paste as _ap
 from platform_util import IS_MAC, IS_WINDOWS
 
@@ -133,6 +134,7 @@ from tokens import (
     DANGER, DANGER_DIM,
     WARN,
     INDIGO, INDIGO_HV,
+    energy_color,
     # Typography + spacing
     FONT_FAMILY_UI, FONT_FAMILY_TEXT, FONT_FAMILY_MONO,
     SPACE_XS, SPACE_SM, SPACE_MD, SPACE_LG, SPACE_XL, SPACE_2XL,
@@ -170,6 +172,108 @@ RIPPLE_MAX        = 3      # 同時存在的最大漣漪數，防止畫面過於
 # 處理中狀態的旋轉粒子環
 PROC_PARTICLES        = 12  # 粒子總數（均勻分布在環上）
 PROC_PARTICLE_RADIUS  = 4   # 每個粒子的半徑（像素）
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Aperture Spectral Bands 波形視覺常數（v2.25.0）
+# ─────────────────────────────────────────────────────────────────────────────
+# 錄音態改用能量色溫 bar 視覺，取代舊三態光場的紅色脈衝＋漣漪（D1 決策：
+# DANGER 紅收回，只留給真正的錯誤）。數學完全照抄 /tmp/aperture_engine.js
+# drawBands() 的 L3 core 段（bar + 高光 + 峰值帽）與削波髮絲線；L1 back
+# （模糊背層）／L2 bloom（發光）兩層刻意不做——tkinter Canvas 沒有
+# blur／lighter 合成，單幀物件數也撐不住 20 FPS，還會排擠語音引擎 CPU。
+# 逃生門：cfg.record_visual == "chamber" 時完全不建立 / 不呼叫這條路徑。
+
+import tokens as _tokens_mod   # 讀 _THEME（tokens 於 import 時鎖定）
+
+WAVE_N_BARS_MAIN = 46      # 主視窗 Ambient Chamber 的 bar 數
+WAVE_N_BARS_MINI = 13      # Mini HUD 的 bar 數（極簡波形）
+WAVE_GAP         = 2.0     # bar 間距（像素）
+WAVE_CORE_ALPHA  = 0.96    # L3 核心 bar 不透明度（JS 原值 dark=0.98／light=0.92
+                           # 取中間值單一常數；tkinter 無 alpha channel，靠
+                           # blend() 對 SURF_1 混色模擬半透明）
+MINI_WAVE_W = 100          # Mini HUD 波形 canvas 寬（像素）
+MINI_WAVE_H = 28           # Mini HUD 波形 canvas 高（像素）
+# 白色鏡面高光只在深色主題畫（參考實作 `if (v > 0.22 && !light)`）。
+# tokens 在 import 時鎖定 theme，這裡跟著同一個來源、不另外讀設定檔。
+_IS_LIGHT_THEME = getattr(_tokens_mod, "_THEME", "dark") == "light"
+
+
+def _draw_spectral_bars(
+    canvas: "tk.Canvas",
+    engine: WaveformEngine,
+    width: int,
+    height: int,
+    elapsed_ms: float,
+    big: bool,
+) -> None:
+    """畫 Spectral Bands 波形（L3 核心層）到指定 canvas。
+
+    照抄 aperture_engine.js drawBands() 的 L3 core 段（bar + 高光 + 峰值帽）
+    與削波髮絲線，數學不變；只有「圓角」因 tkinter 沒有對應原生功能改用
+    直角矩形（create_rectangle）。L1 back（模糊背層）／L2 bloom（發光）
+    兩層刻意不做，同一顆函式給主視窗（46 bar）與 mini HUD（13 bar）共用。
+
+    big=True 才畫峰值帽（照抄 JS 的 `rig.big` 旗標）；mini HUD 用 big=False
+    省掉峰值帽物件量，維持「極簡波形」。呼叫端須自行先 canvas.delete("all")。
+
+    Args:
+        canvas: 目標 tk.Canvas。
+        engine: 已呼叫過 update() 的 WaveformEngine，取 bars / peaks / clipping。
+        width, height: canvas 尺寸（像素）。
+        elapsed_ms: 狀態經過的毫秒數，驅動削波髮絲線的閃爍相位。
+        big: 是否畫峰值帽（主視窗 True／mini HUD False）。
+    """
+    n = engine.n_bars
+    bar_w = max(2.0, (width - (n - 1) * WAVE_GAP) / n)
+    cy = height / 2.0
+    margin = 10.0 if big else 3.0
+    max_h = height / 2.0 - margin
+
+    bars = engine.bars
+    peaks = engine.peaks
+
+    for i in range(n):
+        x0 = i * (bar_w + WAVE_GAP)
+        x1 = x0 + bar_w
+
+        v = bars[i]
+        h = max(1.2, v * max_h)
+        color = blend(energy_color(v), SURF_1, WAVE_CORE_ALPHA)
+        canvas.create_rectangle(x0, cy - h, x1, cy + h, fill=color, outline="")
+
+        # 高光：v > 0.22 時在 bar 中線加一道白色細線（照抄 JS，不分 big/mini）。
+        # 只在深色主題畫——參考實作寫的是 `if (v > 0.22 && !light)`：白色高光是
+        # 「深色介質裡的鏡面反射」語意，淺色主題（墨水濃度斜坡）上會變成一道
+        # 白色切痕、把 bar 割成兩半。PNG 預覽實際看到這個問題才補上此條件。
+        if v > 0.22 and not _IS_LIGHT_THEME:
+            hi_alpha = min(0.6, (v - 0.22) * 1.3)
+            hi_color = blend("#FFFFFF", SURF_1, hi_alpha)
+            canvas.create_rectangle(
+                x0, cy - 0.6, x1, cy + 0.6, fill=hi_color, outline=""
+            )
+
+        # 峰值帽：只有 big（主視窗）才畫，照抄 JS 的 `rig.big` 旗標
+        if big and peaks[i] > 0.08:
+            ph = peaks[i] * max_h
+            peak_color = blend(energy_color(peaks[i]), SURF_1, 0.42)
+            canvas.create_rectangle(
+                x0, cy - ph - 2.4, x1, cy - ph - 0.6, fill=peak_color, outline=""
+            )
+            canvas.create_rectangle(
+                x0, cy + ph + 0.6, x1, cy + ph + 2.4, fill=peak_color, outline=""
+            )
+
+    # 削波髮絲線：上下各一條琥珀線，閃爍頻率照抄 JS（sin(now*0.012)）
+    if engine.clipping:
+        alpha = 0.35 + 0.35 * (0.5 + 0.5 * math.sin(elapsed_ms * 0.012))
+        clip_color = blend(WARN, SURF_1, alpha)
+        canvas.create_rectangle(
+            0, cy - max_h - 1.2, width, cy - max_h - 0.1, fill=clip_color, outline=""
+        )
+        canvas.create_rectangle(
+            0, cy + max_h + 0.1, width, cy + max_h + 1.2, fill=clip_color, outline=""
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -871,6 +975,13 @@ class AppWindow(ctk.CTkFrame):
             getattr(self.cfg, "reduce_motion_pref", "auto")
         )
 
+        # v2.25.0 Aperture 波形視覺：cfg.record_visual == "chamber" 時完全
+        # 不建立（逃生門，新程式碼路徑一行都不執行）
+        self._wave_engine: Optional[WaveformEngine] = None
+        self._wave_last_tick = 0.0
+        if getattr(self.cfg, "record_visual", "waveform") != "chamber":
+            self._wave_engine = WaveformEngine(n_bars=WAVE_N_BARS_MAIN)
+
         # 啟動渲染迴圈（在視窗存活期間持續執行，每 50ms 更新一次 Canvas）
         self._render_tick()
 
@@ -1157,6 +1268,10 @@ class AppWindow(ctk.CTkFrame):
         self._stream_chunks    = []
         self._ripples.clear()
         self._prev_rms         = 0.0
+        # v2.25.0 Aperture 波形：新錄音開始，engine 歸零 + tick 基準重設
+        if self._wave_engine is not None:
+            self._wave_engine.reset()
+            self._wave_last_tick = self._state_start_time
         # v2.24.0 看門狗：錄音起點視為「最後聽到語音」的起算點
         self._last_voice_at    = time.perf_counter()
         self._watchdog_warned  = False
@@ -2781,8 +2896,38 @@ class AppWindow(ctk.CTkFrame):
 
         self.after(tick, self._render_tick)
 
+    def _draw_chamber_waveform(self) -> None:
+        """錄音態的 Aperture 波形視覺（46 bar Spectral Bands）。
+
+        只在 cfg.record_visual != "chamber" 時被 _draw_chamber() 呼叫（逃生
+        門）。取代舊三態光場錄音態的紅色脈衝＋漣漪；idle／processing 兩態
+        與 chamber 模式完全不受影響，見 _draw_chamber() 開頭的 early return。
+        """
+        now = time.perf_counter()
+        c   = self._chamber
+        c.delete("all")
+
+        rms = self.recorder.get_rms_level() if self.recorder.is_recording() else 0.0
+        dt_ms = max(0.0, (now - self._wave_last_tick) * 1000.0)
+        self._wave_last_tick = now
+        self._wave_engine.update(rms, dt_ms)
+
+        elapsed_ms = (now - self._state_start_time) * 1000.0
+        _draw_spectral_bars(
+            c, self._wave_engine,
+            width=CHAMBER_SIZE, height=CHAMBER_SIZE,
+            elapsed_ms=elapsed_ms, big=True,
+        )
+
     def _draw_chamber(self) -> None:
         """Render ambient rings + central disc + icon for the current state."""
+        # v2.25.0 Aperture 波形：錄音態改走 bar 視覺（逃生門 cfg.record_visual）。
+        # early return 讓 idle／processing 與 chamber 模式的 recording 完全
+        # 沿用下面原本的程式碼，不受影響、不用改動任何既有分支。
+        if self._state == "recording" and self._wave_engine is not None:
+            self._draw_chamber_waveform()
+            return
+
         now = time.perf_counter()
         c   = self._chamber
         c.delete("all")
@@ -6925,10 +7070,16 @@ class MiniRecordingWindow(tk.Toplevel):
 
     AppWindow 透過 `update(state, elapsed_s, rms)` 推進狀態；不該由 mini
     自己 polling，避免狀態真相分散。
+
+    v2.25.0：cfg.record_visual != "chamber" 時加寬到 220×44，錄音中額外顯示
+    13 根 bar 的 Aperture 極簡波形（取代「錄音中」文字，dot 顏色已經在傳達
+    狀態）；cfg.record_visual == "chamber" 時完全退回舊版 140×38（逃生門）。
     """
 
-    WIN_W = 140
-    WIN_H = 38
+    # v2.25.0 新預設（waveform 模式）；legacy（chamber）模式在 __init__ 內
+    # 覆寫回舊值，見下方 self._legacy_visual 判斷
+    WIN_W = 220
+    WIN_H = 44
     # 距螢幕底邊（Speakly 風格：中下方）
     BOTTOM_MARGIN = 120
 
@@ -6945,6 +7096,17 @@ class MiniRecordingWindow(tk.Toplevel):
         self._ns_window = None   # 升級成功才設
         # Fix 9 P2-B：每 instance 獨一無二 title，destroy 中的舊 window 不會混淆
         self._ns_title = f"{self._NS_TITLE_PREFIX}-{id(self):x}"
+
+        # v2.25.0 Aperture 波形：cfg.record_visual == "chamber" 時完全退回
+        # 舊版 140×38（逃生門，新程式碼路徑一行都不執行）。WIN_W/WIN_H 覆寫
+        # 成 instance attribute，下面既有的定位／geometry 邏輯原樣沿用。
+        self._legacy_visual = (
+            getattr(getattr(master, "cfg", None), "record_visual", "waveform")
+            == "chamber"
+        )
+        if self._legacy_visual:
+            self.WIN_W = 140
+            self.WIN_H = 38
 
         # 無邊框
         self.overrideredirect(True)
@@ -7009,8 +7171,28 @@ class MiniRecordingWindow(tk.Toplevel):
         )
         self._timer.pack(side="right", padx=SPACE_MD)
 
+        # v2.25.0 Aperture 波形：13 bar 極簡波形（不畫峰值帽／削波線，見
+        # _draw_spectral_bars 的 big=False 分支）。錄音中取代「錄音中」文字
+        # 顯示（dot 顏色已經在傳達狀態，見 show_recording/show_processing）；
+        # 逃生門模式（chamber）完全不建立。
+        self._wave_engine: Optional[WaveformEngine] = None
+        self._wave_canvas: Optional[tk.Canvas] = None
+        self._wave_tick_active = False
+        self._wave_last_tick = 0.0
+        self._wave_state_start = 0.0
+        if not self._legacy_visual:
+            self._wave_engine = WaveformEngine(n_bars=WAVE_N_BARS_MINI)
+            self._wave_canvas = tk.Canvas(
+                inner, width=MINI_WAVE_W, height=MINI_WAVE_H,
+                bg=SURF_2, highlightthickness=0, bd=0,
+            )
+            # 不在這裡 pack：show_recording() 時取代 _label 顯示（見下方）
+
         # 點擊任何處 → 把主視窗拉前
-        for w in (self, outer, inner, self._dot, self._label, self._timer):
+        _click_targets = [self, outer, inner, self._dot, self._label, self._timer]
+        if self._wave_canvas is not None:
+            _click_targets.append(self._wave_canvas)
+        for w in _click_targets:
             w.bind("<Button-1>", self._on_click)
 
         # 預設隱藏；由 AppWindow 透過 .show() 顯示
@@ -7186,6 +7368,15 @@ class MiniRecordingWindow(tk.Toplevel):
         self._dot.configure(fg=DANGER)
         self._label.configure(text="錄音中")
         self._timer.configure(text="00:00")
+        # v2.25.0 Aperture 波形：canvas 取代文字 label，啟動 20 FPS render tick
+        if self._wave_canvas is not None:
+            self._label.pack_forget()
+            self._wave_canvas.pack(side="left", padx=(4, 4))
+            self._wave_engine.reset()
+            self._wave_state_start = time.perf_counter()
+            self._wave_last_tick = self._wave_state_start
+            self._wave_tick_active = True
+            self._wave_tick()
         self.deiconify()
         self._reapply_panel_level()
         # Bug A：若 NSPanel 升級失敗（_ns_window=None），重新跑 topmost 保證可見
@@ -7213,8 +7404,46 @@ class MiniRecordingWindow(tk.Toplevel):
         self._position_at_cursor_screen_bottom()   # D3-S6：multi-monitor 跟手
         self._dot.configure(fg=WARN)
         self._label.configure(text="轉錄中")
+        # v2.25.0 Aperture 波形：處理中不畫波形（沒有錄音訊號），停 render
+        # tick、canvas 收起來換回文字 label
+        if self._wave_canvas is not None:
+            self._wave_tick_active = False
+            self._wave_canvas.pack_forget()
+            self._wave_canvas.delete("all")
+            self._label.pack(side="left")
         self.deiconify()
         self._reapply_panel_level()
+
+    def _wave_tick(self) -> None:
+        """v2.25.0：mini HUD 波形 render tick（50ms／20 FPS，跟主視窗一致）。
+
+        只在錄音中 tick；show_processing() / hide() 會把 _wave_tick_active
+        關掉，迴圈下一次執行時發現旗標為 False 就直接 return、不再重新排程
+        （不留 dangling after() callback）。
+        """
+        if not self._wave_tick_active or self._closed:
+            return
+        try:
+            now = time.perf_counter()
+            rms = 0.0
+            recorder = getattr(self._master, "recorder", None)
+            if recorder is not None and recorder.is_recording():
+                rms = recorder.get_rms_level()
+            dt_ms = max(0.0, (now - self._wave_last_tick) * 1000.0)
+            self._wave_last_tick = now
+            self._wave_engine.update(rms, dt_ms)
+
+            self._wave_canvas.delete("all")
+            elapsed_ms = (now - self._wave_state_start) * 1000.0
+            _draw_spectral_bars(
+                self._wave_canvas, self._wave_engine,
+                width=MINI_WAVE_W, height=MINI_WAVE_H,
+                elapsed_ms=elapsed_ms, big=False,
+            )
+        except tk.TclError:
+            return
+
+        self.after(RENDER_TICK_MS, self._wave_tick)
 
     def update_timer(self, seconds: float) -> None:
         """錄音中每秒呼叫一次更新計時器。"""
@@ -7226,6 +7455,7 @@ class MiniRecordingWindow(tk.Toplevel):
     def hide(self) -> None:
         if self._closed:
             return
+        self._wave_tick_active = False
         self.withdraw()
 
     def _on_click(self, _event) -> None:
