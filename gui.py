@@ -7,7 +7,7 @@
 字型：      SF Pro Display / Text（macOS 原生字型）
 自動貼上：  錄音開始前記錄前景 App，轉錄完成後模擬 ⌘V 注入文字
 
-視窗佈局（760 × 800 px，由上到下）：
+視窗佈局（776 × 880 px，由上到下）：
   TopBar      — 品牌 logo、模型選單、語言選單
   RecordCard  — Ambient Chamber 畫布（呼吸光圈 + 錄音按鈕）、計時器
   ResultCard  — 轉錄結果文字區（含原文／潤飾切換）
@@ -117,10 +117,15 @@ def _open_path_in_os_default(path) -> None:
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-WIN_W, WIN_H = 760, 880   # 視窗預設寬度 × 高度（像素）
+WIN_W, WIN_H = 776, 880   # 視窗預設寬度 × 高度（像素）
 # WIN_H 推導：實測 AppWindow.winfo_reqheight() ≈ 858（TopBar 60 + RecordCard 398 +
 # ResultCard 281 + ActionBar 58 + StatusBar 32 + 分隔線×3 + 內邊距），舊值 800
 # 會把 ActionBar（5 顆動作按鈕）與 StatusBar 擠出視窗下緣。預留 22px 緩衝。
+# v2.27.0 三態統一：RecordCard 改放 712×160 寬條 canvas（見 WAVE_CHAMBER_W/H），
+# WIN_W 760→776，讓 712 寬 canvas 在 card 內（padx=SPACE_LG=16）左右各留 16px
+# margin、跟 card 自己的外距同一個節奏，不擠壓其他元件。RecordCard 高度反而
+# 因 canvas 280→160 變矮（少 120px），WIN_H 維持 880 綽綽有餘（多出的高度會
+# 讓下面 fill="both", expand=True 的 ResultCard 拿到更多轉錄文字顯示空間）。
 
 # ── 設計 Token（統一從 tokens.py 匯入，此模組內不重複定義任何 hex 色碼）────────
 from tokens import (
@@ -134,7 +139,7 @@ from tokens import (
     DANGER, DANGER_DIM,
     WARN,
     INDIGO, INDIGO_HV,
-    energy_color,
+    energy_color, idle_color, process_color, WAVE_DIM, MARK_BG,
     # Typography + spacing
     FONT_FAMILY_UI, FONT_FAMILY_TEXT, FONT_FAMILY_MONO,
     SPACE_XS, SPACE_SM, SPACE_MD, SPACE_LG, SPACE_XL, SPACE_2XL,
@@ -197,6 +202,27 @@ MINI_WAVE_H = 28           # Mini HUD 波形 canvas 高（像素）
 # 白色鏡面高光只在深色主題畫（參考實作 `if (v > 0.22 && !light)`）。
 # tokens 在 import 時鎖定 theme，這裡跟著同一個來源、不另外讀設定檔。
 _IS_LIGHT_THEME = getattr(_tokens_mod, "_THEME", "dark") == "light"
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  三態統一（v2.27.0）── 主視窗 Ambient Chamber 改「寬條」，idle／processing
+#  併入同一個 canvas + 同一支繪圖函式（見 _draw_aperture_bars）。
+# ─────────────────────────────────────────────────────────────────────────────
+
+WAVE_CHAMBER_W = 712       # 主視窗 chamber canvas 寬（像素）——46 bar 在此寬度
+                           # 下每根 ≈13.5px，比例才對（280px 下只有 4.1px）
+WAVE_CHAMBER_H = 160       # 主視窗 chamber canvas 高（像素）
+
+# 處理態掠掃光帶：接不上真實進度時的等速 fallback 週期（見 _processing_sweep_progress）
+# 閒置行波振幅重映射（Aperture 2z：閒置地板 1.6%→4.6%）。
+#   引擎的地板公式 0.016 + 0.014×sin 給的是 1.6%→3.0%（那是參考實作的
+#   **錄音態**「bar 不歸零」地板）。閒置態要更明顯的呼吸感，所以在 gui 的
+#   idle 分支把 swing 放大：0.016 + (v−0.016) × (0.030/0.014) → 1.6%→4.6%。
+WAVE_IDLE_BASE        = 0.016
+WAVE_IDLE_SWING_SCALE = 0.030 / 0.014   # ≈ 2.143
+
+PROCESS_SWEEP_CYCLE_MS = 1900.0
+# 光帶前緣「亮帶」半寬，單位是 bar index（1.0 = 前後各約 1 根 bar 的亮區）
+PROCESS_SWEEP_BAND_HALF_BARS = 1.0
 
 
 def _draw_spectral_bars(
@@ -274,6 +300,130 @@ def _draw_spectral_bars(
         canvas.create_rectangle(
             0, cy + max_h + 0.1, width, cy + max_h + 1.2, fill=clip_color, outline=""
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  三態統一繪圖函式（v2.27.0）── 主視窗 Ambient Chamber 專用
+#  「三態不是三個畫面，是同一個儀表的三種讀數」：idle／recording／processing
+#  共用同一個 canvas、同一份 46 bar 幾何（bar_w／cy／max_h）、同一支
+#  create_rectangle 繪製流程。三態差異完全收斂成兩個參數（values 高度來源、
+#  color_fn 顏色查表），peaks/clipping/highlight 只有 recording 態會用到。
+#
+#  注意：這支函式**不是** _draw_spectral_bars 的取代品——後者是 Mini HUD
+#  （13 bar 極簡波形）專用，兩者刻意保持獨立、互不相依，避免這裡的三態
+#  統一改動波及已經做完的 Mini HUD（v2.25.0）。
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _draw_aperture_bars(
+    canvas: "tk.Canvas",
+    n_bars: int,
+    width: int,
+    height: int,
+    values: list,
+    color_fn,
+    *,
+    big: bool = True,
+    show_highlight: bool = True,
+    peaks: Optional[list] = None,
+    clipping: bool = False,
+    elapsed_ms: float = 0.0,
+) -> None:
+    """主視窗 chamber 三態統一繪圖：同一份 bar 幾何、同一套 fill 邏輯。
+
+    Args:
+        values: 長度 n_bars、每根 bar 的高度比例 0..1。idle／recording 讀
+            WaveformEngine 的即時 bars；processing 讀「錄音剛結束那一刻」
+            的凍結快照（不再呼叫 engine.update()）。
+        color_fn: (i, v) -> hex 色碼，呼叫端決定顏色語意（idle_color／
+            energy_color 依振幅查表；processing 依「有沒有被光帶掃到」）。
+            回傳的是查表後的「原色」，blend() 混色統一在這支函式內做一次，
+            不需要呼叫端各自處理。
+        peaks / clipping: 只有 recording 態會傳非 None／True；idle／
+            processing 天生沒有這兩個概念，呼叫端留預設值即可。
+        show_highlight: 白色鏡面高光（v > 0.22）只有 recording 態開啟——
+            idle／processing 刻意關閉，維持設計要求的「乾淨、不搶戲」。
+
+    呼叫端須自行先 canvas.delete("all")。
+    """
+    n = n_bars
+    bar_w = max(2.0, (width - (n - 1) * WAVE_GAP) / n)
+    cy = height / 2.0
+    margin = 10.0 if big else 3.0
+    max_h = height / 2.0 - margin
+
+    for i in range(n):
+        x0 = i * (bar_w + WAVE_GAP)
+        x1 = x0 + bar_w
+
+        v = values[i]
+        h = max(1.2, v * max_h)
+        color = blend(color_fn(i, v), SURF_1, WAVE_CORE_ALPHA)
+        canvas.create_rectangle(x0, cy - h, x1, cy + h, fill=color, outline="")
+
+        if show_highlight and v > 0.22 and not _IS_LIGHT_THEME:
+            hi_alpha = min(0.6, (v - 0.22) * 1.3)
+            hi_color = blend("#FFFFFF", SURF_1, hi_alpha)
+            canvas.create_rectangle(
+                x0, cy - 0.6, x1, cy + 0.6, fill=hi_color, outline=""
+            )
+
+        if big and peaks is not None and peaks[i] > 0.08:
+            ph = peaks[i] * max_h
+            peak_color = blend(energy_color(peaks[i]), SURF_1, 0.42)
+            canvas.create_rectangle(
+                x0, cy - ph - 2.4, x1, cy - ph - 0.6, fill=peak_color, outline=""
+            )
+            canvas.create_rectangle(
+                x0, cy + ph + 0.6, x1, cy + ph + 2.4, fill=peak_color, outline=""
+            )
+
+    if clipping:
+        alpha = 0.35 + 0.35 * (0.5 + 0.5 * math.sin(elapsed_ms * 0.012))
+        clip_color = blend(WARN, SURF_1, alpha)
+        canvas.create_rectangle(
+            0, cy - max_h - 1.2, width, cy - max_h - 0.1, fill=clip_color, outline=""
+        )
+        canvas.create_rectangle(
+            0, cy + max_h + 0.1, width, cy + max_h + 1.2, fill=clip_color, outline=""
+        )
+
+
+def _processing_sweep_progress(elapsed_ms: float, use_real: bool, known_frac: float) -> float:
+    """處理態掠掃光帶的位置，0（最左）→1（最右）。
+
+    真實進度（use_real=True）：直接回 known_frac——這是 LocalAgreement-2
+    在錄音期間就已經 commit 的邊界（哪段兩輪 ASR 都同意），不是估的。
+    只有「這次錄音真的走過 LA 路徑、而且已經 commit 過東西」才會是 True，
+    見呼叫端 _transition_to_processing 怎麼決定。
+
+    等速 fallback（use_real=False）：fixed_chunk 路徑，或錄音太短、LA 從
+    沒機會 commit 過任何東西（一次轉完），接不上真實進度就不硬湊——退回
+    週期 PROCESS_SWEEP_CYCLE_MS 的等速掠掃，无限循環（不知道還要處理多久，
+    用循環動畫表示「還在跑」比停在一個假數字誠實）。
+    """
+    if use_real:
+        return 0.0 if known_frac < 0.0 else 1.0 if known_frac > 1.0 else known_frac
+    cycle_pos = elapsed_ms % PROCESS_SWEEP_CYCLE_MS
+    return cycle_pos / PROCESS_SWEEP_CYCLE_MS
+
+
+def _processing_bar_color(i: int, v: float, n_bars: int, progress: float) -> str:
+    """處理態單一 bar 的顏色：光帶前緣最亮、已掃過的依振幅上色、還沒掃到的 WAVE_DIM。
+
+    progress（0..1，見 _processing_sweep_progress）換算成 bar-index 空間的
+    連續位置 sweep_idx，跟每根 bar 的中心比較距離，分三段：
+      還沒掃到（bar 中心在 sweep_idx 前緣之後）        → WAVE_DIM（扁平中性灰）
+      光帶前緣（±PROCESS_SWEEP_BAND_HALF_BARS 內）      → process_color(1.0)（最亮）
+      已經掃過（bar 中心在 sweep_idx 後緣之前）          → process_color(v)（依凍結
+                                                            振幅取色，保留輪廓資訊）
+    """
+    sweep_idx = progress * n_bars
+    center = i + 0.5
+    if center > sweep_idx + PROCESS_SWEEP_BAND_HALF_BARS:
+        return WAVE_DIM
+    if center > sweep_idx - PROCESS_SWEEP_BAND_HALF_BARS:
+        return process_color(1.0)
+    return process_color(v)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -545,6 +695,16 @@ class AppWindow(ctk.CTkFrame):
     _pipeline_polish_mode = "blocking"     # v2.18.2
     _hotkey_health_tick_count = 0
     _last_ping_at = None
+
+    # v2.27.0 三態統一：同上緣故的 class-level 防禦性 net。_transition_to_processing
+    # 會讀 self._wave_engine / self._proc_sweep_* 決定要不要凍結 bars 快照與
+    # 掠掃光帶進度；bare stub（AppWindow.__new__）沒跑過 _build_record_card
+    # 就不會有這些 instance attr，靠這裡的 class default 補上、避免撞
+    # AttributeError（呼應本區塊上面 v2.21.0 的既有慣例）。
+    _wave_engine = None
+    _frozen_bars = None
+    _proc_sweep_use_real = False
+    _proc_sweep_known_frac = 0.0
 
     def __init__(self, master: ctk.CTk, cfg: Config) -> None:
         super().__init__(master, fg_color=BG, corner_radius=0)
@@ -915,10 +1075,19 @@ class AppWindow(ctk.CTkFrame):
         )
         card.pack(fill="x", padx=SPACE_LG, pady=(SPACE_MD + 2, SPACE_SM - 2))
 
+        # v2.27.0 三態統一：canvas 尺寸依 record_visual 決定——bar 模式（預設）
+        # 用 712×160 寬條；chamber 逃生門維持舊 280×280 正方形（舊三態光場的
+        # 同心圓／粒子環比例只在正方形下才對）。self._wave_visual 是這支
+        # AppWindow 唯一的模式旗標，下面 engine 建立、_draw_chamber 分派、
+        # _in_disc 熱區計算都共用它，避免同一個 getattr 判斷散落多處。
+        self._wave_visual = getattr(self.cfg, "record_visual", "waveform") != "chamber"
+        self._chamber_w = WAVE_CHAMBER_W if self._wave_visual else CHAMBER_SIZE
+        self._chamber_h = WAVE_CHAMBER_H if self._wave_visual else CHAMBER_SIZE
+
         # Ambient chamber — single canvas replacing waveform + outer ring + button
         self._chamber = tk.Canvas(
             card,
-            width=CHAMBER_SIZE, height=CHAMBER_SIZE,
+            width=self._chamber_w, height=self._chamber_h,
             bg=SURF_1, highlightthickness=0, bd=0,
         )
         self._chamber.pack(pady=(SPACE_MD, SPACE_XS))
@@ -975,11 +1144,19 @@ class AppWindow(ctk.CTkFrame):
             getattr(self.cfg, "reduce_motion_pref", "auto")
         )
 
-        # v2.25.0 Aperture 波形視覺：cfg.record_visual == "chamber" 時完全
-        # 不建立（逃生門，新程式碼路徑一行都不執行）
+        # v2.25.0 Aperture 波形視覺 / v2.27.0 三態統一：cfg.record_visual ==
+        # "chamber" 時完全不建立（逃生門，新程式碼路徑一行都不執行）。
+        # engine 現在橫跨 idle／recording／processing 三態共用、永遠不會被
+        # reset 以外的方式重建（「沒有任何元件被建立或銷毀」）。
         self._wave_engine: Optional[WaveformEngine] = None
-        self._wave_last_tick = 0.0
-        if getattr(self.cfg, "record_visual", "waveform") != "chamber":
+        self._wave_last_tick = time.perf_counter()
+        # processing 態的凍結快照（_transition_to_processing 存最後一幀
+        # engine.bars）；idle／recording 不讀這個欄位。
+        self._frozen_bars: Optional[list] = None
+        # processing 態掠掃光帶是否餵真實 LA 進度（見 _processing_sweep_progress）
+        self._proc_sweep_use_real = False
+        self._proc_sweep_known_frac = 0.0
+        if self._wave_visual:
             self._wave_engine = WaveformEngine(n_bars=WAVE_N_BARS_MAIN)
 
         # 啟動渲染迴圈（在視窗存活期間持續執行，每 50ms 更新一次 Canvas）
@@ -1382,6 +1559,12 @@ class AppWindow(ctk.CTkFrame):
         self._state            = "processing"
         self._state_start_time = time.perf_counter()
 
+        # v2.27.0 三態統一：凍結最後一幀 engine.bars 快照，處理態畫「剛剛
+        # 那段錄音的輪廓」不再繼續 update() engine（bars 屬性本身就回複本，
+        # 這裡存的是獨立 list、不受後續 idle 態 update() 影響）。
+        if self._wave_engine is not None:
+            self._frozen_bars = self._wave_engine.bars
+
         # Pipeline timing 起點：按下結束熱鍵 / 點停止按鈕的這一瞬間。
         # 從這裡開始算「使用者等多久才看到貼上的字」。
         self._pipeline_t0            = self._state_start_time
@@ -1463,6 +1646,22 @@ class AppWindow(ctk.CTkFrame):
             except Exception:
                 log_error("la_final_add_audio_failed")
             self._start_la_finalize()
+
+        # v2.27.0 三態統一：處理態掠掃光帶盡量餵真實進度。只有「這次錄音真的
+        # 走過 LA 路徑、而且錄音期間已經 commit 過東西」才算數——LA 沒機會
+        # commit（fixed_chunk 模式、或錄音太短一次轉完）就誠實退回等速掠掃，
+        # 不硬湊假進度（見 _processing_sweep_progress docstring）。
+        self._proc_sweep_use_real = False
+        self._proc_sweep_known_frac = 0.0
+        if self._la_buffer is not None:
+            try:
+                total_s = self._la_buffer.buffer_seconds
+                committed_s = self._la_buffer.committed_audio_end_s
+                if total_s > 0 and committed_s > 0:
+                    self._proc_sweep_use_real = True
+                    self._proc_sweep_known_frac = committed_s / total_s
+            except Exception:
+                pass
 
         # v2.20.3 N3：把背景 ASR thread 起點記成一個 milestone。
         # 跟 hotkey_release 的差距 ≈「錄音收尾 + UI 切狀態 + thread spin-up」。
@@ -2660,7 +2859,9 @@ class AppWindow(ctk.CTkFrame):
             pass
 
         if success:
-            self._show_toast(f"⌨  已貼入 {target}")
+            # v2.27.0：綠色語意收窄後唯一的落點——這是真正的成功事件。
+            # 900ms（比預設 2800ms 短）：只是一個確認回饋，不需要長時間佔著畫面。
+            self._show_toast(f"⌨  已貼入 {target}", color=SUCCESS, duration_ms=900)
         else:
             self._show_toast("⌨  自動貼上失敗（請確認輔助使用權限）")
         # Pipeline 終點：emit 完整 timing summary（不論成功 / 失敗都要記）
@@ -2896,36 +3097,87 @@ class AppWindow(ctk.CTkFrame):
 
         self.after(tick, self._render_tick)
 
-    def _draw_chamber_waveform(self) -> None:
-        """錄音態的 Aperture 波形視覺（46 bar Spectral Bands）。
+    def _draw_chamber_bars(self) -> None:
+        """三態統一的 Aperture bar 視覺（46 bar，idle／recording／processing 共用）。
 
         只在 cfg.record_visual != "chamber" 時被 _draw_chamber() 呼叫（逃生
-        門）。取代舊三態光場錄音態的紅色脈衝＋漣漪；idle／processing 兩態
-        與 chamber 模式完全不受影響，見 _draw_chamber() 開頭的 early return。
+        門）。同一個 canvas、同一份 46 bar 幾何、同一支 _draw_aperture_bars()，
+        三態的差異只在「bar 高度從哪來」與「顏色怎麼查」：
+
+          idle       —— engine 用 rms=0 持續 update()，bars 落在行波地板附近
+                        （呼吸律動），顏色查 idle_color（無彩度）。
+          recording  —— engine 用麥克風 RMS 持續 update()（v2.25.0 已完成），
+                        顏色查 energy_color（能量色溫）。
+          processing —— 不再呼叫 update()，直接讀「錄音剛結束那一刻」的
+                        凍結快照 self._frozen_bars；顏色依「有沒有被掠掃
+                        光帶掃到」決定（process_color 三級亮度 / WAVE_DIM）。
         """
         now = time.perf_counter()
         c   = self._chamber
         c.delete("all")
 
-        rms = self.recorder.get_rms_level() if self.recorder.is_recording() else 0.0
-        dt_ms = max(0.0, (now - self._wave_last_tick) * 1000.0)
-        self._wave_last_tick = now
-        self._wave_engine.update(rms, dt_ms)
-
+        state = self._state
         elapsed_ms = (now - self._state_start_time) * 1000.0
-        _draw_spectral_bars(
-            c, self._wave_engine,
-            width=CHAMBER_SIZE, height=CHAMBER_SIZE,
-            elapsed_ms=elapsed_ms, big=True,
+
+        if state == "processing":
+            values = self._frozen_bars if self._frozen_bars is not None \
+                else [0.0] * WAVE_N_BARS_MAIN
+            progress = _processing_sweep_progress(
+                elapsed_ms, self._proc_sweep_use_real, self._proc_sweep_known_frac,
+            )
+
+            def color_fn(i, v, _progress=progress):
+                return _processing_bar_color(i, v, WAVE_N_BARS_MAIN, _progress)
+
+            peaks, clipping, show_highlight = None, False, False
+        else:
+            rms = (
+                self.recorder.get_rms_level()
+                if state == "recording" and self.recorder.is_recording()
+                else 0.0
+            )
+            dt_ms = max(0.0, (now - self._wave_last_tick) * 1000.0)
+            self._wave_last_tick = now
+            self._wave_engine.update(rms, dt_ms)
+            values = self._wave_engine.bars
+
+            if state == "recording":
+                color_fn = lambda i, v: energy_color(v)  # noqa: E731
+                peaks, clipping, show_highlight = (
+                    self._wave_engine.peaks, self._wave_engine.clipping, True,
+                )
+            else:  # idle
+                # 閒置行波振幅：把引擎的「錄音態地板」1.6%→3.0% 線性映射到
+                #   設計規格的閒置範圍 1.6%→4.6%（Aperture 第二輪 2z 表格）。
+                #   為什麼不改引擎公式：那條 0.016 + 0.014×sin 是參考實作給
+                #   **錄音態**用的「bar 不歸零」地板，兩者用途不同；改引擎會
+                #   連帶動到錄音態的視覺。只在 idle 分支重映射最外科手術。
+                #   注意 max(0.0, ...)：引擎在衰減期 bar 會短暫低於地板值，
+                #   直接放大會變負數（實測 -0.82%）。只放大「高於地板」的部分。
+                values = [
+                    WAVE_IDLE_BASE
+                    + max(0.0, v - WAVE_IDLE_BASE) * WAVE_IDLE_SWING_SCALE
+                    for v in values
+                ]
+                color_fn = lambda i, v: idle_color(v)  # noqa: E731
+                peaks, clipping, show_highlight = None, False, False
+
+        _draw_aperture_bars(
+            c, WAVE_N_BARS_MAIN, self._chamber_w, self._chamber_h,
+            values, color_fn,
+            big=True, show_highlight=show_highlight,
+            peaks=peaks, clipping=clipping,
+            elapsed_ms=elapsed_ms,
         )
 
     def _draw_chamber(self) -> None:
         """Render ambient rings + central disc + icon for the current state."""
-        # v2.25.0 Aperture 波形：錄音態改走 bar 視覺（逃生門 cfg.record_visual）。
-        # early return 讓 idle／processing 與 chamber 模式的 recording 完全
-        # 沿用下面原本的程式碼，不受影響、不用改動任何既有分支。
-        if self._state == "recording" and self._wave_engine is not None:
-            self._draw_chamber_waveform()
+        # v2.27.0 三態統一：bar 模式時 idle／recording／processing 三態全部
+        # 走 _draw_chamber_bars()（同一個 canvas、同一支繪圖函式）。early
+        # return 讓 cfg.record_visual == "chamber" 逃生門完全沿用下面原本
+        # 的舊三態光場程式碼，一行新程式碼都不執行。
+        if self._wave_engine is not None:
+            self._draw_chamber_bars()
             return
 
         now = time.perf_counter()
@@ -3070,9 +3322,16 @@ class AppWindow(ctk.CTkFrame):
     # ── Canvas event handlers ────────────────────────────────────────────
 
     def _in_disc(self, x: int, y: int) -> bool:
-        """以畢氏定理判斷座標是否落在中央圓盤內（半徑 DISC_RADIUS）。"""
-        dx = x - CHAMBER_CENTER
-        dy = y - CHAMBER_CENTER
+        """以畢氏定理判斷座標是否落在可點擊熱區內（半徑 DISC_RADIUS，圓心
+        永遠是目前 canvas 的正中央）。
+
+        v2.27.0：三態統一後 canvas 寬高依模式不同（bar 模式 712×160、chamber
+        逃生門 280×280），熱區圓心不能再寫死 CHAMBER_CENTER——改用實際
+        self._chamber_w / _chamber_h 算中心。chamber 模式數值不變
+        （280/2 = 140 = CHAMBER_CENTER），行為 100% 相容、無回歸。
+        """
+        dx = x - self._chamber_w / 2
+        dy = y - self._chamber_h / 2
         return dx * dx + dy * dy <= DISC_RADIUS * DISC_RADIUS
 
     def _on_chamber_enter(self, event) -> None:
@@ -4737,12 +4996,19 @@ class AppWindow(ctk.CTkFrame):
             return ""
         return "\n\n".join(b.get_current_text() for b in self._utterance_blocks)
 
-    def _show_toast(self, message: str) -> None:
-        """在視窗右下角顯示一個浮動 toast，2.8 秒後自動消失。"""
+    def _show_toast(
+        self, message: str, color: Optional[str] = None, duration_ms: int = 2800,
+    ) -> None:
+        """在視窗右下角顯示一個浮動 toast，duration_ms 毫秒後自動消失。
+
+        v2.27.0：綠色（SUCCESS）語意收窄後只留給「真正的成功事件」——目前
+        唯一的落點是自動貼上成功。color 給定時 toast 邊框改該色搭配較短
+        的 duration_ms；其餘呼叫端不傳就是原本的中性樣式，不受影響。
+        """
         toast = ctk.CTkFrame(
             self, corner_radius=10,
             fg_color=SURF_2,
-            border_width=1, border_color=SURF_3,
+            border_width=1, border_color=(color or SURF_3),
         )
         ctk.CTkLabel(
             toast, text=message,
@@ -4750,7 +5016,7 @@ class AppWindow(ctk.CTkFrame):
             text_color=TEXT_1, padx=18, pady=10,
         ).pack()
         toast.place(relx=1.0, rely=1.0, x=-20, y=-52, anchor="se")
-        self.after(2800, toast.destroy)
+        self.after(duration_ms, toast.destroy)
 
     def on_close(self) -> None:
         """視窗關閉時：停止 pynput 監聽器、錄音、清 Cocoa observer，避免資源洩漏。
@@ -4817,12 +5083,29 @@ class AppWindow(ctk.CTkFrame):
 class SettingsWindow(ctk.CTkToplevel):
     """設定視窗（modal）。
 
-    涵蓋語音辨識（模型 / 語言）、快捷鍵重新綁定、輸出偏好
-    （追加 / 自動複製 / 自動貼上）、AI 潤飾（Ollama）、
-    情境路由（Phase 2 preset）、個人字典（#4）等所有設定項目。
+    資訊架構（v2.28.0 重排）：兩層——側欄 6 分類（錄音／辨識／輸出／外觀／
+    資料／關於，對應「錄音→辨識→輸出」主流程 + 3 個非流程類）× 每類最多
+    5 列；最上面一個搜尋框可直接跳到任一列並高亮。AI 潤飾裡較深的欄位
+    （Ollama 模型／Vertex AI／情境路由／Prompt 熱重載）收進「進階設定」
+    對話框，主頁面維持不捲動。
 
     使用者按「儲存」時呼叫 on_save_cb(new_cfg)；按「取消」不修改原 cfg。
     """
+
+    _WIN_W = 840
+    _WIN_H = 680
+    _SIDEBAR_W = 172
+    _LEVEL_METER_W = 460
+    _LEVEL_METER_H = 56
+    # (分類 key, 側欄顯示文字, icons.py 圖示名稱) —— 順序即側欄由上到下順序
+    _CATEGORIES = (
+        ("recording",  "錄音", "mic"),
+        ("stt",        "辨識", "sparkles"),
+        ("output",     "輸出", "keyboard"),
+        ("appearance", "外觀", "settings"),
+        ("data",       "資料", "folder"),
+        ("about",      "關於", "file-text"),
+    )
 
     def __init__(self, parent, cfg: Config, on_save_cb) -> None:
         """初始化設定視窗，深拷貝 cfg 以避免使用者取消時汙染原始設定。"""
@@ -4831,707 +5114,95 @@ class SettingsWindow(ctk.CTkToplevel):
         self.cfg         = Config(**cfg.__dict__)  # 深拷貝：取消時不修改原 cfg
         self._on_save_cb = on_save_cb
         self.title("設定")
-        self.geometry("440x580")
+        self.geometry(f"{self._WIN_W}x{self._WIN_H}")
         self.resizable(False, False)
         self.configure(fg_color=BG)
+
+        # ── 搜尋 + 分類導覽狀態（v2.28.0 兩層 IA 重排）────────────────────────
+        self._row_frames: dict[str, ctk.CTkFrame] = {}       # row_id → outer frame（搜尋高亮用）
+        self._search_index: dict[str, tuple[str, str]] = {}  # 關鍵字 → (category, row_id)
+        self._nav_buttons: dict[str, ctk.CTkButton] = {}
+        self._pages: dict[str, ctk.CTkFrame] = {}
+        self._active_category: Optional[str] = None
+
+        # ── 輸入電平即時表（「錄音」分類唯一 Canvas；只在該頁可見時才跑）───────
+        self._level_engine = WaveformEngine(n_bars=WAVE_N_BARS_MAIN)
+        self._level_canvas: Optional[tk.Canvas] = None
+        self._level_stream = None            # 獨立於 AudioRecorder 的最小 sd.InputStream
+        self._level_stream_failed = False    # 本次停留該頁期間已失敗過一次，別狂 retry
+        self._level_after_id: Optional[str] = None
+        self._level_rms = 0.0
+        self._level_last_tick = 0.0
+        self._level_state_start = 0.0
+        self.bind("<Destroy>", self._on_window_destroyed)
+
         self.grab_set()
         self._build()
 
     def _build(self) -> None:
-        """建立所有設定 section 的 UI 元件與底部儲存 / 取消按鈕。"""
-        scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        scroll.pack(fill="both", expand=True)
-
-        def section(title: str) -> ctk.CTkFrame:
-            ctk.CTkLabel(
-                scroll, text=title.upper(),
-                font=ctk.CTkFont("SF Pro Text", 11),
-                text_color=TEXT_3, anchor="w",
-            ).pack(fill="x", padx=20, pady=(22, 6))
-            f = ctk.CTkFrame(
-                scroll, corner_radius=12,
-                fg_color=SURF_1,
-            )
-            f.pack(fill="x", padx=SPACE_LG, pady=(0, 4))
-            return f
-
-        def row(parent, label: str, widget_fn) -> None:
-            r = ctk.CTkFrame(parent, fg_color="transparent", height=50)
-            r.pack(fill="x", padx=SPACE_LG, pady=2)
-            r.pack_propagate(False)
-            ctk.CTkLabel(
-                r, text=label, anchor="w",
-                font=ctk.CTkFont("SF Pro Text", 14),
-                text_color=TEXT_1,
-            ).pack(side="left")
-            widget_fn(r)
-
-        def sep_line(parent) -> None:
-            ctk.CTkFrame(parent, height=1, fg_color=SURF_3).pack(
-                fill="x", padx=SPACE_LG, pady=0
-            )
-
-        # ── 外觀（v2.6.0）── 放第一個 section 最顯眼位置 ─────────────────
-        # 點 chip → 跟現在不同就彈 confirm dialog → 確認 → 立刻 save + 重啟。
-        # 不跟其他設定一起等 Save 按鈕，因為重啟需要立即動作（plan §「Restart UX 流程」）。
-        ap = section("外觀")
-        self._theme_var = ctk.StringVar(value=self.cfg.theme)
-
-        def theme_row(r):
-            wrap = ctk.CTkFrame(r, fg_color="transparent")
-            wrap.pack(side="right")
-            # 兩顆 segmented chip：深色 / 淺色
-            self._theme_btns: dict[str, ctk.CTkButton] = {}
-            for value, label in (("dark", "深色"), ("light", "淺色")):
-                btn = ctk.CTkButton(
-                    wrap, text=label,
-                    width=72, height=30, corner_radius=8,
-                    font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
-                    border_width=1,
-                    command=lambda v=value: self._on_theme_clicked(v),
-                )
-                btn.pack(side="left", padx=(0, 4))
-                self._theme_btns[value] = btn
-            self._apply_theme_chip_style()
-
-        row(ap, "主題", theme_row)
-        ctk.CTkLabel(
-            ap,
-            text=(
-                "深色：zinc + cyan（目前預設）\n"
-                "淺色：暖白 + Claude 珊瑚（v2.6.0 新增）\n"
-                "切換需重新啟動 App（~2 秒、自動完成）"
-            ),
-            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
-            text_color=TEXT_3,
-            justify="left", anchor="w",
-        ).pack(anchor="w", padx=SPACE_LG, pady=(0, 10))
-
-        # A3（v2.7.0）：動態效果 3-way segmented（auto / always / never）
-        self._reduce_motion_var = ctk.StringVar(
-            value=getattr(self.cfg, "reduce_motion_pref", "auto")
-        )
-
-        def reduce_motion_row(r):
-            wrap = ctk.CTkFrame(r, fg_color="transparent")
-            wrap.pack(side="right")
-            self._reduce_motion_btns: dict[str, ctk.CTkButton] = {}
-            for value, label in (
-                ("auto", "跟系統"),
-                ("always", "減少動態"),
-                ("never", "完整動畫"),
-            ):
-                btn = ctk.CTkButton(
-                    wrap, text=label,
-                    width=78, height=30, corner_radius=8,
-                    font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
-                    border_width=1,
-                    command=lambda v=value: self._on_reduce_motion_clicked(v),
-                )
-                btn.pack(side="left", padx=(0, 4))
-                self._reduce_motion_btns[value] = btn
-            self._apply_reduce_motion_chip_style()
-
-        row(ap, "動態效果", reduce_motion_row)
-        ctk.CTkLabel(
-            ap,
-            text=(
-                "跟系統：依 macOS「減少動態效果」偏好（推薦）\n"
-                "減少動態：強制關閉呼吸光圈／粒子環旋轉／漣漪\n"
-                "完整動畫：永遠跑完整動畫（即使系統開了 reduce motion）"
-            ),
-            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
-            text_color=TEXT_3,
-            justify="left", anchor="w",
-        ).pack(anchor="w", padx=SPACE_LG, pady=(0, 10))
-
-        # ── 語音辨識 ──────────────────────────────────────────────────────
-        stt = section("語音辨識")
-        self._model_var = ctk.StringVar(value=self.cfg.model)
-
-        def model_row(r):
-            ctk.CTkOptionMenu(
-                r, values=list(MODEL_INFO.keys()),
-                variable=self._model_var,
-                width=148, height=30, corner_radius=8,
-                fg_color=SURF_2, button_color=SURF_2,
-                button_hover_color=SURF_3,
-                dropdown_fg_color=SURF_1,
-                text_color=TEXT_1,
-                font=ctk.CTkFont("SF Pro Text", 13),
-                command=self._on_model_preview,
-            ).pack(side="right")
-
-        row(stt, "模型大小", model_row)
-        self._model_desc = ctk.CTkLabel(
-            stt, text=MODEL_INFO.get(self.cfg.model, ""),
-            font=ctk.CTkFont("SF Pro Text", 11),
-            text_color=TEXT_3,
-            wraplength=380, anchor="w",
-        )
-        self._model_desc.pack(fill="x", padx=SPACE_LG, pady=(0, 10))
-        sep_line(stt)
-
-        self._lang_var = ctk.StringVar(value=self.cfg.language)
-
-        def lang_row(r):
-            ctk.CTkOptionMenu(
-                r, values=list(LANGUAGE_OPTIONS.keys()),
-                variable=self._lang_var,
-                width=112, height=30, corner_radius=8,
-                fg_color=SURF_2, button_color=SURF_2,
-                button_hover_color=SURF_3,
-                dropdown_fg_color=SURF_1,
-                text_color=TEXT_1,
-                font=ctk.CTkFont("SF Pro Text", 13),
-            ).pack(side="right")
-
-        row(stt, "辨識語言", lang_row)
-        sep_line(stt)
-
-        # ── 麥克風來源（F1 / v2.12.0）────────────────────────────────────
-        # 列出本機所有有輸入聲道的音訊裝置（含實體 + 虛擬如 BlackHole / Loopback 等）
-        # 第一筆固定為「（系統預設）」對應 input_device=None。
-        from recorder import AudioRecorder as _AR
-        try:
-            # v2.21.0 Phase M：用 app window 的 recorder.refresh_portaudio() 重新初始化
-            #   PortAudio 拿「最新」裝置清單——這樣插了新麥克風只要開設定就看得到、
-            #   不必重啟整個 App（PortAudio 啟動時會把清單拍快照、不 re-init 看不到新裝置）。
-            #   錄音中 refresh_portaudio 會自動跳過（回舊快照）。拿不到 recorder 就退回 static。
-            _rec = getattr(self.master, "recorder", None)
-            if _rec is not None and hasattr(_rec, "refresh_portaudio"):
-                self._available_devices = _rec.refresh_portaudio()
-            else:
-                self._available_devices = _AR.list_devices()
-        except Exception:
-            self._available_devices = []
-            log_error("settings_list_devices_failed")
-        # dropdown 顯示清單：先放「系統預設」，後面是各裝置名
-        self._device_values = ["（系統預設）"] + [d["name"] for d in self._available_devices]
-        # 初始選擇：cfg.input_device 對應的 device 名（找不到就回預設）
-        _current_dev = self.cfg.input_device
-        if _current_dev and _current_dev in (d["name"] for d in self._available_devices):
-            initial = _current_dev
-        else:
-            initial = "（系統預設）"
-        self._device_var = ctk.StringVar(value=initial)
-
-        def device_row(r):
-            ctk.CTkOptionMenu(
-                r, values=self._device_values,
-                variable=self._device_var,
-                width=240, height=30, corner_radius=8,
-                fg_color=SURF_2, button_color=SURF_2,
-                button_hover_color=SURF_3,
-                dropdown_fg_color=SURF_1,
-                text_color=TEXT_1,
-                font=ctk.CTkFont("SF Pro Text", 13),
-            ).pack(side="right")
-
-        row(stt, "麥克風來源", device_row)
-        ctk.CTkLabel(
-            stt,
-            text=f"偵測到 {len(self._available_devices)} 個輸入裝置；「系統預設」會跟隨 macOS 設定。",
-            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
-            text_color=TEXT_3,
-            justify="left", anchor="w",
-        ).pack(anchor="w", padx=SPACE_LG, pady=(0, 10))
-
-        # ── 快捷鍵 ────────────────────────────────────────────────────────
-        hk = section("快捷鍵")
-        hk_row = ctk.CTkFrame(hk, fg_color="transparent", height=52)
-        hk_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
-        hk_row.pack_propagate(False)
-
-        ctk.CTkLabel(
-            hk_row, text="全域快捷鍵", anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
-        ).pack(side="left")
-
-        hk_r = ctk.CTkFrame(hk_row, fg_color="transparent")
-        hk_r.pack(side="right")
-
-        self._hk_label = ctk.CTkLabel(
-            hk_r, text=format_hotkey(self.cfg.hotkey),
-            font=ctk.CTkFont("SF Pro Text", 13, "bold"),
-            fg_color=SURF_2, text_color=TEXT_1,
-            corner_radius=8, padx=SPACE_MD, pady=SPACE_XS,
-        )
-        self._hk_label.pack(side="left", padx=(0, 8))
-
-        ctk.CTkButton(
-            hk_r, text="重新綁定", width=80, height=28, corner_radius=8,
-            fg_color=ACCENT_BG,
-            hover_color=ACCENT,
-            border_width=1, border_color=ACCENT,
-            text_color=ACCENT_HV,
-            font=ctk.CTkFont("SF Pro Text", 12),
-            command=self._rebind_hotkey,
-        ).pack(side="left")
-
-        # ── 輸出偏好 ──────────────────────────────────────────────────────
-        out = section("輸出偏好")
-        self._append_var    = ctk.BooleanVar(value=self.cfg.append_results)
-        self._autocopy_var  = ctk.BooleanVar(value=self.cfg.auto_copy)
-        self._autopaste_var = ctk.BooleanVar(value=self.cfg.auto_paste)
-
-        sw_style = dict(
-            progress_color=ACCENT,
-            button_color=TEXT_1,
-            button_hover_color=TEXT_2,
-            fg_color=SURF_3,
-        )
-
-        def make_sw(var, accent=None):
-            s = dict(sw_style)
-            if accent:
-                s["progress_color"] = accent
-            def fn(r):
-                ctk.CTkSwitch(r, text="", variable=var,
-                              onvalue=True, offvalue=False, **s).pack(side="right")
-            return fn
-
-        row(out, "追加錄音結果", make_sw(self._append_var))
-        sep_line(out)
-        row(out, "轉錄後自動複製", make_sw(self._autocopy_var))
-        sep_line(out)
-        row(out, "語音轉文字後自動貼上 ⌨", make_sw(self._autopaste_var, INDIGO))
-
-        # ── AI 潤飾 ───────────────────────────────────────────────────────
-        ai = section("AI 潤飾")
-
-        # v2.18.0：polish backend 三選一（地端 Ollama / Vertex AI / 關閉）
-        # 之前 user 切後端要手動編 ~/.whisper_app/config.json，現在 UI 直接給。
-        self._polish_backend_var = ctk.StringVar(
-            value=getattr(self.cfg, "polish_backend", "local")
-        )
-
-        def backend_row(r):
-            wrap = ctk.CTkFrame(r, fg_color="transparent")
-            wrap.pack(side="right")
-            self._polish_backend_btns: dict[str, ctk.CTkButton] = {}
-            # v2.19.x：加 Hybrid 第 4 chip（rule + pinyin guard + optional Gemini）
-            # 寬度從 92 縮到 78、4 chip 才放得下
-            for value, label in (
-                ("local",  "地端 Ollama"),
-                ("vertex", "Vertex AI"),
-                ("hybrid", "Hybrid"),
-                ("off",    "關閉"),
-            ):
-                btn = ctk.CTkButton(
-                    wrap, text=label,
-                    width=78, height=30, corner_radius=8,
-                    font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
-                    border_width=1,
-                    command=lambda v=value: self._on_polish_backend_clicked(v),
-                )
-                btn.pack(side="left", padx=(0, 4))
-                self._polish_backend_btns[value] = btn
-            self._apply_polish_backend_chip_style()
-
-        row(ai, "Polish 後端", backend_row)
-        sep_line(ai)
-
-        # ── Vertex AI Gemini 設定（僅 backend="vertex" 時顯示）────────────
-        self._vertex_frame = ctk.CTkFrame(ai, fg_color="transparent")
-        # 注意：先建好不 pack，由 _apply_polish_backend_chip_style 控制顯隱
-
-        # GCP Project ID
-        vp_row = ctk.CTkFrame(self._vertex_frame, fg_color="transparent", height=52)
-        vp_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
-        vp_row.pack_propagate(False)
-        ctk.CTkLabel(
-            vp_row, text="GCP Project ID", anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
-        ).pack(side="left")
-        self._vertex_project_id_var = ctk.StringVar(
-            value=getattr(self.cfg, "vertex_project_id", "")
-        )
-        ctk.CTkEntry(
-            vp_row, textvariable=self._vertex_project_id_var,
-            width=240, height=30, corner_radius=8,
-            fg_color=SURF_2, border_color=SURF_3,
-            text_color=TEXT_2,
-            font=ctk.CTkFont(FONT_FAMILY_MONO, 12),
-            placeholder_text="my-gcp-project-123",
-        ).pack(side="right")
-        sep_line(self._vertex_frame)
-
-        # Vertex model 下拉
-        vm_row = ctk.CTkFrame(self._vertex_frame, fg_color="transparent", height=52)
-        vm_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
-        vm_row.pack_propagate(False)
-        ctk.CTkLabel(
-            vm_row, text="Vertex 模型", anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
-        ).pack(side="left")
-        self._vertex_model_var = ctk.StringVar(
-            value=getattr(self.cfg, "vertex_model", "gemini-2.5-flash")
-        )
-        ctk.CTkOptionMenu(
-            vm_row, variable=self._vertex_model_var,
-            values=["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite"],
-            width=220, height=30, corner_radius=8,
-            fg_color=SURF_2, button_color=SURF_3, button_hover_color=SURF_4,
-            text_color=TEXT_1,
-            font=ctk.CTkFont(FONT_FAMILY_MONO, 12),
-        ).pack(side="right")
-
-        # 隱私警告
-        ctk.CTkLabel(
-            self._vertex_frame,
-            text=(
-                "⚠ 啟用後文字會傳到 Google Cloud（試用 credit 適用 Vertex AI 才會被抵扣）。\n"
-                "需先在終端機跑 `gcloud auth application-default login` 設定憑證。"
-            ),
-            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
-            text_color=WARN,
-            justify="left", anchor="w",
-        ).pack(anchor="w", padx=SPACE_LG, pady=(6, 10))
-        sep_line(self._vertex_frame)
-
-        # 保留 Ollama 開關（地端 backend 才有意義；vertex/off 時可忽略）
-        self._ollama_enabled_var = ctk.BooleanVar(value=self.cfg.ollama_enabled)
-        # 先建好 warmup row，當作 _vertex_frame 的插入 anchor（before=）
-        self._ollama_warmup_anchor = ctk.CTkFrame(ai, fg_color="transparent", height=50)
-        self._ollama_warmup_anchor.pack(fill="x", padx=SPACE_LG, pady=2)
-        self._ollama_warmup_anchor.pack_propagate(False)
-        ctk.CTkLabel(
-            self._ollama_warmup_anchor, text="啟用 Ollama 暖機", anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
-        ).pack(side="left")
-        make_sw(self._ollama_enabled_var, ACCENT)(self._ollama_warmup_anchor)
-        sep_line(ai)
-
-        # vertex_frame 顯隱用 pack(before=anchor) 維持正確順序
-        self._update_vertex_frame_visibility()
-
-        # Bug D（v2.13.0）：貼上策略 chip — wait（品質優先）vs raw（速度優先）
-        # 預設 wait：等潤飾完再貼。對 12B 模型可能 3-20s，user 體感「貼上慢」。
-        # raw：先貼 Whisper 原文（即時），潤飾結果不再覆蓋（避免貼到不同視窗）。
-        # 適合：user 已經要快、品質可後續手動編輯。
-        self._paste_strategy_var = ctk.StringVar(
-            value=getattr(self.cfg, "ollama_paste_strategy", "wait")
-        )
-
-        def paste_strategy_row(r):
-            wrap = ctk.CTkFrame(r, fg_color="transparent")
-            wrap.pack(side="right")
-            self._paste_strategy_btns: dict[str, ctk.CTkButton] = {}
-            for value, label in (
-                ("wait", "等潤飾"),
-                ("raw", "先貼原文"),
-            ):
-                btn = ctk.CTkButton(
-                    wrap, text=label,
-                    width=80, height=30, corner_radius=8,
-                    font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
-                    border_width=1,
-                    command=lambda v=value: self._on_paste_strategy_clicked(v),
-                )
-                btn.pack(side="left", padx=(0, 4))
-                self._paste_strategy_btns[value] = btn
-            self._apply_paste_strategy_chip_style()
-
-        row(ai, "貼上策略", paste_strategy_row)
-        ctk.CTkLabel(
-            ai,
-            text=(
-                "等潤飾：等 AI 校正完成才貼上（品質優先、3-20s 視模型大小）\n"
-                "先貼原文：立即貼 Whisper 原文，潤飾結果只更新 UI 不再覆蓋（速度優先）"
-            ),
-            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
-            text_color=TEXT_3,
-            justify="left", anchor="w",
-        ).pack(anchor="w", padx=SPACE_LG, pady=(0, 10))
-        sep_line(ai)
-
-        # v2.13.0：模型下拉選單（自動偵測本機 Ollama 已安裝模型，取代手動輸入）
-        # get_models() 有 3s timeout，Ollama 沒跑也不會卡太久。
-        model_row = ctk.CTkFrame(ai, fg_color="transparent", height=52)
-        model_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
-        model_row.pack_propagate(False)
-        ctk.CTkLabel(
-            model_row, text="模型名稱", anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
-        ).pack(side="left")
-        # 偵測 + 選預設
-        self._ollama_model_var = ctk.StringVar(value=self.cfg.ollama_model)
-        self._ollama_model_menu_wrap = ctk.CTkFrame(model_row, fg_color="transparent")
-        self._ollama_model_menu_wrap.pack(side="right")
-        self._build_ollama_model_menu()  # 建 OptionMenu + 刷新按鈕（首次同步偵測）
-        # v2.13.0：速度／品質提示（user 反映 12B 慢；3-4B 模型對純錯字校正夠用）
-        ctk.CTkLabel(
-            ai,
-            text=(
-                "速度建議（M 系列 Apple Silicon）：\n"
-                "• qwen2.5:3b-instruct — 1-2 秒（推薦，中文校正夠用）\n"
-                "• gemma3:4b — 1-3 秒（平衡）\n"
-                "• gemma3:12b — 3-6 秒（品質優、但體感較慢）\n"
-                "找不到模型？終端機跑 `ollama pull <名稱>` 後按 ↻ 重新偵測"
-            ),
-            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
-            text_color=TEXT_3,
-            justify="left", anchor="w",
-        ).pack(anchor="w", padx=SPACE_LG, pady=(0, 10))
-        sep_line(ai)
-
-        # Base URL（進階；一般使用者不需要改）
-        url_row = ctk.CTkFrame(ai, fg_color="transparent", height=52)
-        url_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
-        url_row.pack_propagate(False)
-        ctk.CTkLabel(
-            url_row, text="服務位址", anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
-        ).pack(side="left")
-        self._ollama_url_var = ctk.StringVar(value=self.cfg.ollama_base_url)
-        ctk.CTkEntry(
-            url_row, textvariable=self._ollama_url_var,
-            width=200, height=30, corner_radius=8,
-            fg_color=SURF_2, border_color=SURF_3,
-            text_color=TEXT_3,
-            font=ctk.CTkFont(FONT_FAMILY_MONO, 11),
-        ).pack(side="right")
-        sep_line(ai)
-
-        # ── 環境診斷（Phase 4.5）─────────────────────────────────────────
-        # 給首次安裝、Ollama 缺東少西的使用者一行明確指引（含建議命令）。
-        diag_row = ctk.CTkFrame(ai, fg_color=SURF_2, corner_radius=8)
-        diag_row.pack(fill="x", padx=SPACE_LG, pady=(8, 4))
-        self._ollama_diag_title = ctk.CTkLabel(
-            diag_row, text="正在診斷…", anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 13, "bold"), text_color=TEXT_1,
-        )
-        self._ollama_diag_title.pack(fill="x", padx=SPACE_MD, pady=(10, 2))
-        self._ollama_diag_detail = ctk.CTkLabel(
-            diag_row, text="", anchor="w", justify="left",
-            font=ctk.CTkFont("SF Pro Text", 11), text_color=TEXT_3,
-            wraplength=520,
-        )
-        self._ollama_diag_detail.pack(fill="x", padx=SPACE_MD, pady=(0, 4))
-        # 建議命令以等寬字 + 一鍵複製
-        self._ollama_diag_cmd_frame = ctk.CTkFrame(diag_row, fg_color="transparent")
-        self._ollama_diag_cmd_frame.pack(fill="x", padx=SPACE_MD, pady=(0, 10))
-        self._ollama_diag_cmd = ctk.CTkLabel(
-            self._ollama_diag_cmd_frame, text="", anchor="w",
-            font=ctk.CTkFont(FONT_FAMILY_MONO, 11), text_color=ACCENT,
-            wraplength=400,
-        )
-        self._ollama_diag_cmd.pack(side="left", padx=(0, 8))
-        self._ollama_diag_copy_btn = ctk.CTkButton(
-            self._ollama_diag_cmd_frame, text="複製命令",
-            width=84, height=24, corner_radius=6,
-            font=ctk.CTkFont("SF Pro Text", 11),
-            fg_color=SURF_3, hover_color=SURF_4, text_color=TEXT_2,
-        )
-        self._ollama_diag_copy_btn.pack(side="right")
-        self._ollama_diag_copy_btn.pack_forget()   # 預設隱藏，有命令才顯示
-
-        # 啟動後立即跑一次背景診斷
-        self.after(100, self._refresh_ollama_diagnostic)
-
-        # 測試連線 + 狀態標籤
-        test_row = ctk.CTkFrame(ai, fg_color="transparent", height=52)
-        test_row.pack(fill="x", padx=SPACE_LG, pady=(4, 8))
-        test_row.pack_propagate(False)
-        self._ollama_test_status = ctk.CTkLabel(
-            test_row, text="（尚未測試）",
-            anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 12), text_color=TEXT_3,
-        )
-        self._ollama_test_status.pack(side="left")
-        ctk.CTkButton(
-            test_row, text="測試連線", width=100, height=30, corner_radius=8,
-            fg_color=SURF_2, text_color=TEXT_1,
-            hover_color=SURF_3,
-            border_width=1, border_color=SURF_3,
-            font=ctk.CTkFont("SF Pro Text", 12),
-            command=self._test_ollama,
-        ).pack(side="right")
-
-        # ── 情境路由 (Phase 2) ────────────────────────────────────────────
-        rout = section("情境路由 (Phase 2)")
-
-        self._routing_var = ctk.BooleanVar(value=self.cfg.preset_routing_enabled)
-        row(rout, "啟用情境自動切換", make_sw(self._routing_var, ACCENT))
-        sep_line(rout)
-
-        # 每個非 default preset 一個 switch；預設全部啟用
-        self._preset_switch_vars: dict[str, ctk.BooleanVar] = {}
-        import presets as _pr
-        for pname, preset in _pr.PRESETS.items():
-            if pname == "default":
-                continue
-            default_on = self.cfg.preset_overrides.get(pname, True)
-            var = ctk.BooleanVar(value=default_on)
-            self._preset_switch_vars[pname] = var
-            row(rout, f"  ↳ {preset.display_name}", make_sw(var, ACCENT))
-            sep_line(rout)
-
-        # 手動 reload prompt 按鈕 + 熱重載 switch
-        hot_row = ctk.CTkFrame(rout, fg_color="transparent", height=52)
-        hot_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
-        hot_row.pack_propagate(False)
-        ctk.CTkLabel(
-            hot_row, text="Prompt 熱重載", anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
-        ).pack(side="left")
-        self._hot_reload_var = ctk.BooleanVar(value=self.cfg.prompt_hot_reload)
-        ctk.CTkSwitch(
-            hot_row, text="", variable=self._hot_reload_var,
-            onvalue=True, offvalue=False, **sw_style,
-        ).pack(side="right", padx=(8, 0))
-        ctk.CTkButton(
-            hot_row, text="立即重新載入", width=110, height=28, corner_radius=8,
-            fg_color=SURF_2, text_color=TEXT_1,
-            hover_color=SURF_3, border_width=1, border_color=SURF_3,
-            font=ctk.CTkFont("SF Pro Text", 12),
-            command=self._reload_prompts_now,
-        ).pack(side="right", padx=(8, 0))
-
-        # ── 個人字典 (#4) ─────────────────────────────────────────────────
-        dsec = section("個人字典")
-        self._dict_enabled_var = ctk.BooleanVar(value=self.cfg.dictionary_enabled)
-        row(dsec, "注入到轉錄與潤飾", make_sw(self._dict_enabled_var, ACCENT))
-        sep_line(dsec)
-
-        dict_path_row = ctk.CTkFrame(dsec, fg_color="transparent", height=52)
-        dict_path_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
-        dict_path_row.pack_propagate(False)
-        ctk.CTkLabel(
-            dict_path_row, text="字典檔路徑", anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
-        ).pack(side="left")
-        self._dict_path_var = ctk.StringVar(value=self.cfg.dictionary_path)
-        ctk.CTkEntry(
-            dict_path_row, textvariable=self._dict_path_var,
-            placeholder_text="(預設 ~/.whisper_app/dictionary.json)",
-            width=220, height=30, corner_radius=8,
-            fg_color=SURF_2, border_color=SURF_3,
-            text_color=TEXT_3,
-            font=ctk.CTkFont(FONT_FAMILY_MONO, 11),
-        ).pack(side="right")
-        sep_line(dsec)
-
-        dict_btn_row = ctk.CTkFrame(dsec, fg_color="transparent", height=52)
-        dict_btn_row.pack(fill="x", padx=SPACE_LG, pady=(4, 8))
-        dict_btn_row.pack_propagate(False)
-        # v2.13.0：動態顯示「目前 N 個 term」讓 user 知道字典規模
-        self._dict_status_label = ctk.CTkLabel(
-            dict_btn_row, text=self._compute_dict_status(), anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 12), text_color=TEXT_3,
-        )
-        self._dict_status_label.pack(side="left")
-        ctk.CTkButton(
-            dict_btn_row, text="用預設編輯器開啟", width=150, height=30, corner_radius=8,
-            fg_color=SURF_2, text_color=TEXT_1,
-            hover_color=SURF_3, border_width=1, border_color=SURF_3,
-            font=ctk.CTkFont("SF Pro Text", 12),
-            command=self._open_dictionary_file,
-        ).pack(side="right")
-        # v2.13.0：說明常見同音字消歧使用方式
-        ctk.CTkLabel(
-            dsec,
-            text=(
-                "字典術語會注入 Whisper 與 Ollama prompt，提升專有名詞辨識率。\n"
-                "例：把「Claude」「Cloud」「Cursor」加進去，可避免同音字誤判（/klɔːd/ vs /klaʊd/）。"
-            ),
-            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
-            text_color=TEXT_3,
-            justify="left", anchor="w",
-        ).pack(anchor="w", padx=SPACE_LG, pady=(0, 10))
-
-        # ── 介面 (Phase 4.3) ────────────────────────────────────────────
-        ui_sec = section("介面")
-        self._mini_window_var = ctk.BooleanVar(value=self.cfg.mini_recording_window)
-        row(ui_sec, "錄音時顯示浮動 mini 視窗（右下角）",
-            make_sw(self._mini_window_var, ACCENT))
-
-        # ── 歷史紀錄 (Phase 3.2) ─────────────────────────────────────────
-        hist = section("歷史紀錄 (Phase 3.2)")
-        self._history_enabled_var = ctk.BooleanVar(value=self.cfg.history_enabled)
-        row(hist, "寫入 ~/.whisper_app/history.db",
-            make_sw(self._history_enabled_var, ACCENT))
-        sep_line(hist)
-
-        retention_row = ctk.CTkFrame(hist, fg_color="transparent", height=52)
-        retention_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
-        retention_row.pack_propagate(False)
-        ctk.CTkLabel(
-            retention_row, text="保留天數（0 = 永久）", anchor="w",
-            font=ctk.CTkFont("SF Pro Text", 14), text_color=TEXT_1,
-        ).pack(side="left")
-        self._history_retention_var = tk.StringVar(
-            value=str(self.cfg.history_retention_days)
-        )
-        ctk.CTkEntry(
-            retention_row, textvariable=self._history_retention_var,
-            width=90, height=30, corner_radius=8,
+        """建立搜尋列 + 側欄導覽 + 6 個分類頁 + 底部儲存／取消按鈕。"""
+        # ── 搜尋列 ───────────────────────────────────────────────────────────
+        search_bar = ctk.CTkFrame(self, height=52, fg_color=SURF_1, corner_radius=0)
+        search_bar.pack(fill="x", side="top")
+        search_bar.pack_propagate(False)
+        self._search_var = ctk.StringVar(value="")
+        search_entry = ctk.CTkEntry(
+            search_bar, textvariable=self._search_var,
+            placeholder_text="搜尋設定…（例如：字典、快捷鍵、主題）按 Enter 跳過去",
+            height=32, corner_radius=8,
             fg_color=SURF_2, border_color=SURF_3, text_color=TEXT_1,
-            font=ctk.CTkFont(FONT_FAMILY_MONO, 13),
-            justify="right",
-        ).pack(side="right")
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
+        )
+        search_entry.pack(fill="x", padx=SPACE_LG, pady=SPACE_SM)
+        search_entry.bind("<Return>", self._run_search)
 
-        # ── 關於 ──────────────────────────────────────────────────────────
-        about = section("關於")
-        for label, path in [
-            ("Whisper 快取", "~/.cache/huggingface"),
-            ("設定檔", "~/.whisper_app/config.json"),
-        ]:
-            pr = ctk.CTkFrame(about, fg_color="transparent", height=38)
-            pr.pack(fill="x", padx=SPACE_LG, pady=2)
-            pr.pack_propagate(False)
-            ctk.CTkLabel(pr, text=label, anchor="w",
-                         font=ctk.CTkFont("SF Pro Text", 13),
-                         text_color=TEXT_1).pack(side="left")
-            ctk.CTkLabel(pr, text=path, anchor="e",
-                         font=ctk.CTkFont("SF Pro Text", 11),
-                         text_color=TEXT_3).pack(side="right")
+        ctk.CTkFrame(self, height=1, fg_color=SURF_3, corner_radius=0).pack(fill="x", side="top")
 
-        ctk.CTkButton(
-            about, text="開啟設定資料夾", width=156, height=28,
-            image=get_icon("folder", 14, ACCENT_HV),
-            compound="left",
-            fg_color="transparent",
-            border_width=1, border_color=SURF_3,
-            text_color=ACCENT_HV,
-            hover_color=SURF_2,
-            font=ctk.CTkFont("SF Pro Text", 12),
-            corner_radius=8,
-            command=lambda: _open_path_in_os_default(
-                os.path.expanduser("~/.whisper_app")
-            ),
-        ).pack(anchor="w", padx=SPACE_LG, pady=(0, 8))
+        # ── 主體：側欄 + 內容 ────────────────────────────────────────────────
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, side="top")
 
-        # 匯入 / 匯出（Phase 4.4）—— 設定 + 字典 + preset 覆寫 → zip
-        # 不含 history.db（隱私）與 polish_log.jsonl（debug 用、可能很大）
-        ie_row = ctk.CTkFrame(about, fg_color="transparent")
-        ie_row.pack(anchor="w", padx=SPACE_LG, pady=(0, 14))
-        ctk.CTkButton(
-            ie_row, text="匯出設定…", width=120, height=28,
-            image=get_icon("download", 14, ACCENT_HV),
-            compound="left",
-            fg_color="transparent",
-            border_width=1, border_color=SURF_3,
-            text_color=ACCENT_HV, hover_color=SURF_2,
-            font=ctk.CTkFont("SF Pro Text", 12),
-            corner_radius=8,
-            command=self._export_settings,
-        ).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(
-            ie_row, text="匯入設定…", width=120, height=28,
-            image=get_icon("file-text", 14, ACCENT_HV),
-            compound="left",
-            fg_color="transparent",
-            border_width=1, border_color=SURF_3,
-            text_color=ACCENT_HV, hover_color=SURF_2,
-            font=ctk.CTkFont("SF Pro Text", 12),
-            corner_radius=8,
-            command=self._import_settings,
-        ).pack(side="left")
+        sidebar = ctk.CTkFrame(body, width=self._SIDEBAR_W, fg_color=SURF_1, corner_radius=0)
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
 
-        # ── Buttons ───────────────────────────────────────────────────────
-        ctk.CTkFrame(self, height=1, fg_color=SURF_3, corner_radius=0).pack(fill="x")
+        for key, label, icon_name in self._CATEGORIES:
+            btn = ctk.CTkButton(
+                sidebar, text=f"  {label}",
+                image=get_icon(icon_name, 16, TEXT_3),
+                compound="left", anchor="w",
+                width=self._SIDEBAR_W - 16, height=40, corner_radius=8,
+                fg_color="transparent", hover_color=SURF_2,
+                text_color=TEXT_3,
+                font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
+                command=lambda k=key: self._select_category(k),
+            )
+            first = key == self._CATEGORIES[0][0]
+            btn.pack(fill="x", padx=SPACE_SM, pady=(SPACE_SM if first else 2, 2))
+            self._nav_buttons[key] = btn
+
+        ctk.CTkFrame(body, width=1, fg_color=SURF_3, corner_radius=0).pack(side="left", fill="y")
+
+        content = ctk.CTkFrame(body, fg_color="transparent")
+        content.pack(side="left", fill="both", expand=True)
+
+        builders = {
+            "recording":  self._build_page_recording,
+            "stt":        self._build_page_stt,
+            "output":     self._build_page_output,
+            "appearance": self._build_page_appearance,
+            "data":       self._build_page_data,
+            "about":      self._build_page_about,
+        }
+        for key, _label, _icon in self._CATEGORIES:
+            page = ctk.CTkFrame(content, fg_color="transparent")
+            self._pages[key] = page
+            builders[key](page)
+
+        self._select_category(self._CATEGORIES[0][0])
+
+        # ── Buttons ──────────────────────────────────────────────────────────
+        ctk.CTkFrame(self, height=1, fg_color=SURF_3, corner_radius=0).pack(fill="x", side="bottom")
         btn_bar = ctk.CTkFrame(self, height=60, fg_color=SURF_1, corner_radius=0)
         btn_bar.pack(fill="x", side="bottom")
         btn_bar.pack_propagate(False)
@@ -5555,6 +5226,941 @@ class SettingsWindow(ctk.CTkToplevel):
             font=ctk.CTkFont("SF Pro Text", 14, "bold"),
             command=self._save,
         ).pack(side="left")
+
+    # ── 分類切換 ─────────────────────────────────────────────────────────────
+
+    def _select_category(self, key: str) -> None:
+        """切換側欄分類：顯示對應頁面、更新導覽按鈕高亮。
+
+        離開「錄音」頁一定要停掉電平表（render loop + 麥克風串流）——那是
+        設定視窗唯一允許跑 Canvas render loop 的分類頁，看不到就不該繼續
+        佔用麥克風；進入「錄音」頁才重新啟動。
+        """
+        if key == self._active_category:
+            return
+        if self._active_category == "recording":
+            self._stop_level_meter()
+        for page in self._pages.values():
+            page.pack_forget()
+        self._pages[key].pack(fill="both", expand=True)
+        for k, btn in self._nav_buttons.items():
+            active = k == key
+            btn.configure(
+                fg_color=(SURF_2 if active else "transparent"),
+                text_color=(TEXT_1 if active else TEXT_3),
+            )
+        self._active_category = key
+        if key == "recording":
+            self._start_level_meter()
+
+    # ── 通用列 / 搜尋登記 helper ─────────────────────────────────────────────
+
+    def _page_header(self, page: ctk.CTkFrame, title: str) -> None:
+        """每個分類頁最上面的大標題（側欄已經有分類名，這裡再放一次是為了
+        『搜尋跳過來、一眼確認自己在哪頁』）。"""
+        ctk.CTkLabel(
+            page, text=title, anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_UI, 17, "bold"), text_color=TEXT_1,
+        ).pack(fill="x", padx=SPACE_LG, pady=(SPACE_LG, SPACE_SM))
+
+    def _register_row(self, category: str, row_id: str, frame: ctk.CTkFrame, *terms: str) -> None:
+        """登記 row frame（搜尋高亮用）與搜尋關鍵字（label 本身 + 自訂 alias）。"""
+        self._row_frames[row_id] = frame
+        for t in terms:
+            if t:
+                self._search_index[t] = (category, row_id)
+
+    def _row(
+        self, parent, category: str, row_id: str, label: str,
+        desc: Optional[str], widget_fn, *, search_terms: tuple = (),
+    ) -> tuple:
+        """畫一列設定：左標籤（13pt）／說明（11pt TEXT_3，desc=None 時省略），
+        右控制項（由 widget_fn 畫進已經 side="right" 的 wrap frame）。
+
+        回傳 (outer, desc_label)：outer 讓呼叫端需要在列下方繼續 pack 額外
+        內容時用（例如個人字典的路徑欄）；desc_label 給需要動態改文字的
+        列用（例如模型說明會隨下拉選單即時更新）。desc 用 None（不是空
+        字串）代表「這列沒有說明」——刻意跟空字串區分，這樣「說明文字
+        剛好是空字串」的邊界情況（例如 config 損毀時 MODEL_INFO 查無此
+        模型）仍然會建立一個空白 label，呼叫端存的 handle 才不會是 None
+        而在後續 .configure() 時噴 AttributeError。
+        """
+        has_desc = desc is not None
+        outer = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=8)
+        outer.pack(fill="x", padx=SPACE_LG, pady=(0, SPACE_XS))
+
+        top = ctk.CTkFrame(outer, fg_color="transparent")
+        top.pack(fill="x", padx=SPACE_MD, pady=(SPACE_SM, 2 if has_desc else SPACE_SM))
+
+        ctk.CTkLabel(
+            top, text=label, anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 13), text_color=TEXT_1,
+        ).pack(side="left")
+
+        wrap = ctk.CTkFrame(top, fg_color="transparent")
+        wrap.pack(side="right")
+        widget_fn(wrap)
+
+        desc_label = None
+        if has_desc:
+            desc_label = ctk.CTkLabel(
+                outer, text=desc, anchor="w", justify="left",
+                font=ctk.CTkFont(FONT_FAMILY_TEXT, 11), text_color=TEXT_3,
+                wraplength=480,
+            )
+            desc_label.pack(fill="x", padx=SPACE_MD, pady=(0, SPACE_SM))
+
+        self._register_row(category, row_id, outer, label, *search_terms)
+        return outer, desc_label
+
+    def _make_sw(self, var, accent: Optional[str] = None):
+        """回傳一個 widget_fn：在給定 parent 裡放一顆樣式統一的 switch。"""
+        style = dict(
+            progress_color=(accent or ACCENT),
+            button_color=TEXT_1, button_hover_color=TEXT_2, fg_color=SURF_3,
+        )
+
+        def fn(r):
+            ctk.CTkSwitch(
+                r, text="", variable=var, onvalue=True, offvalue=False, **style,
+            ).pack(side="right")
+
+        return fn
+
+    def _var(self, attr: str, factory):
+        """回傳已存在的 var；不存在才用 factory() 建一個新的。
+
+        給「AI 潤飾進階設定」對話框用——那個對話框每次開啟都整個重建
+        widget（跟 HotkeyBindDialog 同一套模式），但底層 var 要跨開關保留
+        使用者還沒按主視窗「儲存」的暫時改動，不能每次重開都從 self.cfg
+        重新蓋過去。
+        """
+        if getattr(self, attr, None) is None:
+            setattr(self, attr, factory())
+        return getattr(self, attr)
+
+    # ── 分類頁：錄音 ─────────────────────────────────────────────────────────
+
+    def _build_page_recording(self, page: ctk.CTkFrame) -> None:
+        """錄音分類：全域快捷鍵、麥克風、輸入電平（即時）、靜音自動停止。"""
+        self._page_header(page, "錄音")
+
+        # 全域快捷鍵 --------------------------------------------------------
+        def hotkey_row(r):
+            self._hk_label = ctk.CTkLabel(
+                r, text=format_hotkey(self.cfg.hotkey),
+                font=ctk.CTkFont(FONT_FAMILY_TEXT, 13, "bold"),
+                fg_color=SURF_2, text_color=TEXT_1,
+                corner_radius=8, padx=SPACE_MD, pady=SPACE_XS,
+            )
+            self._hk_label.pack(side="left", padx=(0, 8))
+            ctk.CTkButton(
+                r, text="重新綁定", width=80, height=28, corner_radius=8,
+                fg_color=ACCENT_BG, hover_color=ACCENT,
+                border_width=1, border_color=ACCENT, text_color=ACCENT_HV,
+                font=ctk.CTkFont(FONT_FAMILY_TEXT, 12),
+                command=self._rebind_hotkey,
+            ).pack(side="left")
+
+        self._row(
+            page, "recording", "recording_hotkey", "全域快捷鍵", None, hotkey_row,
+            search_terms=("快捷鍵", "熱鍵", "hotkey", "重新綁定"),
+        )
+
+        # 麥克風來源 ----------------------------------------------------------
+        # v2.21.0 Phase M：優先用 app window 的 recorder.refresh_portaudio() 重新
+        # 初始化 PortAudio 拿「最新」裝置清單，插了新麥克風不用重開整個 App。
+        from recorder import AudioRecorder as _AR
+        try:
+            _rec = getattr(self.master, "recorder", None)
+            if _rec is not None and hasattr(_rec, "refresh_portaudio"):
+                self._available_devices = _rec.refresh_portaudio()
+            else:
+                self._available_devices = _AR.list_devices()
+        except Exception:
+            self._available_devices = []
+            log_error("settings_list_devices_failed")
+        self._device_values = ["（系統預設）"] + [d["name"] for d in self._available_devices]
+        _current_dev = self.cfg.input_device
+        if _current_dev and _current_dev in (d["name"] for d in self._available_devices):
+            initial = _current_dev
+        else:
+            initial = "（系統預設）"
+        self._device_var = ctk.StringVar(value=initial)
+
+        def device_row(r):
+            ctk.CTkOptionMenu(
+                r, values=self._device_values, variable=self._device_var,
+                width=220, height=30, corner_radius=8,
+                fg_color=SURF_2, button_color=SURF_2, button_hover_color=SURF_3,
+                dropdown_fg_color=SURF_1, text_color=TEXT_1,
+                font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
+                command=self._on_preview_device_changed,
+            ).pack(side="right")
+
+        self._row(
+            page, "recording", "recording_mic", "麥克風來源",
+            f"偵測到 {len(self._available_devices)} 個輸入裝置；「系統預設」會跟隨系統設定。",
+            device_row, search_terms=("麥克風", "裝置", "輸入裝置", "mic", "microphone"),
+        )
+
+        # 輸入電平（即時）------------------------------------------------------
+        level_outer = ctk.CTkFrame(page, fg_color="transparent")
+        level_outer.pack(fill="x", padx=SPACE_LG, pady=(0, SPACE_XS))
+        ctk.CTkLabel(
+            level_outer, text="輸入電平（即時）", anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 13), text_color=TEXT_1,
+        ).pack(fill="x", padx=SPACE_MD, pady=(SPACE_SM, 4))
+        canvas_card = ctk.CTkFrame(
+            level_outer, fg_color=SURF_1, corner_radius=8,
+            border_width=1, border_color=SURF_3,
+        )
+        canvas_card.pack(fill="x", padx=SPACE_MD, pady=(0, 4))
+        self._level_canvas = tk.Canvas(
+            canvas_card, width=self._LEVEL_METER_W, height=self._LEVEL_METER_H,
+            bg=SURF_1, highlightthickness=0, bd=0,
+        )
+        self._level_canvas.pack(padx=8, pady=8)
+        ctk.CTkLabel(
+            level_outer, text="離開此頁會自動停止讀取麥克風；跟正式錄音互不干擾。",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11), text_color=TEXT_3, anchor="w",
+        ).pack(fill="x", padx=SPACE_MD, pady=(0, SPACE_SM))
+        self._register_row(
+            "recording", "recording_level", level_outer,
+            "輸入電平（即時）", "電平表", "麥克風音量", "level", "meter",
+        )
+
+        # 靜音自動停止 ----------------------------------------------------------
+        self._recording_watchdog_var = ctk.BooleanVar(
+            value=getattr(self.cfg, "recording_watchdog", True)
+        )
+        self._row(
+            page, "recording", "recording_watchdog", "靜音自動停止",
+            "連續 8 分鐘沒偵測到語音會提醒；15 分鐘會自動停止錄音並保留內容（防止忘記關）。",
+            self._make_sw(self._recording_watchdog_var, ACCENT),
+            search_terms=("看門狗", "watchdog", "自動停止", "忘記關"),
+        )
+
+    # ── 分類頁：辨識 ─────────────────────────────────────────────────────────
+
+    def _build_page_stt(self, page: ctk.CTkFrame) -> None:
+        """辨識分類：模型、語言、邊錄邊轉錄門檻（VAD 靈敏度）、個人字典。"""
+        self._page_header(page, "辨識")
+
+        self._model_var = ctk.StringVar(value=self.cfg.model)
+
+        def model_row(r):
+            ctk.CTkOptionMenu(
+                r, values=list(MODEL_INFO.keys()), variable=self._model_var,
+                width=180, height=30, corner_radius=8,
+                fg_color=SURF_2, button_color=SURF_2, button_hover_color=SURF_3,
+                dropdown_fg_color=SURF_1, text_color=TEXT_1,
+                font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
+                command=self._on_model_preview,
+            ).pack(side="right")
+
+        _, self._model_desc = self._row(
+            page, "stt", "stt_model", "模型大小",
+            MODEL_INFO.get(self.cfg.model, ""), model_row,
+            search_terms=("模型", "whisper", "qwen"),
+        )
+
+        self._lang_var = ctk.StringVar(value=self.cfg.language)
+
+        def lang_row(r):
+            ctk.CTkOptionMenu(
+                r, values=list(LANGUAGE_OPTIONS.keys()), variable=self._lang_var,
+                width=112, height=30, corner_radius=8,
+                fg_color=SURF_2, button_color=SURF_2, button_hover_color=SURF_3,
+                dropdown_fg_color=SURF_1, text_color=TEXT_1,
+                font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
+            ).pack(side="right")
+
+        self._row(
+            page, "stt", "stt_lang", "辨識語言", None, lang_row,
+            search_terms=("語言", "language"),
+        )
+
+        # 邊錄邊轉錄門檻（Silero VAD 靈敏度）------------------------------------
+        self._silero_vad_enabled_var = ctk.BooleanVar(
+            value=getattr(self.cfg, "silero_vad_enabled", True)
+        )
+        self._silero_vad_threshold_var = ctk.StringVar(
+            value=str(getattr(self.cfg, "silero_vad_threshold", 0.35))
+        )
+
+        def vad_row(r):
+            ctk.CTkEntry(
+                r, textvariable=self._silero_vad_threshold_var,
+                width=56, height=30, corner_radius=8,
+                fg_color=SURF_2, border_color=SURF_3, text_color=TEXT_1,
+                font=ctk.CTkFont(FONT_FAMILY_MONO, 13), justify="right",
+            ).pack(side="right", padx=(8, 0))
+            self._make_sw(self._silero_vad_enabled_var, ACCENT)(r)
+
+        self._row(
+            page, "stt", "stt_vad", "邊錄邊轉錄門檻",
+            "語音偵測靈敏度（Silero VAD）：數值越低，愈容易把小聲／背景雜音當語音送去轉錄；"
+            "數值越高，只有明顯人聲才會被錄進結果。範圍 0.0–1.0，預設 0.35。",
+            vad_row, search_terms=("VAD", "語音偵測", "門檻", "靈敏度", "雜音"),
+        )
+
+        # 個人字典 --------------------------------------------------------------
+        self._dict_enabled_var = ctk.BooleanVar(value=self.cfg.dictionary_enabled)
+        dict_outer, _ = self._row(
+            page, "stt", "stt_dict", "個人字典",
+            "字典術語會注入 Whisper 與 Ollama prompt，提升專有名詞辨識率"
+            "（例：Claude／Cloud 同音字消歧）。",
+            self._make_sw(self._dict_enabled_var, ACCENT),
+            search_terms=("字典", "術語", "dictionary", "同音字"),
+        )
+        dict_detail = ctk.CTkFrame(dict_outer, fg_color=SURF_2, corner_radius=8)
+        dict_detail.pack(fill="x", padx=SPACE_MD, pady=(0, SPACE_SM))
+
+        path_row = ctk.CTkFrame(dict_detail, fg_color="transparent", height=40)
+        path_row.pack(fill="x", padx=SPACE_MD, pady=(SPACE_SM, 2))
+        path_row.pack_propagate(False)
+        ctk.CTkLabel(
+            path_row, text="字典檔路徑", anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 12), text_color=TEXT_2,
+        ).pack(side="left")
+        self._dict_path_var = ctk.StringVar(value=self.cfg.dictionary_path)
+        ctk.CTkEntry(
+            path_row, textvariable=self._dict_path_var,
+            placeholder_text="(預設 ~/.whisper_app/dictionary.json)",
+            width=220, height=28, corner_radius=6,
+            fg_color=SURF_1, border_color=SURF_4, text_color=TEXT_3,
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 11),
+        ).pack(side="right")
+
+        status_row = ctk.CTkFrame(dict_detail, fg_color="transparent", height=36)
+        status_row.pack(fill="x", padx=SPACE_MD, pady=(2, SPACE_SM))
+        status_row.pack_propagate(False)
+        self._dict_status_label = ctk.CTkLabel(
+            status_row, text=self._compute_dict_status(), anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11), text_color=TEXT_3,
+        )
+        self._dict_status_label.pack(side="left")
+        ctk.CTkButton(
+            status_row, text="用預設編輯器開啟", width=140, height=26, corner_radius=6,
+            fg_color=SURF_1, text_color=TEXT_1, hover_color=SURF_3,
+            border_width=1, border_color=SURF_4,
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
+            command=self._open_dictionary_file,
+        ).pack(side="right")
+
+    # ── 分類頁：輸出 ─────────────────────────────────────────────────────────
+
+    def _build_page_output(self, page: ctk.CTkFrame) -> None:
+        """輸出分類：自動貼上、自動複製、AI 潤飾、貼上策略、追加錄音結果。
+
+        Ollama 模型／Vertex AI／情境路由／Prompt 熱重載這些較深的欄位收進
+        「AI 潤飾」列的「進階…」按鈕（見 _open_polish_advanced），這頁本身
+        維持 5 列、不捲動。
+        """
+        self._page_header(page, "輸出")
+
+        self._autopaste_var = ctk.BooleanVar(value=self.cfg.auto_paste)
+        self._row(
+            page, "output", "output_paste", "語音轉文字後自動貼上",
+            "轉錄完成後自動模擬 ⌘V 貼到目前游標位置。",
+            self._make_sw(self._autopaste_var, INDIGO),
+            search_terms=("自動貼上", "貼上", "paste", "⌘V"),
+        )
+
+        self._autocopy_var = ctk.BooleanVar(value=self.cfg.auto_copy)
+        self._row(
+            page, "output", "output_copy", "轉錄後自動複製",
+            "轉錄完成後自動把文字複製到剪貼簿。",
+            self._make_sw(self._autocopy_var),
+            search_terms=("自動複製", "複製", "copy", "剪貼簿"),
+        )
+
+        self._polish_backend_var = ctk.StringVar(
+            value=getattr(self.cfg, "polish_backend", "local")
+        )
+
+        def backend_row(r):
+            self._polish_backend_btns: dict[str, ctk.CTkButton] = {}
+            for value, label in (
+                ("local", "地端 Ollama"), ("vertex", "Vertex AI"),
+                ("hybrid", "Hybrid"), ("off", "關閉"),
+            ):
+                btn = ctk.CTkButton(
+                    r, text=label, width=74, height=30, corner_radius=8,
+                    font=ctk.CTkFont(FONT_FAMILY_TEXT, 12), border_width=1,
+                    command=lambda v=value: self._on_polish_backend_clicked(v),
+                )
+                btn.pack(side="left", padx=(0, 4))
+                self._polish_backend_btns[value] = btn
+            self._apply_polish_backend_chip_style()
+            ctk.CTkButton(
+                r, text="進階…", width=52, height=30, corner_radius=8,
+                fg_color="transparent", border_width=1, border_color=SURF_3,
+                text_color=ACCENT_HV, hover_color=SURF_2,
+                font=ctk.CTkFont(FONT_FAMILY_TEXT, 12),
+                command=self._open_polish_advanced,
+            ).pack(side="left", padx=(6, 0))
+
+        self._row(
+            page, "output", "output_ai", "AI 潤飾",
+            "地端 Ollama／雲端 Vertex AI／Hybrid／關閉。模型、服務位址、情境路由、"
+            "Prompt 熱重載等細節在「進階…」。",
+            backend_row,
+            search_terms=("AI 潤飾", "潤飾", "ollama", "vertex", "校正", "polish", "gemini"),
+        )
+
+        self._paste_strategy_var = ctk.StringVar(
+            value=getattr(self.cfg, "ollama_paste_strategy", "wait")
+        )
+
+        def paste_strategy_row(r):
+            self._paste_strategy_btns: dict[str, ctk.CTkButton] = {}
+            for value, label in (("wait", "等潤飾"), ("raw", "先貼原文")):
+                btn = ctk.CTkButton(
+                    r, text=label, width=80, height=30, corner_radius=8,
+                    font=ctk.CTkFont(FONT_FAMILY_TEXT, 13), border_width=1,
+                    command=lambda v=value: self._on_paste_strategy_clicked(v),
+                )
+                btn.pack(side="left", padx=(0, 4))
+                self._paste_strategy_btns[value] = btn
+            self._apply_paste_strategy_chip_style()
+
+        self._row(
+            page, "output", "output_paste_strategy", "貼上策略",
+            "等潤飾：品質優先，等 AI 校正完才貼上。先貼原文：立即貼 Whisper 原文，速度優先。",
+            paste_strategy_row, search_terms=("貼上策略", "等潤飾", "先貼原文"),
+        )
+
+        self._append_var = ctk.BooleanVar(value=self.cfg.append_results)
+        self._row(
+            page, "output", "output_append", "追加錄音結果",
+            "開啟：新結果接在舊結果後面。關閉：新結果覆蓋畫面上的舊結果。",
+            self._make_sw(self._append_var),
+            search_terms=("追加", "append", "覆蓋"),
+        )
+
+    def _open_polish_advanced(self) -> None:
+        """開「AI 潤飾進階設定」：Ollama／Vertex AI 詳細欄位、情境路由、
+        Prompt 熱重載。從輸出頁「AI 潤飾」列的「進階…」按鈕開啟。
+
+        每次開啟都整個重建 widget（跟 HotkeyBindDialog 同一套模式），但底層
+        StringVar／BooleanVar 用 self._var()「有就沿用、沒有才新建」，確保
+        使用者在對話框裡改了、還沒按主視窗「儲存」就先關掉對話框再重開，
+        剛剛的改動不會被蓋掉。關閉時把 self._vertex_frame 設回 None，
+        _update_vertex_frame_visibility() 已有防呆、之後點主頁 chip 不會噴錯。
+        """
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("AI 潤飾進階設定")
+        dlg.geometry("540x640")
+        dlg.resizable(False, False)
+        dlg.configure(fg_color=BG)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        def _on_close():
+            self._vertex_frame = None
+            dlg.destroy()
+
+        dlg.protocol("WM_DELETE_WINDOW", _on_close)
+        dlg.bind("<Escape>", lambda e: _on_close())
+
+        scroll = ctk.CTkScrollableFrame(dlg, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+
+        def section(title: str) -> ctk.CTkFrame:
+            ctk.CTkLabel(
+                scroll, text=title.upper(), font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
+                text_color=TEXT_3, anchor="w",
+            ).pack(fill="x", padx=SPACE_LG, pady=(SPACE_LG, 6))
+            f = ctk.CTkFrame(scroll, corner_radius=12, fg_color=SURF_1)
+            f.pack(fill="x", padx=SPACE_LG, pady=(0, 4))
+            return f
+
+        def sep(parent) -> None:
+            ctk.CTkFrame(parent, height=1, fg_color=SURF_3).pack(fill="x", padx=SPACE_LG, pady=0)
+
+        # ── Ollama（地端）／Vertex AI（雲端）─────────────────────────────
+        ai = section("Ollama ／ Vertex AI 詳細設定")
+
+        self._vertex_frame = ctk.CTkFrame(ai, fg_color="transparent")
+        # 先建好不 pack，由下面 _update_vertex_frame_visibility() 依 backend 決定顯隱
+
+        vp_row = ctk.CTkFrame(self._vertex_frame, fg_color="transparent", height=52)
+        vp_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
+        vp_row.pack_propagate(False)
+        ctk.CTkLabel(
+            vp_row, text="GCP Project ID", anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 14), text_color=TEXT_1,
+        ).pack(side="left")
+        self._vertex_project_id_var = self._var(
+            "_vertex_project_id_var",
+            lambda: ctk.StringVar(value=getattr(self.cfg, "vertex_project_id", "")),
+        )
+        ctk.CTkEntry(
+            vp_row, textvariable=self._vertex_project_id_var,
+            width=220, height=30, corner_radius=8,
+            fg_color=SURF_2, border_color=SURF_3, text_color=TEXT_2,
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 12),
+            placeholder_text="my-gcp-project-123",
+        ).pack(side="right")
+        sep(self._vertex_frame)
+
+        vm_row = ctk.CTkFrame(self._vertex_frame, fg_color="transparent", height=52)
+        vm_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
+        vm_row.pack_propagate(False)
+        ctk.CTkLabel(
+            vm_row, text="Vertex 模型", anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 14), text_color=TEXT_1,
+        ).pack(side="left")
+        self._vertex_model_var = self._var(
+            "_vertex_model_var",
+            lambda: ctk.StringVar(value=getattr(self.cfg, "vertex_model", "gemini-2.5-flash")),
+        )
+        ctk.CTkOptionMenu(
+            vm_row, variable=self._vertex_model_var,
+            values=["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite"],
+            width=200, height=30, corner_radius=8,
+            fg_color=SURF_2, button_color=SURF_3, button_hover_color=SURF_4,
+            text_color=TEXT_1, font=ctk.CTkFont(FONT_FAMILY_MONO, 12),
+        ).pack(side="right")
+
+        ctk.CTkLabel(
+            self._vertex_frame,
+            text=(
+                "⚠ 啟用後文字會傳到 Google Cloud（試用 credit 適用 Vertex AI 才會被抵扣）。\n"
+                "需先在終端機跑 `gcloud auth application-default login` 設定憑證。"
+            ),
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11), text_color=WARN,
+            justify="left", anchor="w",
+        ).pack(anchor="w", padx=SPACE_LG, pady=(6, 10))
+        sep(self._vertex_frame)
+
+        self._ollama_enabled_var = self._var(
+            "_ollama_enabled_var", lambda: ctk.BooleanVar(value=self.cfg.ollama_enabled)
+        )
+        self._ollama_warmup_anchor = ctk.CTkFrame(ai, fg_color="transparent", height=50)
+        self._ollama_warmup_anchor.pack(fill="x", padx=SPACE_LG, pady=2)
+        self._ollama_warmup_anchor.pack_propagate(False)
+        ctk.CTkLabel(
+            self._ollama_warmup_anchor, text="啟用 Ollama 暖機", anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 14), text_color=TEXT_1,
+        ).pack(side="left")
+        self._make_sw(self._ollama_enabled_var, ACCENT)(self._ollama_warmup_anchor)
+        sep(ai)
+
+        self._update_vertex_frame_visibility()
+
+        model_row = ctk.CTkFrame(ai, fg_color="transparent", height=52)
+        model_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
+        model_row.pack_propagate(False)
+        ctk.CTkLabel(
+            model_row, text="模型名稱", anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 14), text_color=TEXT_1,
+        ).pack(side="left")
+        self._ollama_model_var = self._var(
+            "_ollama_model_var", lambda: ctk.StringVar(value=self.cfg.ollama_model)
+        )
+        self._ollama_model_menu_wrap = ctk.CTkFrame(model_row, fg_color="transparent")
+        self._ollama_model_menu_wrap.pack(side="right")
+        self._build_ollama_model_menu()
+        ctk.CTkLabel(
+            ai,
+            text=(
+                "速度建議（M 系列 Apple Silicon）：\n"
+                "• qwen2.5:3b-instruct — 1-2 秒（推薦，中文校正夠用）\n"
+                "• gemma3:4b — 1-3 秒（平衡）\n"
+                "• gemma3:12b — 3-6 秒（品質優、但體感較慢）\n"
+                "找不到模型？終端機跑 `ollama pull <名稱>` 後按 ↻ 重新偵測"
+            ),
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11), text_color=TEXT_3,
+            justify="left", anchor="w",
+        ).pack(anchor="w", padx=SPACE_LG, pady=(0, 10))
+        sep(ai)
+
+        url_row = ctk.CTkFrame(ai, fg_color="transparent", height=52)
+        url_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
+        url_row.pack_propagate(False)
+        ctk.CTkLabel(
+            url_row, text="服務位址", anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 14), text_color=TEXT_1,
+        ).pack(side="left")
+        self._ollama_url_var = self._var(
+            "_ollama_url_var", lambda: ctk.StringVar(value=self.cfg.ollama_base_url)
+        )
+        ctk.CTkEntry(
+            url_row, textvariable=self._ollama_url_var,
+            width=200, height=30, corner_radius=8,
+            fg_color=SURF_2, border_color=SURF_3, text_color=TEXT_3,
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 11),
+        ).pack(side="right")
+        sep(ai)
+
+        diag_row = ctk.CTkFrame(ai, fg_color=SURF_2, corner_radius=8)
+        diag_row.pack(fill="x", padx=SPACE_LG, pady=(8, 4))
+        self._ollama_diag_title = ctk.CTkLabel(
+            diag_row, text="正在診斷…", anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 13, "bold"), text_color=TEXT_1,
+        )
+        self._ollama_diag_title.pack(fill="x", padx=SPACE_MD, pady=(10, 2))
+        self._ollama_diag_detail = ctk.CTkLabel(
+            diag_row, text="", anchor="w", justify="left",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11), text_color=TEXT_3, wraplength=440,
+        )
+        self._ollama_diag_detail.pack(fill="x", padx=SPACE_MD, pady=(0, 4))
+        self._ollama_diag_cmd_frame = ctk.CTkFrame(diag_row, fg_color="transparent")
+        self._ollama_diag_cmd_frame.pack(fill="x", padx=SPACE_MD, pady=(0, 10))
+        self._ollama_diag_cmd = ctk.CTkLabel(
+            self._ollama_diag_cmd_frame, text="", anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 11), text_color=ACCENT, wraplength=320,
+        )
+        self._ollama_diag_cmd.pack(side="left", padx=(0, 8))
+        self._ollama_diag_copy_btn = ctk.CTkButton(
+            self._ollama_diag_cmd_frame, text="複製命令",
+            width=84, height=24, corner_radius=6,
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
+            fg_color=SURF_3, hover_color=SURF_4, text_color=TEXT_2,
+        )
+        self._ollama_diag_copy_btn.pack(side="right")
+        self._ollama_diag_copy_btn.pack_forget()
+        self.after(100, self._refresh_ollama_diagnostic)
+
+        test_row = ctk.CTkFrame(ai, fg_color="transparent", height=52)
+        test_row.pack(fill="x", padx=SPACE_LG, pady=(4, 8))
+        test_row.pack_propagate(False)
+        self._ollama_test_status = ctk.CTkLabel(
+            test_row, text="（尚未測試）", anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 12), text_color=TEXT_3,
+        )
+        self._ollama_test_status.pack(side="left")
+        ctk.CTkButton(
+            test_row, text="測試連線", width=100, height=30, corner_radius=8,
+            fg_color=SURF_2, text_color=TEXT_1, hover_color=SURF_3,
+            border_width=1, border_color=SURF_3,
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 12),
+            command=self._test_ollama,
+        ).pack(side="right")
+
+        # ── 情境路由 (Phase 2) ────────────────────────────────────────────
+        rout = section("情境路由（依前景 App／關鍵字自動選 Prompt）")
+
+        self._routing_var = self._var(
+            "_routing_var", lambda: ctk.BooleanVar(value=self.cfg.preset_routing_enabled)
+        )
+        routing_row = ctk.CTkFrame(rout, fg_color="transparent", height=50)
+        routing_row.pack(fill="x", padx=SPACE_LG, pady=2)
+        routing_row.pack_propagate(False)
+        ctk.CTkLabel(
+            routing_row, text="啟用情境自動切換", anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 14), text_color=TEXT_1,
+        ).pack(side="left")
+        self._make_sw(self._routing_var, ACCENT)(routing_row)
+        sep(rout)
+
+        if not hasattr(self, "_preset_switch_vars"):
+            self._preset_switch_vars: dict[str, ctk.BooleanVar] = {}
+        for pname, preset in _presets.PRESETS.items():
+            if pname == "default":
+                continue
+            if pname not in self._preset_switch_vars:
+                default_on = self.cfg.preset_overrides.get(pname, True)
+                self._preset_switch_vars[pname] = ctk.BooleanVar(value=default_on)
+            prow = ctk.CTkFrame(rout, fg_color="transparent", height=44)
+            prow.pack(fill="x", padx=SPACE_LG, pady=2)
+            prow.pack_propagate(False)
+            ctk.CTkLabel(
+                prow, text=f"  ↳ {preset.display_name}", anchor="w",
+                font=ctk.CTkFont(FONT_FAMILY_TEXT, 13), text_color=TEXT_2,
+            ).pack(side="left")
+            self._make_sw(self._preset_switch_vars[pname], ACCENT)(prow)
+            sep(rout)
+
+        hot_row = ctk.CTkFrame(rout, fg_color="transparent", height=52)
+        hot_row.pack(fill="x", padx=SPACE_LG, pady=SPACE_XS)
+        hot_row.pack_propagate(False)
+        ctk.CTkLabel(
+            hot_row, text="Prompt 熱重載", anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 14), text_color=TEXT_1,
+        ).pack(side="left")
+        self._hot_reload_var = self._var(
+            "_hot_reload_var", lambda: ctk.BooleanVar(value=self.cfg.prompt_hot_reload)
+        )
+        ctk.CTkSwitch(
+            hot_row, text="", variable=self._hot_reload_var,
+            onvalue=True, offvalue=False,
+            progress_color=ACCENT, button_color=TEXT_1, button_hover_color=TEXT_2,
+            fg_color=SURF_3,
+        ).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(
+            hot_row, text="立即重新載入", width=110, height=28, corner_radius=8,
+            fg_color=SURF_2, text_color=TEXT_1,
+            hover_color=SURF_3, border_width=1, border_color=SURF_3,
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 12),
+            command=self._reload_prompts_now,
+        ).pack(side="right", padx=(8, 0))
+        self._hot_reload_status_label = ctk.CTkLabel(
+            rout, text="", anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11), text_color=TEXT_3,
+        )
+        self._hot_reload_status_label.pack(fill="x", padx=SPACE_LG, pady=(0, 10))
+
+        ctk.CTkButton(
+            dlg, text="完成", width=100, height=32, corner_radius=8,
+            fg_color=ACCENT, hover_color=ACCENT_HV, text_color=TEXT_1,
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 13, "bold"),
+            command=_on_close,
+        ).pack(side="bottom", pady=SPACE_MD)
+
+    # ── 分類頁：外觀 ─────────────────────────────────────────────────────────
+
+    def _build_page_appearance(self, page: ctk.CTkFrame) -> None:
+        """外觀分類：主題、動態效果、迷你懸浮條、錄音視覺。"""
+        self._page_header(page, "外觀")
+
+        # 主題（v2.6.0）—— 點 chip 跟現在不同就彈 confirm dialog → 確認 → 立刻
+        # save + 重啟，不跟其他設定一起等 Save 按鈕。
+        self._theme_var = ctk.StringVar(value=self.cfg.theme)
+
+        def theme_row(r):
+            self._theme_btns: dict[str, ctk.CTkButton] = {}
+            for value, label in (("dark", "深色"), ("light", "淺色")):
+                btn = ctk.CTkButton(
+                    r, text=label, width=72, height=30, corner_radius=8,
+                    font=ctk.CTkFont(FONT_FAMILY_TEXT, 13), border_width=1,
+                    command=lambda v=value: self._on_theme_clicked(v),
+                )
+                btn.pack(side="left", padx=(0, 4))
+                self._theme_btns[value] = btn
+            self._apply_theme_chip_style()
+
+        self._row(
+            page, "appearance", "appearance_theme", "主題",
+            "深色：zinc + cyan（目前預設）。淺色：暖白 + Claude 珊瑚。"
+            "切換需重新啟動 App（~2 秒、自動完成）。",
+            theme_row, search_terms=("主題", "深色", "淺色", "theme", "dark", "light"),
+        )
+
+        self._reduce_motion_var = ctk.StringVar(
+            value=getattr(self.cfg, "reduce_motion_pref", "auto")
+        )
+
+        def reduce_motion_row(r):
+            self._reduce_motion_btns: dict[str, ctk.CTkButton] = {}
+            for value, label in (
+                ("auto", "跟系統"), ("always", "減少動態"), ("never", "完整動畫"),
+            ):
+                btn = ctk.CTkButton(
+                    r, text=label, width=76, height=30, corner_radius=8,
+                    font=ctk.CTkFont(FONT_FAMILY_TEXT, 13), border_width=1,
+                    command=lambda v=value: self._on_reduce_motion_clicked(v),
+                )
+                btn.pack(side="left", padx=(0, 4))
+                self._reduce_motion_btns[value] = btn
+            self._apply_reduce_motion_chip_style()
+
+        self._row(
+            page, "appearance", "appearance_motion", "動態效果",
+            "跟系統：依 macOS「減少動態效果」偏好（推薦）。減少動態：強制關閉呼吸光圈／"
+            "粒子環／漣漪。完整動畫：即使系統開了 reduce motion 也跑完整動畫。",
+            reduce_motion_row, search_terms=("動態效果", "動畫", "reduce motion", "呼吸光圈"),
+        )
+
+        self._mini_window_var = ctk.BooleanVar(value=self.cfg.mini_recording_window)
+        self._row(
+            page, "appearance", "appearance_mini", "迷你懸浮條",
+            "錄音／處理中時在游標所在螢幕中下方顯示小型狀態視窗，跨 Space／全螢幕仍可見。",
+            self._make_sw(self._mini_window_var, ACCENT),
+            search_terms=("mini", "懸浮", "hud", "浮動視窗", "迷你"),
+        )
+
+        self._record_visual_var = ctk.StringVar(
+            value=getattr(self.cfg, "record_visual", "waveform")
+        )
+
+        def visual_row(r):
+            self._record_visual_btns: dict[str, ctk.CTkButton] = {}
+            for value, label in (("waveform", "波形"), ("chamber", "光場")):
+                btn = ctk.CTkButton(
+                    r, text=label, width=70, height=30, corner_radius=8,
+                    font=ctk.CTkFont(FONT_FAMILY_TEXT, 13), border_width=1,
+                    command=lambda v=value: self._on_record_visual_clicked(v),
+                )
+                btn.pack(side="left", padx=(0, 4))
+                self._record_visual_btns[value] = btn
+            self._apply_record_visual_chip_style()
+
+        self._row(
+            page, "appearance", "appearance_visual", "錄音視覺",
+            "波形：46 格頻譜長條、依音量變色（預設）。光場：同心圓呼吸光圈（v2.3 前風格）。"
+            "變更於下次啟動 App 生效。",
+            visual_row, search_terms=("錄音視覺", "波形", "光場", "aperture", "chamber"),
+        )
+
+    def _apply_record_visual_chip_style(self) -> None:
+        """根據 _record_visual_var 重繪 2 顆 chip（跟主題／動態效果同一套樣式）。"""
+        active = self._record_visual_var.get()
+        for value, btn in self._record_visual_btns.items():
+            if value == active:
+                btn.configure(
+                    fg_color=SURF_2, border_color=ACCENT,
+                    text_color=TEXT_1, hover_color=SURF_3,
+                )
+            else:
+                btn.configure(
+                    fg_color="transparent", border_color=SURF_3,
+                    text_color=TEXT_3, hover_color=SURF_2,
+                )
+
+    def _on_record_visual_clicked(self, value: str) -> None:
+        """點 chip → 預覽切換，按 Save 才落地到 cfg（需重啟才生效）。"""
+        if value == self._record_visual_var.get():
+            return
+        self._record_visual_var.set(value)
+        self._apply_record_visual_chip_style()
+
+    # ── 分類頁：資料 ─────────────────────────────────────────────────────────
+
+    def _build_page_data(self, page: ctk.CTkFrame) -> None:
+        """資料分類：歷史紀錄保留、可疑音檔保留、匯入匯出。"""
+        self._page_header(page, "資料")
+
+        self._history_enabled_var = ctk.BooleanVar(value=self.cfg.history_enabled)
+        self._history_retention_var = tk.StringVar(value=str(self.cfg.history_retention_days))
+
+        def history_row(r):
+            ctk.CTkLabel(
+                r, text="天（0=永久）", font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
+                text_color=TEXT_3,
+            ).pack(side="right", padx=(4, 0))
+            ctk.CTkEntry(
+                r, textvariable=self._history_retention_var,
+                width=56, height=30, corner_radius=8,
+                fg_color=SURF_2, border_color=SURF_3, text_color=TEXT_1,
+                font=ctk.CTkFont(FONT_FAMILY_MONO, 13), justify="right",
+            ).pack(side="right")
+            self._make_sw(self._history_enabled_var, ACCENT)(r)
+
+        self._row(
+            page, "data", "data_history", "歷史紀錄保留",
+            "每次轉錄（含潤飾）寫入 ~/.whisper_app/history.db；保留天數到期後自動清除舊紀錄。",
+            history_row, search_terms=("歷史紀錄", "history", "保留天數"),
+        )
+
+        self._suspicious_audio_var = ctk.BooleanVar(
+            value=getattr(self.cfg, "suspicious_audio_capture", False)
+        )
+        self._suspicious_audio_maxsize_var = tk.StringVar(
+            value=str(getattr(self.cfg, "suspicious_audio_max_size_mb", 200))
+        )
+
+        def suspicious_row(r):
+            ctk.CTkLabel(
+                r, text="MB 上限", font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
+                text_color=TEXT_3,
+            ).pack(side="right", padx=(4, 0))
+            ctk.CTkEntry(
+                r, textvariable=self._suspicious_audio_maxsize_var,
+                width=64, height=30, corner_radius=8,
+                fg_color=SURF_2, border_color=SURF_3, text_color=TEXT_1,
+                font=ctk.CTkFont(FONT_FAMILY_MONO, 13), justify="right",
+            ).pack(side="right")
+            self._make_sw(self._suspicious_audio_var, ACCENT)(r)
+
+        self._row(
+            page, "data", "data_suspicious", "可疑音檔保留",
+            "觸發幻覺／去重／轉錄過慢時把錄音另存供除錯；超過上限自動清最舊的。預設關閉。",
+            suspicious_row, search_terms=("可疑音檔", "debug", "除錯錄音", "幻覺"),
+        )
+
+        def ie_row(r):
+            ctk.CTkButton(
+                r, text="匯入設定…", width=110, height=28,
+                image=get_icon("file-text", 14, ACCENT_HV), compound="left",
+                fg_color="transparent", border_width=1, border_color=SURF_3,
+                text_color=ACCENT_HV, hover_color=SURF_2,
+                font=ctk.CTkFont(FONT_FAMILY_TEXT, 12), corner_radius=8,
+                command=self._import_settings,
+            ).pack(side="right")
+            ctk.CTkButton(
+                r, text="匯出設定…", width=110, height=28,
+                image=get_icon("download", 14, ACCENT_HV), compound="left",
+                fg_color="transparent", border_width=1, border_color=SURF_3,
+                text_color=ACCENT_HV, hover_color=SURF_2,
+                font=ctk.CTkFont(FONT_FAMILY_TEXT, 12), corner_radius=8,
+                command=self._export_settings,
+            ).pack(side="right", padx=(0, 8))
+
+        self._row(
+            page, "data", "data_importexport", "匯入匯出",
+            "打包 config.json + dictionary.json 成 zip；不含歷史紀錄（隱私）與除錯日誌。",
+            ie_row, search_terms=("匯入", "匯出", "備份", "export", "import"),
+        )
+
+    # ── 分類頁：關於 ─────────────────────────────────────────────────────────
+
+    def _build_page_about(self, page: ctk.CTkFrame) -> None:
+        """關於分類：版本、權限狀態、日誌位置。"""
+        self._page_header(page, "關於")
+
+        from _version import __version__ as _app_ver
+
+        def version_row(r):
+            ctk.CTkLabel(
+                r, text=f"v{_app_ver}",
+                font=ctk.CTkFont(FONT_FAMILY_MONO, 13), text_color=TEXT_2,
+            ).pack(side="right")
+
+        self._row(
+            page, "about", "about_version", "版本", "Whisper Pro（Mac／Windows 雙棲版）。",
+            version_row, search_terms=("版本", "version"),
+        )
+
+        def permission_row(r):
+            granted = check_accessibility()
+            self._permission_status_label = ctk.CTkLabel(
+                r, text=("已授權" if granted else "未授權"),
+                font=ctk.CTkFont(FONT_FAMILY_TEXT, 13, "bold"),
+                text_color=(SUCCESS if granted else DANGER),
+            )
+            self._permission_status_label.pack(side="right", padx=(0, 8))
+            ctk.CTkButton(
+                r, text="開啟權限引導", width=110, height=28, corner_radius=8,
+                fg_color=SURF_2, text_color=TEXT_1, hover_color=SURF_3,
+                border_width=1, border_color=SURF_3,
+                font=ctk.CTkFont(FONT_FAMILY_TEXT, 12),
+                command=self._open_accessibility_guide,
+            ).pack(side="right")
+
+        self._row(
+            page, "about", "about_permission", "權限狀態",
+            "熱鍵運作需要 macOS「輔助使用」權限；Windows 不需額外授權，永遠顯示已授權。",
+            permission_row, search_terms=("權限", "輔助使用", "accessibility"),
+        )
+
+        def logpath_row(r):
+            ctk.CTkButton(
+                r, text="開啟資料夾", width=110, height=28,
+                image=get_icon("folder", 14, ACCENT_HV), compound="left",
+                fg_color="transparent", border_width=1, border_color=SURF_3,
+                text_color=ACCENT_HV, hover_color=SURF_2,
+                font=ctk.CTkFont(FONT_FAMILY_TEXT, 12), corner_radius=8,
+                command=lambda: _open_path_in_os_default(
+                    os.path.expanduser("~/.whisper_app")
+                ),
+            ).pack(side="right")
+
+        self._row(
+            page, "about", "about_logs", "日誌位置",
+            "~/.whisper_app 內含 config.json、logs/、dictionary.json；"
+            "Whisper 模型快取另存在 ~/.cache/huggingface。",
+            logpath_row, search_terms=("日誌", "log", "設定檔", "快取", "cache"),
+        )
+
+    def _open_accessibility_guide(self) -> None:
+        """開啟輔助使用權限引導對話框（沿用 main.py 首次啟動用的同一個 dialog）。"""
+        log_action("settings_accessibility_guide_opened")
+        AccessibilityDialog(self)
+
 
     def _on_model_preview(self, value: str) -> None:
         """模型選單即時預覽：更新下方說明文字。"""
@@ -5678,19 +6284,30 @@ class SettingsWindow(ctk.CTkToplevel):
 
         pack(before=anchor) 確保 vertex_frame 插在 Ollama 暖機 row 上面、
         而不是預設地附加到 ai section 最尾端。
+
+        v2.28.0：AI 潤飾進階設定搬進獨立對話框後，_vertex_frame 只在該
+        對話框開著時存在；對話框關閉時會把它設回 None，這裡多一層防呆
+        （winfo_exists 檢查 + try/except），避免使用者在對話框關閉後又點
+        主頁 chip 時對已銷毀的 widget 操作噴 TclError。
         """
-        if not hasattr(self, "_vertex_frame"):
+        vf = getattr(self, "_vertex_frame", None)
+        if vf is None:
             return
-        if self._polish_backend_var.get() == "vertex":
-            if not self._vertex_frame.winfo_ismapped():
-                anchor = getattr(self, "_ollama_warmup_anchor", None)
-                if anchor is not None and anchor.winfo_exists():
-                    self._vertex_frame.pack(fill="x", before=anchor)
-                else:
-                    self._vertex_frame.pack(fill="x")
-        else:
-            if self._vertex_frame.winfo_ismapped():
-                self._vertex_frame.pack_forget()
+        try:
+            if not vf.winfo_exists():
+                return
+            if self._polish_backend_var.get() == "vertex":
+                if not vf.winfo_ismapped():
+                    anchor = getattr(self, "_ollama_warmup_anchor", None)
+                    if anchor is not None and anchor.winfo_exists():
+                        vf.pack(fill="x", before=anchor)
+                    else:
+                        vf.pack(fill="x")
+            else:
+                if vf.winfo_ismapped():
+                    vf.pack_forget()
+        except Exception:
+            log_error("update_vertex_frame_visibility_failed")
 
     def _on_theme_clicked(self, new_theme: str) -> None:
         """使用者點主題 chip。跟現在不同就彈 confirm dialog。"""
@@ -5836,7 +6453,16 @@ class SettingsWindow(ctk.CTkToplevel):
                 log_error("settings_window_destroy_failed")
 
     def _collect_and_save(self) -> None:
-        """從表單欄位蒐集所有值、呼叫 cfg.save() 並通知主視窗。"""
+        """從表單欄位蒐集所有值、呼叫 cfg.save() 並通知主視窗。
+
+        v2.28.0 風險控管：Ollama 模型／Vertex AI／情境路由／Prompt 熱重載
+        這批欄位的 var 只在使用者開過「AI 潤飾進階設定」對話框（輸出頁
+        「AI 潤飾」列的「進階…」按鈕）才會被建立——多數使用者可能整個
+        session 都不會打開它。這裡逐一用 hasattr 防呆：var 不存在就跳過
+        （self.cfg 已經是 __init__ 深拷貝時的原值，不覆蓋＝值不變，不是
+        « 遺漏儲存 »），絕對不能讓「使用者只是想改模型/麥克風/快捷鍵按
+        儲存」這個最常見路徑因為 AttributeError 而整個設定視窗炸掉。
+        """
         self.cfg.model          = self._model_var.get()
         self.cfg.language       = self._lang_var.get()
         # F1（v2.12.0）：麥克風來源 — 顯示「（系統預設）」對應 None
@@ -5848,27 +6474,35 @@ class SettingsWindow(ctk.CTkToplevel):
         self.cfg.append_results = self._append_var.get()
         self.cfg.auto_copy      = self._autocopy_var.get()
         self.cfg.auto_paste     = self._autopaste_var.get()
-        # ── Ollama ────────────────────────────────────────────────────────
-        self.cfg.ollama_enabled  = self._ollama_enabled_var.get()
-        # v2.18.0：polish backend 三選一 + Vertex 設定
-        self.cfg.polish_backend    = self._polish_backend_var.get()
-        self.cfg.vertex_project_id = self._vertex_project_id_var.get().strip()
-        self.cfg.vertex_model      = self._vertex_model_var.get().strip()
-        # Bug D（v2.13.0）：貼上策略
+        # ── Ollama（進階設定對話框才有的欄位，見上方 docstring）───────────
+        if hasattr(self, "_ollama_enabled_var"):
+            self.cfg.ollama_enabled = self._ollama_enabled_var.get()
+        # v2.18.0：polish backend 三選一（主頁一定有）+ Vertex 設定（進階才有）
+        self.cfg.polish_backend = self._polish_backend_var.get()
+        if hasattr(self, "_vertex_project_id_var"):
+            self.cfg.vertex_project_id = self._vertex_project_id_var.get().strip()
+        if hasattr(self, "_vertex_model_var"):
+            self.cfg.vertex_model = self._vertex_model_var.get().strip()
+        # Bug D（v2.13.0）：貼上策略（主頁一定有）
         self.cfg.ollama_paste_strategy = self._paste_strategy_var.get()
-        model = self._ollama_model_var.get().strip()
-        if model:
-            self.cfg.ollama_model = model
-        url = self._ollama_url_var.get().strip()
-        if url:
-            self.cfg.ollama_base_url = url
-        # ── Phase 2 preset 路由 ──────────────────────────────────────────
-        self.cfg.preset_routing_enabled = self._routing_var.get()
-        self.cfg.preset_overrides = {
-            name: var.get() for name, var in self._preset_switch_vars.items()
-        }
-        # ── #2 熱重載 ─────────────────────────────────────────────────────
-        self.cfg.prompt_hot_reload = self._hot_reload_var.get()
+        if hasattr(self, "_ollama_model_var"):
+            model = self._ollama_model_var.get().strip()
+            if model:
+                self.cfg.ollama_model = model
+        if hasattr(self, "_ollama_url_var"):
+            url = self._ollama_url_var.get().strip()
+            if url:
+                self.cfg.ollama_base_url = url
+        # ── Phase 2 preset 路由（進階設定對話框才有的欄位）─────────────────
+        if hasattr(self, "_routing_var"):
+            self.cfg.preset_routing_enabled = self._routing_var.get()
+        if hasattr(self, "_preset_switch_vars"):
+            self.cfg.preset_overrides = {
+                name: var.get() for name, var in self._preset_switch_vars.items()
+            }
+        # ── #2 熱重載（進階設定對話框才有的欄位）───────────────────────────
+        if hasattr(self, "_hot_reload_var"):
+            self.cfg.prompt_hot_reload = self._hot_reload_var.get()
         # ── #4 字典 ──────────────────────────────────────────────────────
         self.cfg.dictionary_enabled = self._dict_enabled_var.get()
         self.cfg.dictionary_path    = self._dict_path_var.get().strip()
@@ -5885,6 +6519,23 @@ class SettingsWindow(ctk.CTkToplevel):
         self.cfg.mini_recording_window = self._mini_window_var.get()
         # ── A3（v2.7.0）動態效果偏好 ────────────────────────────────────
         self.cfg.reduce_motion_pref = self._reduce_motion_var.get()
+        # ── v2.28.0 設定視窗重排新增欄位（辨識／錄音／外觀／資料四類）─────
+        self.cfg.silero_vad_enabled = self._silero_vad_enabled_var.get()
+        try:
+            _thr = float(self._silero_vad_threshold_var.get().strip())
+            self.cfg.silero_vad_threshold = min(1.0, max(0.0, _thr))
+        except ValueError:
+            log_error("silero_vad_threshold_parse_failed",
+                      value=self._silero_vad_threshold_var.get())
+        self.cfg.recording_watchdog = self._recording_watchdog_var.get()
+        self.cfg.record_visual = self._record_visual_var.get()
+        self.cfg.suspicious_audio_capture = self._suspicious_audio_var.get()
+        try:
+            _max_mb = int(self._suspicious_audio_maxsize_var.get().strip())
+            self.cfg.suspicious_audio_max_size_mb = max(1, _max_mb)
+        except ValueError:
+            log_error("suspicious_audio_maxsize_parse_failed",
+                      value=self._suspicious_audio_maxsize_var.get())
         self.cfg.save()
         self._on_save_cb(self.cfg)   # 通知主視窗（destroy 由 _save 的 finally 負責）
 
@@ -5953,21 +6604,24 @@ class SettingsWindow(ctk.CTkToplevel):
         self._build_ollama_model_menu()
 
     def _reload_prompts_now(self) -> None:
-        """立即觸發 PromptReloader.reload_now()，並以狀態標籤顯示結果。"""
+        """立即觸發 PromptReloader.reload_now()，並以狀態標籤顯示結果。
+
+        v2.28.0：按鈕搬進「AI 潤飾進階設定」對話框後，回饋文字改寫到跟
+        按鈕同一個對話框裡的 _hot_reload_status_label（原本借用辨識頁的
+        _dict_status_label，兩者現在不在同一個視窗，使用者會看不到回饋）。
+        """
         reloader = getattr(self._parent, "_prompt_reloader", None)
         if reloader is None:
             return
         reloaded = reloader.reload_now()
+        label = getattr(self, "_hot_reload_status_label", None)
+        if label is None:
+            return
         if reloaded:
             names = ", ".join(f"{n}.py" for n in reloaded)
-            self._dict_status_label.configure(
-                text=f"已重新載入 {names}", text_color=SUCCESS,
-            )
+            label.configure(text=f"已重新載入 {names}", text_color=SUCCESS)
         else:
-            self._dict_status_label.configure(
-                text="Reload 失敗（檢查 console log）",
-                text_color=DANGER,
-            )
+            label.configure(text="Reload 失敗（檢查 console log）", text_color=DANGER)
 
     def _compute_dict_status(self) -> str:
         """讀字典檔回傳「目前 N 個 term + M 條 corrections」狀態字串。"""
@@ -6200,6 +6854,195 @@ class SettingsWindow(ctk.CTkToplevel):
         """從 SettingsWindow 觸發主視窗的 toast（避免設定視窗本身懸浮一個 toast）。"""
         try:
             self._parent._show_toast(msg)
+        except Exception:
+            pass
+
+    # ── 搜尋（v2.28.0）────────────────────────────────────────────────────────
+
+    def _run_search(self, event=None) -> None:
+        """搜尋列按 Enter：找到就切分類 + 高亮該列；找不到就 toast 提示。"""
+        query = self._search_var.get().strip()
+        if not query:
+            return
+        match = self._search_index.get(query)
+        if match is None:
+            for kw, target in self._search_index.items():
+                if query in kw or kw in query:
+                    match = target
+                    break
+        if match is None:
+            self._toast_via_parent(f"找不到「{query}」相關設定")
+            return
+        category, row_id = match
+        self._select_category(category)
+        self._highlight_row(row_id)
+
+    def _highlight_row(self, row_id: str) -> None:
+        """把某一列的底色短暫換成 MARK_BG（搜尋高亮），1.6 秒後淡回透明。"""
+        frame = self._row_frames.get(row_id)
+        if frame is None:
+            return
+        try:
+            if not frame.winfo_exists():
+                return
+            frame.configure(fg_color=MARK_BG)
+        except Exception:
+            return
+
+        def _revert():
+            try:
+                if frame.winfo_exists():
+                    frame.configure(fg_color="transparent")
+            except Exception:
+                pass
+
+        self.after(1600, _revert)
+
+    # ── 輸入電平即時表（v2.28.0，「錄音」分類唯一 Canvas）───────────────────
+    #
+    # 安全鐵律（血條最高）：這支獨立、最小的 sd.InputStream 絕對不能跟真正的
+    # 錄音搶麥克風裝置——每個 render tick 都會檢查主 App 是否進入錄音狀態，
+    # 是的話立刻釋放串流；任何失敗（權限、裝置忙碌、sounddevice 不可用）都
+    # 靜默降級成地板呼吸動畫，不影響設定視窗其他任何操作。
+
+    def _start_level_meter(self) -> None:
+        """進入「錄音」分類頁：重置波形引擎、啟動 render tick。"""
+        self._level_rms = 0.0
+        self._level_stream_failed = False
+        self._level_state_start = time.perf_counter()
+        self._level_last_tick = self._level_state_start
+        if self._level_engine is not None:
+            self._level_engine.reset()
+        self._level_tick()
+
+    def _stop_level_meter(self) -> None:
+        """離開「錄音」分類頁 / 關閉設定視窗：停 render tick + 釋放麥克風串流。"""
+        if self._level_after_id is not None:
+            try:
+                self.after_cancel(self._level_after_id)
+            except Exception:
+                pass
+            self._level_after_id = None
+        self._release_level_stream()
+
+    def _level_tick(self) -> None:
+        """電平表 render tick（20 FPS，跟主視窗 RENDER_TICK_MS 一致）。
+
+        每 tick 檢查主 App 是否正在錄音——是的話立刻放掉麥克風裝置（避免
+        跟真正的錄音搶裝置降質或失敗），並顯示地板呼吸動畫；主 App 錄完後
+        下個 tick 會自動嘗試重新接上麥克風。
+        """
+        if self._active_category != "recording":
+            return
+        try:
+            if not self.winfo_exists() or self._level_canvas is None or not self._level_canvas.winfo_exists():
+                return
+        except Exception:
+            return
+
+        main_recording = False
+        try:
+            main_recording = getattr(self._parent, "_state", None) == "recording"
+        except Exception:
+            pass
+
+        if main_recording:
+            if self._level_stream is not None:
+                self._release_level_stream()
+        elif self._level_stream is None and not self._level_stream_failed:
+            self._open_level_stream()
+
+        now = time.perf_counter()
+        dt_ms = max(0.0, (now - self._level_last_tick) * 1000.0)
+        self._level_last_tick = now
+        rms = self._level_rms if (self._level_stream is not None and not main_recording) else 0.0
+        self._level_engine.update(rms, dt_ms)
+
+        try:
+            self._level_canvas.delete("all")
+            elapsed_ms = (now - self._level_state_start) * 1000.0
+            _draw_spectral_bars(
+                self._level_canvas, self._level_engine,
+                width=self._LEVEL_METER_W, height=self._LEVEL_METER_H,
+                elapsed_ms=elapsed_ms, big=True,
+            )
+        except tk.TclError:
+            return
+
+        self._level_after_id = self.after(RENDER_TICK_MS, self._level_tick)
+
+    def _open_level_stream(self) -> None:
+        """開一個獨立、最小的麥克風串流只算 RMS，不錄音、不存音訊、完全不碰
+        AudioRecorder（不會干擾主錄音狀態機）。失敗一律靜默降級。"""
+        try:
+            import numpy as np
+            import sounddevice as sd
+            from recorder import SAMPLE_RATE as _sr, BLOCK_MS as _block_ms
+        except Exception:
+            self._level_stream_failed = True
+            return
+        if sd is None:
+            self._level_stream_failed = True
+            return
+        try:
+            device = self._resolve_preview_device_index()
+            blocksize = int(_block_ms / 1000 * _sr)
+
+            def _cb(indata, frames, time_info, status, _sw=self):
+                try:
+                    _sw._level_rms = float(np.sqrt(np.mean(indata ** 2)))
+                except Exception:
+                    pass
+
+            stream = sd.InputStream(
+                samplerate=_sr, channels=1, dtype="float32",
+                blocksize=blocksize, device=device, callback=_cb,
+            )
+            stream.start()
+            self._level_stream = stream
+        except Exception:
+            log_error("settings_level_meter_open_failed")
+            self._level_stream = None
+            self._level_stream_failed = True
+
+    def _release_level_stream(self) -> None:
+        """關掉目前的電平表麥克風串流（若有）。render tick 是否繼續跑不受影響。"""
+        stream = self._level_stream
+        self._level_stream = None
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                log_error("settings_level_meter_release_failed")
+
+    def _resolve_preview_device_index(self) -> Optional[int]:
+        """把麥克風下拉選單目前選的裝置名稱換成 PortAudio index；系統預設回 None。"""
+        sel = self._device_var.get()
+        if sel == "（系統預設）":
+            return None
+        for d in self._available_devices:
+            if d["name"] == sel:
+                return d["id"]
+        return None
+
+    def _on_preview_device_changed(self, _value: str = "") -> None:
+        """麥克風下拉選單變更時，若電平表正在跑就釋放舊串流，下個 tick 用新裝置重開。"""
+        if self._active_category == "recording":
+            self._release_level_stream()
+            self._level_stream_failed = False
+
+    def _on_window_destroyed(self, event=None) -> None:
+        """視窗即將銷毀時停掉電平表 render loop + 麥克風串流，避免殘留背景資源。
+
+        用 <Destroy> event binding（__init__ 裡 self.bind("<Destroy>", ...)）
+        而不是覆寫 destroy()：常見情境是使用者一開 Settings 就直接按
+        儲存／取消，從未離開過「錄音」分類頁，_select_category 的清理
+        路徑不會被觸發，需要補最後一道防線，而 <Destroy> event 涵蓋所有
+        銷毀路徑（顯式 .destroy()、WM 關閉、父視窗連鎖銷毀）。
+        """
+        try:
+            self._stop_level_meter()
         except Exception:
             pass
 
@@ -6564,20 +7407,81 @@ class AccessibilityDialog(ctk.CTkToplevel):
 #  HistoryWindow（Phase 3.2 歷史紀錄檢視）
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _hist_group_header_text(d) -> str:
+    """把一個 date 物件轉成分組標頭文字。
+
+    今天 → 「今天 · 8/14」；昨天 → 「昨天 · 8/13」；7 天內 → 「週三 · 8/12」；
+    同年較早 → 「8/5」；跨年 → 「2025/12/25」。
+    """
+    import datetime as _dt
+    today = _dt.date.today()
+    delta = (today - d).days
+    if delta == 0:
+        rel = "今天"
+    elif delta == 1:
+        rel = "昨天"
+    elif 0 < delta < 7:
+        rel = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"][d.weekday()]
+    else:
+        rel = None
+    date_str = f"{d.year}/{d.month}/{d.day}" if d.year != today.year else f"{d.month}/{d.day}"
+    return f"{rel} · {date_str}" if rel else date_str
+
+
+def _hist_first_sentence(text: str, max_chars: int) -> str:
+    """取第一句（遇中英文句尾標點或換行就切）、再依字數上限截斷。"""
+    import re
+    t = (text or "").strip()
+    if not t:
+        return "（空白）"
+    m = re.search(r"[。！？!?\n]", t)
+    if m and m.start() > 0:
+        t = t[:m.start()].strip()
+    if len(t) > max_chars:
+        t = t[:max_chars].rstrip() + "…"
+    return t or "（空白）"
+
+
+def _hist_format_row_meta(entry) -> str:
+    """清單 row 第二行 metadata：「14:32 · 0:18 · 96 字 · Claude」。"""
+    import datetime as _dt
+    time_str = _dt.datetime.fromtimestamp(entry.timestamp).strftime("%H:%M")
+    total_s = int(round(entry.duration_s or 0.0))
+    dur_str = f"{total_s // 60}:{total_s % 60:02d}"
+    display_text = entry.polished_text or entry.raw_text or ""
+    parts = [time_str, dur_str, f"{len(display_text)} 字"]
+    if entry.preset_used and entry.preset_used != "default":
+        p = _presets.PRESETS.get(entry.preset_used)
+        parts.append(p.display_name if p else entry.preset_used)
+    elif entry.target_app:
+        parts.append(entry.target_app)
+    return " · ".join(parts)
+
+
 class HistoryWindow(ctk.CTkToplevel):
     """歷史紀錄視窗（modal-less）。
 
-    左側：搜尋框 + 清單（時間、preset 標籤、摘要）
-    右側：選中項目的詳細內容（raw / polished 並排）+ 動作按鈕
+    左側：搜尋框 + 篩選 chip + 按天分組清單（日期標頭捲動時黏頂）
+    右側：選中項目的詳細內容（raw / polished 對照）+ 動作按鈕
+    底部：多選時出現「合併複製 N 段」列
 
     動作：
       • 複製 — 把 raw 或 polished 複製到剪貼簿
+      • 合併複製 — ⌘/Ctrl 點選多列後，依時間順序合併複製
       • 重新潤飾 — 呼叫主視窗的 _repolish_from_history
       • 刪除 — 從 DB 刪除並刷新清單
     """
 
     WIN_W = 980
     WIN_H = 640
+
+    # 篩選 chip：(key, 顯示文字)
+    _FILTER_CHIPS = (
+        ("all", "全部"),
+        ("polished", "已潤飾"),
+        ("dict", "有字典校正"),
+        ("long", ">30 秒"),
+    )
 
     def __init__(self, parent, store, on_repolish) -> None:
         """Args:
@@ -6598,34 +7502,43 @@ class HistoryWindow(ctk.CTkToplevel):
         self.after(50, self.lift)
 
         self._entries: list = []
-        self._selected_id: Optional[int] = None
+        self._entry_by_id: dict = {}
+        self._selected_ids: set = set()      # ⌘/Ctrl 多選集合
+        self._row_widgets: dict = {}         # entry.id -> row card widget
+        self._group_offsets: list = []       # [{widget,label,count_text,y}]，供 sticky header 用
+        self._filter_key: str = "all"
+        self._dict_terms_lc: set = set()     # 字典 term / correction 小寫快取，供「有字典校正」篩選
 
         self._build_ui()
+        self._load_dict_terms_cache()
         self._refresh(query="")
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
-        # 搜尋列
-        top = ctk.CTkFrame(self, height=56, fg_color=SURF_1, corner_radius=0)
-        top.pack(fill="x", side="top")
-        top.pack_propagate(False)
+        # 視窗三段式：搜尋/篩選列（固定）／主區（撐滿）／合併複製列（多選時才出現）
+        self.grid_rowconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=1)
 
-        row = ctk.CTkFrame(top, fg_color="transparent")
-        row.pack(fill="x", padx=SPACE_LG, pady=SPACE_MD)
+        # ── 搜尋 + 篩選列 ────────────────────────────────────────────────
+        top = ctk.CTkFrame(self, fg_color=SURF_1, corner_radius=0)
+        top.grid(row=0, column=0, sticky="ew")
+
+        search_row = ctk.CTkFrame(top, fg_color="transparent")
+        search_row.pack(fill="x", padx=SPACE_LG, pady=(SPACE_MD, SPACE_XS))
 
         ctk.CTkLabel(
-            row, text="搜尋",
-            font=ctk.CTkFont("SF Pro Text", 13),
+            search_row, text="搜尋",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
             text_color=TEXT_3,
         ).pack(side="left", padx=(0, 8))
 
         self._search_var = tk.StringVar(value="")
         entry = ctk.CTkEntry(
-            row,
+            search_row,
             textvariable=self._search_var,
             width=380, height=32,
-            font=ctk.CTkFont("SF Pro Text", 13),
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
             fg_color=SURF_2, border_color=SURF_3, text_color=TEXT_1,
             placeholder_text="輸入關鍵字（中文 ≥ 2 字、英文 ≥ 3 字）",
         )
@@ -6633,26 +7546,64 @@ class HistoryWindow(ctk.CTkToplevel):
         self._search_var.trace_add("write", lambda *_: self._on_search_changed())
 
         self._count_label = ctk.CTkLabel(
-            row, text="",
+            search_row, text="",
             font=ctk.CTkFont(FONT_FAMILY_MONO, 12),
             text_color=TEXT_3,
         )
         self._count_label.pack(side="right", padx=SPACE_SM)
 
-        # 主區：左清單 + 右詳細
+        chip_row = ctk.CTkFrame(top, fg_color="transparent")
+        chip_row.pack(fill="x", padx=SPACE_LG, pady=(0, SPACE_MD))
+
+        self._chip_buttons: dict = {}
+        for key, label in self._FILTER_CHIPS:
+            btn = ctk.CTkButton(
+                chip_row, text=label, width=0, height=26, corner_radius=999,
+                font=ctk.CTkFont(FONT_FAMILY_TEXT, 12),
+                fg_color=SURF_2, hover_color=SURF_3, text_color=TEXT_2,
+                border_width=1, border_color=SURF_3,
+                command=lambda k=key: self._set_filter(k),
+            )
+            btn.pack(side="left", padx=(0, SPACE_XS))
+            self._chip_buttons[key] = btn
+        self._update_chip_styles()
+
+        # ── 主區：左清單 + 右詳細 ────────────────────────────────────────
         body = ctk.CTkFrame(self, fg_color=BG)
-        body.pack(fill="both", expand=True, padx=0, pady=0)
+        body.grid(row=1, column=0, sticky="nsew")
+
+        list_col = ctk.CTkFrame(body, width=340, fg_color=SURF_1, corner_radius=0)
+        list_col.pack(side="left", fill="y")
+        list_col.pack_propagate(False)
+
+        # 日期黏頂列：固定在清單最上方，文字跟著捲動位置即時更新
+        self._sticky_header = ctk.CTkFrame(list_col, height=30, fg_color=SURF_2, corner_radius=0)
+        self._sticky_header.pack(side="top", fill="x")
+        self._sticky_header.pack_propagate(False)
+        self._sticky_date_label = ctk.CTkLabel(
+            self._sticky_header, text="",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 12, "bold"),
+            text_color=TEXT_2,
+        )
+        self._sticky_date_label.pack(side="left", padx=SPACE_MD)
+        self._sticky_count_label = ctk.CTkLabel(
+            self._sticky_header, text="",
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 11),
+            text_color=TEXT_3,
+        )
+        self._sticky_count_label.pack(side="right", padx=SPACE_MD)
 
         # 左清單（CTkScrollableFrame）
         self._list_frame = ctk.CTkScrollableFrame(
-            body,
+            list_col,
             width=340,
             fg_color=SURF_1,
             corner_radius=0,
             scrollbar_button_color=SURF_3,
             scrollbar_button_hover_color=SURF_4,
         )
-        self._list_frame.pack(side="left", fill="y")
+        self._list_frame.pack(side="top", fill="both", expand=True)
+        self._install_scroll_hook()
 
         # 分隔線
         ctk.CTkFrame(body, width=1, fg_color=SURF_3).pack(side="left", fill="y")
@@ -6663,6 +7614,44 @@ class HistoryWindow(ctk.CTkToplevel):
 
         self._build_empty_detail()
 
+        # ── 合併複製列（多選 ≥2 筆時才出現）──────────────────────────────
+        self._merge_bar = ctk.CTkFrame(self, height=52, fg_color=SURF_2, corner_radius=0)
+        self._merge_bar.grid(row=2, column=0, sticky="ew")
+        self._merge_bar.grid_propagate(False)
+        self._merge_bar.grid_remove()
+
+        merge_inner = ctk.CTkFrame(self._merge_bar, fg_color="transparent")
+        merge_inner.pack(fill="both", expand=True, padx=SPACE_LG, pady=SPACE_SM)
+
+        self._merge_bar_btn = ctk.CTkButton(
+            merge_inner, text="合併複製 0 段",
+            image=get_icon("copy", 15, TEXT_1),
+            compound="left",
+            width=160, height=32, corner_radius=8,
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
+            fg_color=ACCENT, hover_color=ACCENT_HV, text_color=TEXT_1,
+            command=self._merge_copy_selected,
+        )
+        self._merge_bar_btn.pack(side="right")
+
+    def _install_scroll_hook(self) -> None:
+        """接管清單 canvas 的 yscrollcommand，捲動（滾輪／拖拉／程式呼叫）時即時更新黏頂日期列。
+
+        沿用本檔既有的私有 API 存取慣例（見 `_blocks_container._parent_canvas`）。
+        只裝一次（CTkScrollableFrame 物件本身跨 refresh 不會重建，只有裡面的 row 會）。
+        """
+        try:
+            orig_set = self._list_frame._scrollbar.set
+            canvas = self._list_frame._parent_canvas
+
+            def _hooked(first, last, _orig=orig_set):
+                _orig(first, last)
+                self._update_sticky_header()
+
+            canvas.configure(yscrollcommand=_hooked)
+        except Exception:
+            pass
+
     def _build_empty_detail(self) -> None:
         """未選取時的空態畫面。"""
         for w in self._detail_frame.winfo_children():
@@ -6670,9 +7659,59 @@ class HistoryWindow(ctk.CTkToplevel):
         ctk.CTkLabel(
             self._detail_frame,
             text="← 從左側選取一筆紀錄",
-            font=ctk.CTkFont("SF Pro Text", 14),
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 14),
             text_color=TEXT_3,
         ).pack(expand=True)
+
+    # ── 篩選 ──────────────────────────────────────────────────────────────────
+
+    def _set_filter(self, key: str) -> None:
+        if key == self._filter_key:
+            return
+        self._filter_key = key
+        self._update_chip_styles()
+        self._refresh(query=self._search_var.get())
+
+    def _update_chip_styles(self) -> None:
+        for key, btn in self._chip_buttons.items():
+            active = (key == self._filter_key)
+            btn.configure(
+                fg_color=ACCENT if active else SURF_2,
+                hover_color=ACCENT_HV if active else SURF_3,
+                text_color=TEXT_1 if active else TEXT_2,
+                border_color=ACCENT if active else SURF_3,
+            )
+
+    def _passes_filter(self, e) -> bool:
+        if self._filter_key == "polished":
+            return e.has_polish()
+        if self._filter_key == "dict":
+            return self._has_dict_hit(e)
+        if self._filter_key == "long":
+            return (e.duration_s or 0.0) > 30.0
+        return True
+
+    def _load_dict_terms_cache(self) -> None:
+        """載入目前字典（term + correction 目標字）小寫快取，供「有字典校正」篩選比對。
+
+        這是啟發式判斷（比對目前字典內容是否出現在文字中），不是精確的「當時是否真的
+        套用過校正」旗標——history.db schema 沒有存這個旗標，不新增欄位是本次任務的限制。
+        """
+        try:
+            path = self._parent._dictionary_path()
+            terms = _dictionary.load_terms(path)
+            corrections = _dictionary.load_corrections(path)
+            merged = {t.lower() for t in terms if t}
+            merged.update(dst.lower() for _src, dst in corrections if dst)
+            self._dict_terms_lc = merged
+        except Exception:
+            self._dict_terms_lc = set()
+
+    def _has_dict_hit(self, e) -> bool:
+        if not self._dict_terms_lc:
+            return False
+        hay = f"{e.raw_text or ''} {e.polished_text or ''}".lower()
+        return any(term in hay for term in self._dict_terms_lc)
 
     # ── 資料刷新 ──────────────────────────────────────────────────────────────
 
@@ -6680,103 +7719,218 @@ class HistoryWindow(ctk.CTkToplevel):
         self.after(180, lambda q=self._search_var.get(): self._refresh(q))
 
     def _refresh(self, query: str) -> None:
-        """重新查詢並重建清單。"""
+        """重新查詢、套篩選 chip、按天分組重建清單。"""
         # 若搜尋框的內容已變動（使用者繼續打字），放棄這次舊 query
         if query != self._search_var.get():
             return
         if query.strip():
-            self._entries = self._store.search(query, limit=200)
+            fetched = self._store.search(query, limit=200)
         else:
-            self._entries = self._store.list_recent(limit=200)
+            fetched = self._store.list_recent(limit=200)
+        self._entries = [e for e in fetched if self._passes_filter(e)]
 
-        self._count_label.configure(text=f"{len(self._entries)} / {self._store.count()}")
+        self._count_label.configure(text=f"{len(self._entries)} / {self._store.count()} 符合")
 
         # 清空舊 list widgets
         for w in self._list_frame.winfo_children():
             w.destroy()
+        self._entry_by_id = {e.id: e for e in self._entries}
+        self._group_offsets = []
+        self._row_widgets = {}
 
         if not self._entries:
+            self._selected_ids = set()
             ctk.CTkLabel(
                 self._list_frame, text="（沒有符合的紀錄）",
-                font=ctk.CTkFont("SF Pro Text", 13),
+                font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
                 text_color=TEXT_4,
             ).pack(pady=20)
-            self._build_empty_detail()
+            self._sticky_date_label.configure(text="")
+            self._sticky_count_label.configure(text="")
+            self._on_selection_changed()
             return
 
-        # 渲染每筆
-        for entry in self._entries:
-            self._render_list_row(entry)
+        # 預設選第一筆（最新一筆）
+        self._selected_ids = {self._entries[0].id}
+        self._render_grouped_rows()
+        self._refresh_scroll_state()
+        self._on_selection_changed()
 
-        # 自動選第一筆
-        if self._entries:
-            self._select(self._entries[0])
+    def _refresh_scroll_state(self) -> None:
+        """兩段式：跟既有 D3-S5 auto-scroll 同一個保險（macOS Tk 第一輪 idle 有時還沒
+        commit layout，量測 winfo_y() / 捲到頂會拿到舊值），見 `_add_result_block` 的
+        `_scroll_to_top` 註解。"""
+        def _do():
+            try:
+                self._list_frame.update_idletasks()
+                self._list_frame._parent_canvas.yview_moveto(0.0)
+                self._recompute_group_offsets()
+                self._update_sticky_header()
+            except Exception:
+                pass
+        self.after(0, _do)
+        self.after(150, _do)
 
-    def _render_list_row(self, entry) -> None:
-        """渲染單筆清單 row（可點擊卡片）。"""
+    # ── 清單渲染（按天分組）──────────────────────────────────────────────────
+
+    def _render_grouped_rows(self) -> None:
+        """把 self._entries（timestamp DESC）依本地日期切段渲染，段與段之間插入日期標頭列。"""
         import datetime as _dt
-        selected = (entry.id == self._selected_id)
-        card = ctk.CTkFrame(
-            self._list_frame,
-            fg_color=SURF_2 if selected else SURF_1,
-            corner_radius=8,
-            border_width=1,
-            border_color=ACCENT if selected else SURF_3,
-        )
-        card.pack(fill="x", padx=SPACE_SM, pady=SPACE_XS)
 
-        time_str = _dt.datetime.fromtimestamp(entry.timestamp).strftime("%m/%d %H:%M")
-        preset = entry.preset_used
-        preset_badge = ""
-        if preset != "default":
-            display = _presets.PRESETS.get(preset)
-            preset_badge = display.display_name if display else preset
+        groups: list = []   # [(date, [entry, ...]), ...]
+        for e in self._entries:
+            d = _dt.datetime.fromtimestamp(e.timestamp).date()
+            if groups and groups[-1][0] == d:
+                groups[-1][1].append(e)
+            else:
+                groups.append((d, [e]))
 
-        header = ctk.CTkFrame(card, fg_color="transparent")
-        header.pack(fill="x", padx=10, pady=(8, 2))
+        for d, group_entries in groups:
+            label_text = _hist_group_header_text(d)
+            count_text = f"{len(group_entries)} 段"
+            header_row = self._render_day_header_row(label_text, count_text)
+            self._group_offsets.append({
+                "widget": header_row, "label": label_text,
+                "count_text": count_text, "y": 0,
+            })
+
+            day_max = max((ge.duration_s or 0.0) for ge in group_entries) or 1.0
+            for ge in group_entries:
+                self._render_list_row(ge, day_max)
+
+    def _render_day_header_row(self, label_text: str, count_text: str):
+        """日期分組標頭（清單內的天然邊界；同樣文字也用於黏頂列）。"""
+        row = ctk.CTkFrame(self._list_frame, fg_color=SURF_2, corner_radius=0, height=26)
+        row.pack(fill="x", side="top")
+        row.pack_propagate(False)
         ctk.CTkLabel(
-            header, text=time_str,
+            row, text=label_text,
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 12, "bold"),
+            text_color=TEXT_2,
+        ).pack(side="left", padx=SPACE_MD)
+        ctk.CTkLabel(
+            row, text=count_text,
             font=ctk.CTkFont(FONT_FAMILY_MONO, 11),
             text_color=TEXT_3,
-        ).pack(side="left")
-        if preset_badge:
-            ctk.CTkLabel(
-                header, text=f"· {preset_badge}",
-                font=ctk.CTkFont("SF Pro Text", 11),
-                text_color=ACCENT,
-            ).pack(side="left", padx=(6, 0))
-        if entry.has_polish():
-            ctk.CTkLabel(
-                header, text="✨",
-                font=ctk.CTkFont("SF Pro Text", 11),
-                text_color=INDIGO,
-            ).pack(side="right")
+        ).pack(side="right", padx=SPACE_MD)
+        return row
+
+    def _render_list_row(self, entry, day_max: float) -> None:
+        """渲染單筆清單 row：兩行文字（首句 + metadata）+ 底部時長橫條，共約 60pt。"""
+        card = ctk.CTkFrame(
+            self._list_frame,
+            fg_color=SURF_2 if entry.id in self._selected_ids else SURF_1,
+            corner_radius=8,
+            border_width=1,
+            border_color=ACCENT if entry.id in self._selected_ids else SURF_3,
+        )
+        card.pack(fill="x", padx=SPACE_SM, pady=SPACE_XS)
+        self._row_widgets[entry.id] = card
+
+        display_text = entry.polished_text or entry.raw_text or ""
+        ctk.CTkLabel(
+            card, text=_hist_first_sentence(display_text, 20),
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
+            text_color=TEXT_1, anchor="w",
+        ).pack(fill="x", padx=SPACE_SM, pady=(8, 2))
 
         ctk.CTkLabel(
-            card, text=entry.summary(46),
-            font=ctk.CTkFont("SF Pro Text", 13),
-            text_color=TEXT_1 if selected else TEXT_2,
-            wraplength=310, justify="left", anchor="w",
-        ).pack(fill="x", padx=10, pady=(0, 8))
+            card, text=_hist_format_row_meta(entry),
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 11),
+            text_color=TEXT_3, anchor="w",
+        ).pack(fill="x", padx=SPACE_SM, pady=(0, 4))
 
-        # 整張卡片可點擊
+        # 長度橫條：寬度 = 該段秒數 ÷ 當天最長（CTkFrame，非 Canvas）
+        track = ctk.CTkFrame(card, height=2, fg_color=SURF_3, corner_radius=0)
+        track.pack(fill="x", padx=SPACE_SM, pady=(0, 8))
+        frac = max(0.03, min(1.0, (entry.duration_s or 0.0) / day_max))
+        fill = ctk.CTkFrame(track, height=2, fg_color=ACCENT, corner_radius=0)
+        fill.place(x=0, y=0, relheight=1, relwidth=frac)
+
+        # 整張卡片可點擊；⌘（Mac）／Ctrl（跨平台）點選 = 多選 toggle
         for w in (card, *_walk_children(card)):
-            w.bind("<Button-1>", lambda e, en=entry: self._select(en))
+            w.bind("<Button-1>", lambda e, en=entry: self._on_row_plain_click(en))
+            w.bind("<Control-Button-1>", lambda e, en=entry: self._on_row_toggle_click(en))
+            if IS_MAC:
+                w.bind("<Command-Button-1>", lambda e, en=entry: self._on_row_toggle_click(en))
 
-    def _select(self, entry) -> None:
-        """選中某筆後刷新右側詳細。"""
-        self._selected_id = entry.id
-        # 重新渲染清單以更新 selected 視覺
-        # （不用重新查 DB，直接用快取的 self._entries）
-        for w in self._list_frame.winfo_children():
-            w.destroy()
-        for e in self._entries:
-            self._render_list_row(e)
+    def _recompute_group_offsets(self) -> None:
+        for off in self._group_offsets:
+            try:
+                off["y"] = off["widget"].winfo_y()
+            except Exception:
+                off["y"] = 0
 
-        self._build_detail(entry)
+    def _update_sticky_header(self, *_args) -> None:
+        """依目前捲動位置，把黏頂列文字換成「當前最上方那個分組」的日期／筆數。"""
+        if not self._group_offsets:
+            return
+        try:
+            top_y = self._list_frame._parent_canvas.canvasy(0)
+        except Exception:
+            return
+        current = self._group_offsets[0]
+        for off in self._group_offsets:
+            if off["y"] <= top_y + 2:
+                current = off
+            else:
+                break
+        self._sticky_date_label.configure(text=current["label"])
+        self._sticky_count_label.configure(text=current["count_text"])
+
+    # ── 選取（單選 / ⌘ 多選）──────────────────────────────────────────────────
+
+    def _on_row_plain_click(self, entry) -> None:
+        self._selected_ids = {entry.id}
+        self._on_selection_changed()
+
+    def _on_row_toggle_click(self, entry) -> None:
+        ids = set(self._selected_ids)
+        if entry.id in ids:
+            ids.discard(entry.id)
+        else:
+            ids.add(entry.id)
+        self._selected_ids = ids
+        self._on_selection_changed()
+
+    def _clear_selection(self) -> None:
+        self._selected_ids = set()
+        self._on_selection_changed()
+
+    def _apply_selection_styles(self) -> None:
+        for eid, card in self._row_widgets.items():
+            sel = eid in self._selected_ids
+            try:
+                card.configure(
+                    fg_color=SURF_2 if sel else SURF_1,
+                    border_color=ACCENT if sel else SURF_3,
+                )
+            except Exception:
+                pass
+
+    def _on_selection_changed(self) -> None:
+        """選取集合變動後的單一進入點：重刷 row 高亮、右側詳細、合併複製列。"""
+        self._apply_selection_styles()
+        n = len(self._selected_ids)
+        if n >= 2:
+            self._merge_bar_btn.configure(text=f"合併複製 {n} 段")
+            self._merge_bar.grid()
+            self._build_multi_detail()
+        else:
+            self._merge_bar.grid_remove()
+            if n == 1:
+                entry = self._entry_by_id.get(next(iter(self._selected_ids)))
+                if entry is not None:
+                    self._build_detail(entry)
+                else:
+                    self._build_empty_detail()
+            else:
+                self._build_empty_detail()
+
+    # ── 右側詳細 ──────────────────────────────────────────────────────────────
 
     def _build_detail(self, entry) -> None:
-        """右側詳細視圖。"""
+        """右側單筆詳細視圖。"""
         import datetime as _dt
         for w in self._detail_frame.winfo_children():
             w.destroy()
@@ -6804,16 +7958,17 @@ class HistoryWindow(ctk.CTkToplevel):
             meta_parts.append(p.display_name if p else entry.preset_used)
         ctk.CTkLabel(
             header, text="  ·  ".join(meta_parts),
-            font=ctk.CTkFont("SF Pro Text", 12),
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 12),
             text_color=TEXT_3,
         ).pack(side="left", padx=SPACE_MD)
 
-        # 原文 / 潤飾 並排（潤飾在上，原文在下；有潤飾就顯示兩段）
+        # 原文 / 潤飾 對照（潤飾在上，原文在下；有潤飾就顯示兩段）
+        query = self._search_var.get().strip()
         if entry.polished_text:
-            self._build_text_block(self._detail_frame, "潤飾版", entry.polished_text, ACCENT)
-            self._build_text_block(self._detail_frame, "原文", entry.raw_text, TEXT_3)
+            self._build_text_block(self._detail_frame, "潤飾版", entry.polished_text, ACCENT, query)
+            self._build_text_block(self._detail_frame, "原文", entry.raw_text, TEXT_3, query)
         else:
-            self._build_text_block(self._detail_frame, "原文", entry.raw_text, TEXT_2)
+            self._build_text_block(self._detail_frame, "原文", entry.raw_text, TEXT_2, query)
 
         # 動作列
         bar = ctk.CTkFrame(self._detail_frame, fg_color="transparent", height=56)
@@ -6832,7 +7987,7 @@ class HistoryWindow(ctk.CTkToplevel):
             image=get_icon("copy", 15, TEXT_1),
             compound="left",
             width=140, height=32, corner_radius=8,
-            font=ctk.CTkFont("SF Pro Text", 13),
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
             fg_color=ACCENT, hover_color=ACCENT_HV, text_color=TEXT_1,
             command=lambda: _copy_text(entry.polished_text or entry.raw_text),
         ).pack(side="left", padx=SPACE_XS)
@@ -6841,7 +7996,7 @@ class HistoryWindow(ctk.CTkToplevel):
             ctk.CTkButton(
                 bar, text="複製原文",
                 width=110, height=32, corner_radius=8,
-                font=ctk.CTkFont("SF Pro Text", 13),
+                font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
                 fg_color=SURF_2, hover_color=SURF_3,
                 border_width=1, border_color=SURF_3,
                 text_color=TEXT_2,
@@ -6853,7 +8008,7 @@ class HistoryWindow(ctk.CTkToplevel):
             image=get_icon("sparkles", 15, TEXT_2),
             compound="left",
             width=110, height=32, corner_radius=8,
-            font=ctk.CTkFont("SF Pro Text", 13),
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
             fg_color=SURF_2, hover_color=SURF_3,
             border_width=1, border_color=SURF_3,
             text_color=TEXT_2,
@@ -6865,34 +8020,111 @@ class HistoryWindow(ctk.CTkToplevel):
             image=get_icon("x", 15, TEXT_3),
             compound="left",
             width=90, height=32, corner_radius=8,
-            font=ctk.CTkFont("SF Pro Text", 13),
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
             fg_color=SURF_2, hover_color=SURF_3,
             border_width=1, border_color=SURF_3,
             text_color=TEXT_3,
             command=lambda: self._delete_selected(entry.id),
         ).pack(side="right", padx=SPACE_XS)
 
-    def _build_text_block(self, parent, label: str, text: str, label_color: str) -> None:
-        """渲染一段標籤 + 文字區塊。"""
+    def _build_multi_detail(self) -> None:
+        """右側多選摘要視圖：列出已選段落 + 清除選取（合併複製動作在底部列）。"""
+        import datetime as _dt
+        for w in self._detail_frame.winfo_children():
+            w.destroy()
+
+        pad = 20
+        chosen = sorted(
+            (self._entry_by_id[i] for i in self._selected_ids if i in self._entry_by_id),
+            key=lambda e: e.timestamp,
+        )
+
+        ctk.CTkLabel(
+            self._detail_frame, text=f"已選取 {len(chosen)} 段",
+            font=ctk.CTkFont(FONT_FAMILY_UI, 17, "bold"),
+            text_color=TEXT_1, anchor="w",
+        ).pack(fill="x", padx=pad, pady=(pad, SPACE_SM))
+
+        preview = ctk.CTkScrollableFrame(self._detail_frame, fg_color=SURF_1, corner_radius=8)
+        preview.pack(fill="both", expand=True, padx=pad, pady=(0, SPACE_SM))
+        for e in chosen:
+            t = _dt.datetime.fromtimestamp(e.timestamp).strftime("%H:%M")
+            text = _hist_first_sentence(e.polished_text or e.raw_text or "", 40)
+            ctk.CTkLabel(
+                preview, text=f"{t} · {text}",
+                font=ctk.CTkFont(FONT_FAMILY_TEXT, 12),
+                text_color=TEXT_2, anchor="w", justify="left",
+            ).pack(fill="x", padx=SPACE_SM, pady=(SPACE_XS, 0))
+
+        ctk.CTkButton(
+            self._detail_frame, text="清除選取",
+            width=110, height=32, corner_radius=8,
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 13),
+            fg_color=SURF_2, hover_color=SURF_3,
+            border_width=1, border_color=SURF_3,
+            text_color=TEXT_2,
+            command=self._clear_selection,
+        ).pack(anchor="w", padx=pad, pady=(0, pad))
+
+    def _merge_copy_selected(self) -> None:
+        """把目前多選的段落依時間先後合併，一次複製到剪貼簿。"""
+        chosen = sorted(
+            (self._entry_by_id[i] for i in self._selected_ids if i in self._entry_by_id),
+            key=lambda e: e.timestamp,
+        )
+        if len(chosen) < 2:
+            return
+        merged_text = "\n\n".join((e.polished_text or e.raw_text or "").strip() for e in chosen)
+        try:
+            import pyperclip
+            pyperclip.copy(merged_text)
+            self._toast(f"已複製 {len(chosen)} 段")
+            log_action("history_merge_copy", count=len(chosen))
+        except Exception:
+            log_error("history_merge_copy_failed")
+            self._toast("複製失敗")
+
+    def _build_text_block(self, parent, label: str, text: str, label_color: str, query: str = "") -> None:
+        """渲染一段標籤 + 文字區塊；query 非空時用 MARK_BG 高亮所有比對到的片段。"""
         block = ctk.CTkFrame(parent, fg_color="transparent")
         block.pack(fill="both", expand=True, padx=20, pady=(8, 0))
 
         ctk.CTkLabel(
             block, text=label,
-            font=ctk.CTkFont("SF Pro Text", 11, "bold"),
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11, "bold"),
             text_color=label_color,
         ).pack(anchor="w", pady=(0, 4))
 
         box = ctk.CTkTextbox(
             block,
             fg_color=SURF_1, border_color=SURF_3, border_width=1,
-            text_color=TEXT_1, font=ctk.CTkFont("SF Pro Text", 14),
+            text_color=TEXT_1, font=ctk.CTkFont(FONT_FAMILY_TEXT, 14),
             wrap="word", corner_radius=8,
             scrollbar_button_color=SURF_3,
         )
         box.pack(fill="both", expand=True)
         box.insert("1.0", text)
+        if query:
+            self._highlight_matches(box, text, query)
         box.configure(state="disabled")
+
+    def _highlight_matches(self, box, text: str, query: str) -> None:
+        """在 CTkTextbox 裡用 tag_config 高亮所有 query 命中片段（大小寫不分）。"""
+        try:
+            box.tag_config("hist_search_mark", background=MARK_BG)
+            low_text = (text or "").lower()
+            low_q = query.lower()
+            if not low_q:
+                return
+            start = 0
+            while True:
+                idx = low_text.find(low_q, start)
+                if idx == -1:
+                    break
+                box.tag_add("hist_search_mark", f"1.0+{idx}c", f"1.0+{idx + len(query)}c")
+                start = idx + len(query)
+        except Exception:
+            pass
 
     def _delete_selected(self, id: int) -> None:
         """刪除當前選中的紀錄並刷新。"""
@@ -6901,7 +8133,6 @@ class HistoryWindow(ctk.CTkToplevel):
             return
         log_action("history_deleted", id=id)
         self._toast("已刪除")
-        self._selected_id = None
         self._refresh(query=self._search_var.get())
 
     def _toast(self, msg: str) -> None:

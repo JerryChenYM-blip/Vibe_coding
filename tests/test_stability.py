@@ -1493,3 +1493,26 @@ def test_watchdog_skips_la_path():
     win = _make_watchdog_win(quiet_s=60 * 60, la=object())
     win._recording_watchdog_check()
     win._try_stop.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# v2.26.0 設定檔防護（事故回歸測試）
+#   2026-08-14 事故：sub agent 為了實測設定視窗而觸發存檔，把預設 Config()
+#   寫進使用者真實的 ~/.whisper_app/config.json，40 個欄位 39 個被重置。
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_config_save_is_noop_under_pytest():
+    """pytest 執行期間 Config.save() 必須不寫真實設定檔。"""
+    import json
+    import config as _cfg
+    real = _cfg.CONFIG_PATH
+    before = real.read_text(encoding="utf-8") if real.exists() else None
+
+    c = _cfg.Config()          # 一份全預設的 Config
+    c.model = "__SHOULD_NOT_BE_WRITTEN__"
+    c.save()                   # 在 pytest 下應該 no-op
+
+    after = real.read_text(encoding="utf-8") if real.exists() else None
+    assert after == before, "Config.save() 在 pytest 下不該動到真實設定檔"
+    if after:
+        assert "__SHOULD_NOT_BE_WRITTEN__" not in after
