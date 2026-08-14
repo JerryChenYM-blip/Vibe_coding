@@ -31,6 +31,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.filedialog as fd
+import tkinter.font as tkfont
 from typing import Optional
 
 import customtkinter as ctk
@@ -117,7 +118,8 @@ def _open_path_in_os_default(path) -> None:
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-WIN_W, WIN_H = 776, 880   # 視窗預設寬度 × 高度（像素）
+WIN_W, WIN_H = 776, 880   # 視窗預設寬度 × 高度（像素）—— 逃生門（record_visual
+# == "chamber"）專用，舊版面尺寸不動。
 # WIN_H 推導：實測 AppWindow.winfo_reqheight() ≈ 858（TopBar 60 + RecordCard 398 +
 # ResultCard 281 + ActionBar 58 + StatusBar 32 + 分隔線×3 + 內邊距），舊值 800
 # 會把 ActionBar（5 顆動作按鈕）與 StatusBar 擠出視窗下緣。預留 22px 緩衝。
@@ -126,6 +128,40 @@ WIN_W, WIN_H = 776, 880   # 視窗預設寬度 × 高度（像素）
 # margin、跟 card 自己的外距同一個節奏，不擠壓其他元件。RecordCard 高度反而
 # 因 canvas 280→160 變矮（少 120px），WIN_H 維持 880 綽綽有餘（多出的高度會
 # 讓下面 fill="both", expand=True 的 ResultCard 拿到更多轉錄文字顯示空間）。
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  主視窗骨架重寫（v2.28.0）── 「這個視窗是閱讀器、不是錄音器」
+#  錄音已有主場（R⌘ + 迷你條），主視窗注意力預算重分配：波形 33%→4.6%、
+#  轉錄流 50.7%→83%。record_visual != "chamber"（預設值）時全部走這組常數；
+#  record_visual == "chamber" 逃生門完全不碰這裡，繼續用上面的 WIN_W/WIN_H。
+# ─────────────────────────────────────────────────────────────────────────────
+
+SKELETON_WIN_W       = 704   # 視窗預設寬度
+SKELETON_WIN_H       = 900   # 視窗預設高度
+SKELETON_MIN_W       = 640   # minsize 寬
+SKELETON_MIN_H       = 640   # minsize 高
+
+SKELETON_CONTENT_COL = 640   # 內容欄設計寬度（行長保護基準）
+SKELETON_CONTENT_PAD = 32    # 內容欄左右 padding（640+32+32=704=預設視窗寬）
+SKELETON_CONTENT_MAX = 720   # 視窗拉寬時內容欄封頂——超過此寬度後多出的空間
+                              # 全部變成左右留白，不再讓文字行長失控變長
+
+SKELETON_TOPBAR_H      = 56  # 頂列（狀態點＋文字、模式 pill、導覽圖示）
+SKELETON_STATUS_SLOT_H = 40  # 狀態槽（LevelMeter／Progress／Banner 共用一格）
+SKELETON_STREAM_H      = 724 # 轉錄流容器
+SKELETON_BOTTOMBAR_H   = 52  # 底列（統計文字 + 複製全部主鈕）
+# 28（標題列，系統繪製不計）+ 56+40+724+52 = 900 = SKELETON_WIN_H
+
+# StatusSlot LevelMeter 幾何：取代舊「waveform」模式 712×160 大卡片，把同一顆
+# 46-bar 三態儀表（idle_color／energy_color／process_color，數學沿用
+# WaveformEngine，見 tokens.py + waveform.py）壓進狀態槽的 640×32 橫條。
+# bar:gap = 9:5（舊版是 ~12:2 近乎密實），壓扁版空間不夠畫峰值帽／白色高光，
+# 兩者一律關閉（見 _draw_chamber_bars）。
+LEVEL_METER_W       = 640
+LEVEL_METER_H       = 32
+LEVEL_METER_GAP     = 5.0
+LEVEL_METER_X0      = 1.0
+LEVEL_METER_DRAW_W  = LEVEL_METER_W - LEVEL_METER_X0   # 639 = 46×9 + 45×5，整除對齊
 
 # ── 設計 Token（統一從 tokens.py 匯入，此模組內不重複定義任何 hex 色碼）────────
 from tokens import (
@@ -146,6 +182,17 @@ from tokens import (
     # Motion
     BREATHE_IDLE_MS, BREATHE_RECORDING_MS, BREATHE_PROCESSING_MS,
     ROTATE_PROCESSING_MS, RENDER_TICK_MS,
+    # v2.28.0 主視窗骨架重寫新增
+    CHROME, LINE, ROW_HI, ICON, SCROLL,
+    PILL_ON, PILL_ON_FG, PILL_OFF, PILL_OFF_FG,
+    BTN_BG, BTN_FG, BTN_DIS, BTN_DIS_FG,
+    RED_BG, RED_LINE, RED_TEXT,
+    # Aperture 主視窗內容層新增（UtteranceBlockV2 卡片 + 空狀態／最近區）
+    CARD, CARD_HI, LINE_HI, HAIR,
+    META, META_HI, TEXT_BODY, TEXT_BODY_2,
+    CYAN_TEXT, MARK, CHIP_BG,
+    SEG_BG, SEG_LINE, SEG_ON, SEG_ON_FG,
+    KEY_BG, KEY_LINE, SKEL, SKEL_2,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -327,6 +374,8 @@ def _draw_aperture_bars(
     peaks: Optional[list] = None,
     clipping: bool = False,
     elapsed_ms: float = 0.0,
+    gap: float = WAVE_GAP,
+    x0: float = 0.0,
 ) -> None:
     """主視窗 chamber 三態統一繪圖：同一份 bar 幾何、同一套 fill 邏輯。
 
@@ -342,49 +391,53 @@ def _draw_aperture_bars(
             processing 天生沒有這兩個概念，呼叫端留預設值即可。
         show_highlight: 白色鏡面高光（v > 0.22）只有 recording 態開啟——
             idle／processing 刻意關閉，維持設計要求的「乾淨、不搶戲」。
+        gap / x0: bar 間距與繪圖起點偏移（viewport 像素）。預設值 = 舊行為
+            （gap=WAVE_GAP、x0=0）——v2.28.0 主視窗骨架重寫的 StatusSlot
+            LevelMeter 需要不同的 bar:gap 密度，加這兩個參數而非另開一支
+            函式（幾何以外的邏輯完全共用，沒有理由複製一份）。
 
     呼叫端須自行先 canvas.delete("all")。
     """
     n = n_bars
-    bar_w = max(2.0, (width - (n - 1) * WAVE_GAP) / n)
+    bar_w = max(2.0, (width - (n - 1) * gap) / n)
     cy = height / 2.0
     margin = 10.0 if big else 3.0
     max_h = height / 2.0 - margin
 
     for i in range(n):
-        x0 = i * (bar_w + WAVE_GAP)
-        x1 = x0 + bar_w
+        bx0 = x0 + i * (bar_w + gap)
+        bx1 = bx0 + bar_w
 
         v = values[i]
         h = max(1.2, v * max_h)
         color = blend(color_fn(i, v), SURF_1, WAVE_CORE_ALPHA)
-        canvas.create_rectangle(x0, cy - h, x1, cy + h, fill=color, outline="")
+        canvas.create_rectangle(bx0, cy - h, bx1, cy + h, fill=color, outline="")
 
         if show_highlight and v > 0.22 and not _IS_LIGHT_THEME:
             hi_alpha = min(0.6, (v - 0.22) * 1.3)
             hi_color = blend("#FFFFFF", SURF_1, hi_alpha)
             canvas.create_rectangle(
-                x0, cy - 0.6, x1, cy + 0.6, fill=hi_color, outline=""
+                bx0, cy - 0.6, bx1, cy + 0.6, fill=hi_color, outline=""
             )
 
         if big and peaks is not None and peaks[i] > 0.08:
             ph = peaks[i] * max_h
             peak_color = blend(energy_color(peaks[i]), SURF_1, 0.42)
             canvas.create_rectangle(
-                x0, cy - ph - 2.4, x1, cy - ph - 0.6, fill=peak_color, outline=""
+                bx0, cy - ph - 2.4, bx1, cy - ph - 0.6, fill=peak_color, outline=""
             )
             canvas.create_rectangle(
-                x0, cy + ph + 0.6, x1, cy + ph + 2.4, fill=peak_color, outline=""
+                bx0, cy + ph + 0.6, bx1, cy + ph + 2.4, fill=peak_color, outline=""
             )
 
     if clipping:
         alpha = 0.35 + 0.35 * (0.5 + 0.5 * math.sin(elapsed_ms * 0.012))
         clip_color = blend(WARN, SURF_1, alpha)
         canvas.create_rectangle(
-            0, cy - max_h - 1.2, width, cy - max_h - 0.1, fill=clip_color, outline=""
+            x0, cy - max_h - 1.2, x0 + width, cy - max_h - 0.1, fill=clip_color, outline=""
         )
         canvas.create_rectangle(
-            0, cy + max_h + 0.1, width, cy + max_h + 1.2, fill=clip_color, outline=""
+            x0, cy + max_h + 0.1, x0 + width, cy + max_h + 1.2, fill=clip_color, outline=""
         )
 
 
@@ -706,6 +759,17 @@ class AppWindow(ctk.CTkFrame):
     _proc_sweep_use_real = False
     _proc_sweep_known_frac = 0.0
 
+    # v2.28.0 主視窗骨架重寫：同上緣故的 class-level 防禦性 net。_set_status /
+    # _apply_polish_button_style 等共用 helper 會先看 self._skeleton_mode 決定
+    # 走新骨架分支還是 chamber 逃生門分支；bare stub（AppWindow.__new__，
+    # tests/ 既有慣例）沒跑過 _build_ui 就不會有這個 instance attr。
+    # 預設 False（不是真實預設值 True）是刻意的：既有 test stub 只 mock
+    # 了 chamber 逃生門那組舊 widget（_status_dot/_status_label 等），
+    # 這裡的 class default 選「跟既有 test fixture 相容的值」，而不是
+    # 「跟真實執行狀態相符的值」——真正跑起來的 AppWindow 一定會經過
+    # _build_ui() 把這個值蓋成正確的 True/False，class default 只是防炸網。
+    _skeleton_mode = False
+
     def __init__(self, master: ctk.CTk, cfg: Config) -> None:
         super().__init__(master, fg_color=BG, corner_radius=0)
         self.pack(fill="both", expand=True)
@@ -977,6 +1041,15 @@ class AppWindow(ctk.CTkFrame):
                 self.history_store = HistoryStore()
             except Exception:
                 log_error("history_store_init_failed")
+        # Aperture 空狀態的「最近」區需要 self.history_store：_build_ui()
+        # 在上面這段賦值之前就跑過一次（_show_placeholder 已建好空狀態
+        # plate），當時 self.history_store 這個 instance attr 還不存在
+        # （_build_recent_block 用 getattr 防炸，直接回 None）。這裡補一次
+        # 重建，讓空狀態抓到剛剛才存在的 history_store——不然要等使用者錄
+        # 一段又清除才會刷新，冷啟動永遠看不到「最近」。
+        if self._skeleton_mode and not self._utterance_blocks:
+            self._clear_placeholder()
+            self._show_placeholder()
         # 啟動 1 分鐘後跑一次保留策略清理（不阻塞 UI 建構）
         self.after(60_000, self._run_history_retention)
 
@@ -990,12 +1063,532 @@ class AppWindow(ctk.CTkFrame):
     # ═══════════════════════════════════════════════════════════════════════
 
     def _build_ui(self) -> None:
-        """依序建立五大 UI 區塊（由上到下）。"""
+        """依 cfg.record_visual 分派版面：新骨架（預設）或 chamber 逃生門。
+
+        v2.28.0 主視窗骨架重寫——逃生門要求「cfg.record_visual == 'chamber'
+        時完全退回舊版面……新骨架一行都不執行」，所以在最上層直接分派成
+        兩條完全獨立的建置序列，而不是在既有五個 _build_* 方法內部各自加
+        if/else（那樣兩條路徑會互相污染，稽核也麻煩）。
+        """
+        self._skeleton_mode = getattr(self.cfg, "record_visual", "waveform") != "chamber"
+        if self._skeleton_mode:
+            self._build_ui_skeleton()
+        else:
+            self._build_ui_legacy()
+
+    def _build_ui_legacy(self) -> None:
+        """cfg.record_visual == "chamber" 逃生門：完全原封不動的舊版面。"""
         self._build_topbar()
         self._build_record_card()
         self._build_result_card()
         self._build_action_bar()
         self._build_status_bar()
+
+    def _build_ui_skeleton(self) -> None:
+        """v2.28.0 主視窗骨架重寫（預設路徑）：「這個視窗是閱讀器、不是錄音器」。
+
+        內容欄 640pt（視窗拉寬時封頂 720pt，見 SKELETON_CONTENT_MAX）水平置中，
+        由上到下四段：頂列 56 / 狀態槽 40 / 轉錄流 724 / 底列 52。
+        """
+        self.configure(fg_color=BG)
+        # customtkinter 的 place() 不接受 width/height（會直接 raise）——
+        # 必須在建構子先給定初始寬度，之後 resize 改用 .configure(width=...)。
+        self._content = ctk.CTkFrame(
+            self, fg_color=BG, corner_radius=0,
+            width=SKELETON_CONTENT_COL + 2 * SKELETON_CONTENT_PAD,
+        )
+        self._content.place(relx=0.5, rely=0, anchor="n", relheight=1.0)
+        # pack_propagate 預設 True：容器會依「pack 進去的子元件」自動改自己
+        # 的尺寸，蓋掉上面剛設好的 width——鎖 False 讓內容欄寬度永遠只聽
+        # width= 這個設定值（初始 704，之後由 _on_skeleton_root_resize 動態調）。
+        self._content.pack_propagate(False)
+        self.bind("<Configure>", self._on_skeleton_root_resize, add="+")
+
+        self._build_topbar_v2()
+        self._build_status_slot()
+        self._build_stream_v2()
+        self._build_bottombar_v2()
+
+    def _on_skeleton_root_resize(self, event) -> None:
+        """視窗拉寬時內容欄跟著長，但封頂 SKELETON_CONTENT_MAX（行長保護）；
+        超過的寬度全部變成左右留白。
+
+        這支 bind 只掛在 self 上（見 _build_ui_skeleton），但 customtkinter
+        的 CTkFrame.bind() 會把事件實際轉綁到內部的 `!ctkcanvas` 子元件，
+        所以 event.widget 恆等於那個內部 canvas、不會等於 self 本尊——不能
+        用 `is self` 判斷（永遠 False）。因為這支 handler 只綁在 self 上、
+        沒有任何地方把它綁到別的 widget，收到的事件本來就只會是 self 自己
+        的尺寸變化（內部 canvas 是 1:1 貼齊 self 的），不需要再過濾來源。
+        """
+        content_w = min(event.width - 2 * SKELETON_CONTENT_PAD, SKELETON_CONTENT_MAX)
+        content_w = max(content_w, 200)   # 安全下限，避免視窗被硬拖到極端小時算出負值
+        self._content.configure(width=int(content_w))
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  v2.28.0 主視窗骨架重寫 —— 新版四段式版面（頂列／狀態槽／轉錄流／底列）
+    #  以下方法只在 self._skeleton_mode 為 True 時被呼叫（見 _build_ui）。
+    #  逃生門（record_visual == "chamber"）走再下面「Top bar」以降的舊方法，
+    #  兩條路徑完全獨立、互不呼叫、互不影響。
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # ── 共用 helper：頂列狀態點 + 兩行文字 ────────────────────────────────────
+
+    def _status_sub_text(self) -> str:
+        """頂列狀態副文：「模型 · 裝置 · 語言」（10.5pt mono，取整為 11）。"""
+        model  = self._model_var.get() if hasattr(self, "_model_var") else self.cfg.model
+        device = getattr(self.recorder, "_device_name", None) or "系統預設"
+        lang   = self._lang_var.get() if hasattr(self, "_lang_var") else self.cfg.language
+        return f"{model} · {device} · {lang}"
+
+    def _set_status(self, word: str, color: str) -> None:
+        """更新頂列狀態點（fg_color）＋主文（狀態字）＋副文（模型/裝置/語言）。
+
+        只給 skeleton 模式用——chamber 逃生門的 _status_dot/_status_label
+        是舊版 CTkLabel，configure 參數不同（text_color 而非 fg_color、
+        文字格式也不同），兩條路徑在各自呼叫點自行用
+        `if self._skeleton_mode: ... else: ...` 分岔，不共用這支函式。
+        """
+        self._status_dot.configure(fg_color=color)
+        self._status_label.configure(text=word)
+        self._status_sub_label.configure(text=self._status_sub_text())
+
+    # ── 共用 helper：模式 pill（自動貼上／潤飾共用同一套樣式）─────────────────
+
+    def _pill_font(self) -> ctk.CTkFont:
+        """pill 共用字型（快取一次；_style_pill 的動態寬度量測也用它）。"""
+        if getattr(self, "_pill_font_cache", None) is None:
+            self._pill_font_cache = ctk.CTkFont(FONT_FAMILY_TEXT, 12)   # 規格 11.5、取整
+        return self._pill_font_cache
+
+    def _style_pill(self, btn: ctk.CTkButton, on: bool, label: str) -> None:
+        """套用模式 pill 開／關樣式：形狀＋字元雙重編碼（●／○），不靠顏色。
+
+        寬度依文字動態量測（CTkButton 沒有 CSS 那種 auto-fit padding，
+        用字型 measure() 算出精確寬度 + 兩側 padding，比硬寫死一個數字
+        更貼近規格的「padding 0 11 / padding 0 10 + border 1」語意）。
+        """
+        font = self._pill_font()
+        if on:
+            text = f"●{label}"
+            pad = 11
+            btn.configure(
+                text=text, font=font, image=None,
+                fg_color=PILL_ON, text_color=PILL_ON_FG, hover_color=PILL_ON,
+                border_width=0, corner_radius=13, height=26,
+                width=font.measure(text) + pad * 2,
+            )
+        else:
+            text = f"○{label}"
+            pad = 10
+            btn.configure(
+                text=text, font=font, image=None,
+                fg_color="transparent", text_color=PILL_OFF_FG, hover_color=ROW_HI,
+                border_width=1, border_color=PILL_OFF, corner_radius=13, height=26,
+                width=font.measure(text) + pad * 2 + 2,   # +2：border 左右各 1pt
+            )
+
+    # ── 頂列 56pt ──────────────────────────────────────────────────────────
+
+    def _nav_icon_btn(self, parent, icon_name: str, command) -> ctk.CTkButton:
+        """頂列導覽圖示鈕：28×28、radius 7、hover 底 ROW_HI。"""
+        return ctk.CTkButton(
+            parent, text="", image=get_icon(icon_name, 14, ICON),
+            width=28, height=28, corner_radius=7,
+            fg_color="transparent", hover_color=ROW_HI,
+            command=command,
+        )
+
+    def _build_topbar_v2(self) -> None:
+        """頂列 56pt：取代舊 _build_topbar + _build_status_bar（狀態列併進來）。
+
+        左：狀態點 + 兩行文字｜中：flex｜右：兩顆模式 pill + 分隔線 + 三顆
+        導覽圖示（歷史／設定／⋯選單）。Canvas 物件 0（全 CTkFrame/Label/Button）。
+        """
+        bar = ctk.CTkFrame(self._content, height=SKELETON_TOPBAR_H,
+                            corner_radius=0, fg_color=CHROME)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+
+        inner = ctk.CTkFrame(bar, fg_color="transparent")
+        inner.pack(fill="both", expand=True, padx=(18, 20))
+
+        # 左：狀態點 + 兩行文字
+        left = ctk.CTkFrame(inner, fg_color="transparent")
+        left.pack(side="left", fill="y")
+
+        self._status_dot = ctk.CTkFrame(
+            left, width=8, height=8, corner_radius=4, fg_color=ACCENT,
+        )
+        self._status_dot.pack(side="left", padx=(0, SPACE_MD))
+
+        text_wrap = ctk.CTkFrame(left, fg_color="transparent")
+        text_wrap.pack(side="left")
+        self._status_label = ctk.CTkLabel(
+            text_wrap, text="就緒", anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 13, "bold"),   # 規格 12.5 semibold、取整
+            text_color=TEXT_1,
+        )
+        self._status_label.pack(anchor="w")
+        self._status_sub_label = ctk.CTkLabel(
+            text_wrap, text=self._status_sub_text(), anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 11),
+            text_color=TEXT_3,
+        )
+        self._status_sub_label.pack(anchor="w", pady=(3, 0))
+
+        # 中：flex spacer（最小 24pt，視窗縮到 SKELETON_MIN_W 仍不重疊）
+        ctk.CTkFrame(inner, fg_color="transparent", width=24).pack(
+            side="left", fill="x", expand=True
+        )
+
+        # 右：pill × 2 + 分隔線 + 導覽圖示 × 3——用內部 side="left" 保持
+        # 左到右閱讀順序，整包再貼齊右邊界。
+        right = ctk.CTkFrame(inner, fg_color="transparent")
+        right.pack(side="right")
+
+        pill_wrap = ctk.CTkFrame(right, fg_color="transparent")
+        pill_wrap.pack(side="left")
+        self._ap_btn = ctk.CTkButton(pill_wrap, command=self._toggle_auto_paste)
+        self._ap_btn.pack(side="left")
+        self._ollama_btn = ctk.CTkButton(pill_wrap, command=self._on_ollama)
+        self._ollama_btn.pack(side="left", padx=(6, 0))
+        self._refresh_ap_btn_style()
+        self._apply_polish_button_style(enabled=self.cfg.ollama_enabled, healthy=False)
+
+        # 分隔線左右各 gap4——padx 只給在分隔線這一側，nav_wrap 不再疊加，
+        # 避免 4+4 變 8（規格明確寫「gap 4 → 分隔線 → gap 4」，不是 4→8）。
+        ctk.CTkFrame(right, width=1, height=20, fg_color=LINE).pack(
+            side="left", padx=4
+        )
+
+        nav_wrap = ctk.CTkFrame(right, fg_color="transparent")
+        nav_wrap.pack(side="left")
+        self._nav_icon_btn(nav_wrap, "history", self._open_history).pack(
+            side="left", padx=(0, 2)
+        )
+        self._nav_icon_btn(nav_wrap, "settings", self._open_settings).pack(
+            side="left", padx=(0, 2)
+        )
+        self._menu_btn = self._nav_icon_btn(
+            nav_wrap, "more-horizontal", self._open_overflow_menu
+        )
+        self._menu_btn.pack(side="left")
+
+        # ── 相容殼 ──────────────────────────────────────────────────────────
+        # 以下幾顆 widget 在新骨架沒有對應的可見元件，但深處狀態機有幾十個
+        # 既有呼叫點會 .configure() 它們（計時器／貼上目標／熱鍵提示已是
+        # Mini HUD 的主場；模型/語言下拉選單併入設定視窗，見 SettingsWindow）。
+        # 刻意不逐一改那些呼叫點——那些邏輯不屬於這次「版面層」的範圍——
+        # 改成建立不 pack 的殼，讓呼叫落空但不炸。真正驅動轉錄的
+        # _model_var / _lang_var 仍是「活」的 StringVar（.get() 被 pipeline
+        # 讀取來決定實際轉錄用的模型/語言），不是殼。
+        self._model_var  = ctk.StringVar(value=self.cfg.model)
+        self._lang_var   = ctk.StringVar(value=self.cfg.language)
+        self._model_menu = ctk.CTkOptionMenu(self, values=list(MODEL_INFO.keys()), variable=self._model_var)
+        self._lang_menu  = ctk.CTkOptionMenu(self, values=list(LANGUAGE_OPTIONS.keys()), variable=self._lang_var)
+        self._hotkey_status = ctk.CTkLabel(self, text="")
+
+    def _open_overflow_menu(self) -> None:
+        """⋯ 溢出選單：清除本次結果 / 匯出本次為 .txt / 重新載入模型 / 關於。"""
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="清除本次結果", command=self._on_clear)
+        menu.add_command(label="匯出本次為 .txt", command=self._on_save)
+        menu.add_command(label="重新載入模型", command=self._reload_model_from_menu)
+        menu.add_separator()
+        menu.add_command(label="關於", command=self._open_settings)
+        try:
+            x = self._menu_btn.winfo_rootx()
+            y = self._menu_btn.winfo_rooty() + self._menu_btn.winfo_height()
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def _reload_model_from_menu(self) -> None:
+        """⋯ 選單「重新載入模型」：重跑一次目前選定模型的 warmup。"""
+        log_action("overflow_reload_model_clicked")
+        self._show_toast("正在重新載入模型…")
+        self._warmup_model()
+
+    # ── 狀態槽 40pt ────────────────────────────────────────────────────────
+
+    def _build_status_slot(self) -> None:
+        """狀態槽 40pt：同一個槽輪流顯示 5 種 payload（常態 LevelMeter／模型
+        暖機 Progress／banner）。取代舊 _build_record_card 的錄音卡片——這裡
+        不再可點擊，錄音已有主場（R⌘ + 迷你條），這個視窗是閱讀器。
+        """
+        slot = ctk.CTkFrame(self._content, height=SKELETON_STATUS_SLOT_H,
+                             corner_radius=0, fg_color=CHROME)
+        slot.pack(fill="x")
+        slot.pack_propagate(False)
+        ctk.CTkFrame(self._content, height=1, fg_color=LINE, corner_radius=0).pack(fill="x")
+        self._status_slot = slot
+        self._status_slot_active = "meter"
+
+        # Payload 1：LevelMeter（常態，繪製邏輯見 _draw_chamber_bars）
+        self._chamber_w = LEVEL_METER_W
+        self._chamber_h = LEVEL_METER_H
+        self._chamber = tk.Canvas(
+            slot, width=LEVEL_METER_W, height=LEVEL_METER_H,
+            bg=CHROME, highlightthickness=0, bd=0,
+        )
+        # 不綁 <Enter>/<Leave>/<Motion>/<ButtonPress-1>/<ButtonRelease-1>——
+        # 這個 canvas 不再可點擊，錄音已有主場（R⌘ + 迷你條）。
+        self._chamber.pack(pady=4)
+
+        # Payload 2：Progress（模型暖機，見 _warmup_model / _warmup_progress_tick）
+        self._warmup_progress = ctk.CTkProgressBar(
+            slot, width=LEVEL_METER_W, height=4, corner_radius=2,
+            mode="determinate", progress_color=WARN, fg_color=SURF_3,
+        )
+        self._warmup_progress.set(0.0)
+        self._warmup_progress_anim_id: Optional[str] = None
+
+        # Payload 3：Banner（麥克風無法啟動／轉錄失敗共用一種外觀，內容不同）
+        self._banner = ctk.CTkFrame(slot, fg_color="transparent")
+        ctk.CTkFrame(
+            self._banner, width=6, height=6, corner_radius=3, fg_color=RED_TEXT,
+        ).pack(side="left", padx=(20, 10))
+        self._banner_label = ctk.CTkLabel(
+            self._banner, text="", anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 12, "bold"), text_color=RED_TEXT,
+        )
+        self._banner_label.pack(side="left", fill="x", expand=True)
+        self._banner_btn = ctk.CTkButton(
+            self._banner, text="", height=24, corner_radius=6,
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11),
+            fg_color=RED_LINE, text_color=RED_TEXT,
+            hover_color=blend(RED_TEXT, RED_LINE, 0.25),
+        )
+        # _banner_btn 刻意不在這裡 pack——沒有 action 的 banner 不該顯示空鈕，
+        # 由 _status_slot_show_banner() 依有沒有給 action 決定要不要 pack。
+
+        # ── 相容殼：計時器／貼上目標／熱鍵提示已是 Mini HUD 的主場，新骨架
+        # 不再顯示；_transition_to_recording 等處仍有既有呼叫點，說明同
+        # _build_topbar_v2。
+        self._timer_label  = ctk.CTkLabel(self, text="")
+        self._target_label = ctk.CTkLabel(self, text="")
+        self._hotkey_hint  = ctk.CTkLabel(self, text="")
+
+        # 三態 LevelMeter 的引擎狀態（同舊版 _build_record_card 的等價設定，
+        # 只是不再綁點擊事件、canvas 尺寸換成 LEVEL_METER_W/H）。
+        self._state_start_time = time.perf_counter()
+        self._ripples: list[Ripple] = []
+        self._prev_rms = 0.0
+        self._reduce_motion = resolve_reduce_motion(
+            getattr(self.cfg, "reduce_motion_pref", "auto")
+        )
+        self._wave_engine: Optional[WaveformEngine] = WaveformEngine(n_bars=WAVE_N_BARS_MAIN)
+        self._wave_last_tick = time.perf_counter()
+        self._frozen_bars: Optional[list] = None
+        self._proc_sweep_use_real = False
+        self._proc_sweep_known_frac = 0.0
+
+        # 啟動渲染迴圈（idle／recording／processing 三態都靠這個 tick 驅動）
+        self._render_tick()
+
+    def _status_slot_set(self, mode: str) -> None:
+        """StatusSlot payload 切換：meter／progress／banner 三選一互斥顯示。"""
+        if getattr(self, "_status_slot_active", None) == mode:
+            return
+        self._chamber.pack_forget()
+        self._warmup_progress.pack_forget()
+        self._banner.pack_forget()
+        if mode == "banner":
+            self._status_slot.configure(fg_color=RED_BG)
+            self._banner.pack(fill="both", expand=True)
+        else:
+            self._status_slot.configure(fg_color=CHROME)
+            if mode == "progress":
+                self._warmup_progress.pack(pady=18)
+            else:
+                self._chamber.pack(pady=4)
+        self._status_slot_active = mode
+
+    def _status_slot_show_meter(self) -> None:
+        """StatusSlot 換回常態 LevelMeter。"""
+        self._status_slot_set("meter")
+
+    def _status_slot_show_progress(self) -> None:
+        """StatusSlot 換成模型暖機 Progress。"""
+        self._status_slot_set("progress")
+        if self._warmup_progress_anim_id is None:
+            self._warmup_progress_tick()
+
+    def _warmup_progress_tick(self) -> None:
+        """暖機 Progress bar 動畫：transcriber.warmup() 不回報中間進度，沒有
+        真實完成百分比可用。比照 _processing_sweep_progress 的既有哲學——
+        寧可誠實地跑一個等速循環動畫表示「還在跑」，也不要編一個假的完成
+        百分比。只在 StatusSlot 目前仍顯示 progress payload 時繼續排程。
+        """
+        if getattr(self, "_status_slot_active", None) != "progress":
+            self._warmup_progress_anim_id = None
+            return
+        cycle_s = 1.6
+        frac = (time.perf_counter() % cycle_s) / cycle_s
+        try:
+            self._warmup_progress.set(frac)
+        except tk.TclError:
+            self._warmup_progress_anim_id = None
+            return
+        self._warmup_progress_anim_id = self.after(50, self._warmup_progress_tick)
+
+    def _status_slot_show_banner(
+        self, message: str,
+        action_label: Optional[str] = None, action_cb=None,
+    ) -> None:
+        """StatusSlot 換成 Banner，顯示 message；給了 action_label + action_cb
+        才顯示右側動作鈕（麥克風無法啟動→設定；轉錄失敗→開啟日誌）。
+        """
+        self._banner_label.configure(text=message)
+        if action_label and action_cb is not None:
+            # padding 0 11：跟 pill 同一套「字型 measure() + 兩側 padding」
+            # 動態量寬，不用 CTkButton 預設的 140px 死板寬度。
+            btn_font = self._banner_btn.cget("font")
+            self._banner_btn.configure(
+                text=action_label, command=action_cb,
+                width=btn_font.measure(action_label) + 11 * 2,
+            )
+            self._banner_btn.pack(side="right", padx=(10, 20))
+        else:
+            self._banner_btn.pack_forget()
+        self._status_slot_set("banner")
+
+    # ── 轉錄流容器 724pt ───────────────────────────────────────────────────
+
+    def _build_stream_v2(self) -> None:
+        """轉錄流容器 724pt：滿版 CTkScrollableFrame，內含 UtteranceBlockV2
+        卡片、空狀態／「最近」區。取代整個舊 ResultCard（含 header／divider）。
+        捲動起始位置＝頂端（最新段在最上，沿用 v2.8.0 既有決定）。
+        """
+        self._blocks_container = ctk.CTkScrollableFrame(
+            self._content,
+            corner_radius=0,
+            fg_color=BG,
+            scrollbar_fg_color=BG,
+            scrollbar_button_color=SCROLL,
+            scrollbar_button_hover_color=SCROLL,
+        )
+        # padding 16 32 16 32：CTkScrollableFrame 沒有分邊 padding 參數，
+        # 用 pack 的 padx/pady 模擬（左右 32=SPACE_2XL、上下 16=SPACE_LG）。
+        self._blocks_container.pack(fill="both", expand=True, padx=SPACE_2XL, pady=SPACE_LG)
+        # 捲動條寬 6 radius 3——公開建構參數只能改顏色，寬度/圓角要動內部
+        # _scrollbar（CTkScrollbar 實例）才行；guard 起來避免未來 customtkinter
+        # 版本改內部結構時整段炸掉（沿用本檔既有的 _parent_canvas 存取慣例）。
+        try:
+            self._blocks_container._scrollbar.configure(width=6, corner_radius=3)
+        except Exception:
+            pass
+        self._utterance_blocks: list[UtteranceBlock] = []
+
+        # 內容層新增（skeleton 模式限定；chamber 逃生門的 _display_result
+        # 走 legacy 分支，完全不會碰這三個）：
+        #   _pending_block   — 轉錄中骨架卡（_transition_to_processing 建立、
+        #                       _display_result_skeleton／失敗處理收尾）
+        #   _time_separators — 已插入的時間分隔線，_on_clear 要一併清掉
+        #   _recent_below_frame — 有內容時（≤520pt）貼在所有 block 下方的
+        #                       「最近」區容器；先建好、預設不 pack
+        self._pending_block: Optional["UtteranceBlockV2"] = None
+        self._time_separators: list[ctk.CTkFrame] = []
+        self._recent_below_frame = ctk.CTkFrame(self._blocks_container, fg_color="transparent")
+
+        self._wraplength_debounce_id: Optional[str] = None
+        self._blocks_container.bind("<Configure>", self._on_blocks_container_resize, add="+")
+        self._placeholder_label: Optional[ctk.CTkBaseClass] = None
+        self._show_placeholder()
+
+        # ── 相容殼：舊 ResultCard header（標題 + 原文/潤飾 toggle chip）在
+        # 新骨架被砍掉（本階段只做容器）；_rebuild_result_title /
+        # _apply_toggle_style 等既有邏輯仍會 .configure() 它們——那些是
+        # UtteranceBlock 層級的邏輯（下一階段做卡片時才會重新設計進卡片
+        # 本身），這裡不動，只補殼避免呼叫落空時炸掉。
+        self._result_title     = ctk.CTkLabel(self, text="")
+        self._seg_raw_btn      = ctk.CTkButton(self, text="")
+        self._seg_polished_btn = ctk.CTkButton(self, text="")
+
+    def _refresh_stream_stats(self) -> None:
+        """底列左側統計文字「本次 N 段 · M 字」+ 右側複製全部主鈕的
+        enable/disable 狀態，兩者共用同一份「目前有沒有結果」判斷。
+        """
+        if not self._skeleton_mode:
+            return
+        n = len(self._utterance_blocks)
+        chars = sum(len(b.get_current_text()) for b in self._utterance_blocks)
+        self._stream_stats_label.configure(
+            text=f"本次 {n} 段 · {chars:,} 字",
+            text_color=TEXT_3 if n == 0 else TEXT_2,
+        )
+        if n == 0:
+            self._copy_all_btn.configure(state="disabled", fg_color=BTN_DIS, text_color=BTN_DIS_FG)
+        else:
+            self._copy_all_btn.configure(state="normal", fg_color=BTN_BG, text_color=BTN_FG)
+        # 「最近」區顯示規則跟著 block 增減一起重算（單一 choke point，
+        # 所有會改動 _utterance_blocks 的地方都已經呼叫這支）。
+        self._refresh_recent_section()
+
+    def _on_copy_all(self) -> None:
+        """底列主鈕「複製全部」：依畫面顯示順序（最新在上）串接所有段落
+        目前顯示文字（尊重各自的原文／潤飾狀態），整份複製到剪貼簿。
+
+        跟舊版「複製」（_on_copy，只複製最新一段）是不同動作——新骨架的
+        主鈕文字明講「全部」，語意就該是全部，不能掛羊頭賣狗肉沿用舊
+        handler；但不動 UtteranceBlock，只用它既有的 get_current_text()
+        公開方法。
+        """
+        if not self._utterance_blocks:
+            log_action("copy_all_clicked_empty")
+            return
+        parts = [b.get_current_text().strip() for b in self._utterance_blocks]
+        text = "\n\n".join(p for p in parts if p)
+        if not text:
+            log_action("copy_all_clicked_empty")
+            return
+        try:
+            import pyperclip
+            pyperclip.copy(text)
+            log_action("copy_all_succeeded", text_len=len(text), blocks=len(parts))
+            self._show_toast(f"已複製全部 {len(self._utterance_blocks)} 段")
+        except Exception as e:
+            log_error("copy_all_failed", text_len=len(text))
+            self._show_toast(f"複製失敗: {e}")
+
+    # ── 底列 52pt ──────────────────────────────────────────────────────────
+
+    def _build_bottombar_v2(self) -> None:
+        """底列 52pt：取代舊 _build_action_bar 的六顆按鈕。左：統計文字；
+        右：主鈕「複製全部」。原六顆按鈕去向——自動貼上/潤飾→頂列 pill；
+        複製/存檔→移到卡片（下一階段）；歷史/設定→頂列圖示；清除→⋯選單。
+        """
+        ctk.CTkFrame(self._content, height=1, fg_color=LINE, corner_radius=0).pack(fill="x")
+        bar = ctk.CTkFrame(self._content, height=SKELETON_BOTTOMBAR_H,
+                            corner_radius=0, fg_color=CHROME)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+
+        inner = ctk.CTkFrame(bar, fg_color="transparent")
+        inner.pack(fill="both", expand=True, padx=20)
+
+        self._stream_stats_label = ctk.CTkLabel(
+            inner, text="", anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 12),   # 規格 11.5、取整
+            text_color=TEXT_3,
+        )
+        self._stream_stats_label.pack(side="left", fill="y")
+
+        btn_font = ctk.CTkFont(FONT_FAMILY_TEXT, 13, "bold")   # 規格 12.5 semibold、取整
+        btn_text = "複製全部"
+        self._copy_all_btn = ctk.CTkButton(
+            inner, text=btn_text,
+            image=get_icon("copy", 14, BTN_FG),
+            compound="left",
+            height=32, corner_radius=8,
+            font=btn_font,
+            width=btn_font.measure(btn_text) + 14 + 7 + 16 * 2,   # icon+gap+左右padding 16
+            fg_color=BTN_BG, text_color=BTN_FG, hover_color=BTN_BG,
+            command=self._on_copy_all,
+        )
+        self._copy_all_btn.pack(side="right")
+
+        self._refresh_stream_stats()
 
     # ── Top bar ──────────────────────────────────────────────────────────────
 
@@ -1417,6 +2010,18 @@ class AppWindow(ctk.CTkFrame):
                 self._show_toast("⚠ 麥克風無法啟動（請確認權限或裝置）")
             except Exception:
                 pass
+            # v2.28.0 骨架重寫：把這個錯誤同時升級成 StatusSlot 的持久 Banner
+            # （toast 幾秒就消失，使用者切開別的視窗回來就看不到了）。現有
+            # recorder.start() 回傳值分不出「權限被拒」vs「裝置不見了」兩種
+            # 原因，訊息故意寫成兩者皆可的通用版本，不假裝能分辨。
+            if self._skeleton_mode:
+                try:
+                    self._status_slot_show_banner(
+                        "麥克風無法啟動，請確認權限或裝置",
+                        action_label="設定", action_cb=self._open_settings,
+                    )
+                except Exception:
+                    pass
             return
 
         # v2.21.4：若 recorder 因指定裝置（AirPods）未就緒而退回系統預設、提示使用者
@@ -1491,8 +2096,7 @@ class AppWindow(ctk.CTkFrame):
         )
         self._model_menu.configure(state="disabled")
         self._lang_menu.configure(state="disabled")
-        self._status_dot.configure(text_color=DANGER)
-        self._status_label.configure(text="  錄音中")
+        self._set_status("錄音中", DANGER)
 
         self._update_timer()
         # v2.16.0：streaming 轉錄啟用（邊講邊轉、長段語音放開後幾乎立即出結果）
@@ -1622,8 +2226,34 @@ class AppWindow(ctk.CTkFrame):
         self._timer_label.configure(text="")
         self._hotkey_hint.configure(text="轉錄中…")
         self._target_label.configure(text="")
-        self._status_dot.configure(text_color=WARN)
-        self._status_label.configure(text="  轉錄中，請稍候…")
+        if self._skeleton_mode:
+            # v2.28.0 骨架重寫：狀態點語意收窄——PROC(=INDIGO) 專職「處理中」，
+            # WARN 讓給「暖機中」（見 _warmup_model）。
+            self._set_status("處理中", INDIGO)
+            # v2.29.0：錄音一停就在轉錄流頂端插一張「轉錄中」骨架卡（固定
+            # 高度 88，避免真正內容填入時版面跳動）；_display_result_skeleton
+            # 完成後會就地把它填成 ready／failed，不會有「骨架卡消失、新卡片
+            # 彈出」的閃爍。狀態機不允許 processing 中再開始新錄音，同一時間
+            # 只會有一個 pending block，不用擔心覆蓋舊的。
+            self._clear_placeholder()
+            self._pending_block = UtteranceBlockV2(
+                self._blocks_container,
+                on_copy=self._on_block_copy, on_save=self._on_block_save,
+            )
+            prev_top = self._utterance_blocks[0] if self._utterance_blocks else None
+            if prev_top is not None:
+                prev_top.highlight_as_latest(False)
+                self._pending_block.pack(fill="x", pady=(0, 8), before=prev_top)
+            else:
+                self._pending_block.pack(fill="x", pady=(0, 8))
+            try:
+                self._blocks_container.update_idletasks()
+                self._blocks_container._parent_canvas.yview_moveto(0.0)
+            except Exception:
+                pass
+        else:
+            self._status_dot.configure(text_color=WARN)
+            self._status_label.configure(text="  轉錄中，請稍候…")
 
         tail  = full_audio[self._stream_samples:]
         model = self._model_var.get()
@@ -1720,8 +2350,14 @@ class AppWindow(ctk.CTkFrame):
         self._target_label.configure(text="")
 
         model = self._model_var.get()
-        self._status_dot.configure(text_color=SUCCESS)
-        self._status_label.configure(text=f"  就緒 ({model})")
+        if self._skeleton_mode:
+            # v2.28.0 骨架重寫：狀態點語意收窄——CYAN(=ACCENT) 專職「就緒」，
+            # 從閒置態原本的 SUCCESS(綠) 讓出來（SUCCESS 只留給「已貼上」toast
+            # 與權限已授權，見 tokens.py Aperture 第二輪語意收窄）。
+            self._set_status("就緒", ACCENT)
+        else:
+            self._status_dot.configure(text_color=SUCCESS)
+            self._status_label.configure(text=f"  就緒 ({model})")
 
         if result is not None:
             self._display_result(result)
@@ -2311,6 +2947,19 @@ class AppWindow(ctk.CTkFrame):
             failure_reason="asr",
         )
         self._show_toast("⚠ 轉錄失敗")
+        # v2.28.0 骨架重寫：toast 幾秒就消失，轉錄失敗這種「使用者可能沒看到」
+        # 的錯誤額外升級成 StatusSlot 的持久 Banner。
+        if self._skeleton_mode:
+            try:
+                self._status_slot_show_banner(
+                    "轉錄失敗，請查看日誌",
+                    action_label="開啟日誌",
+                    action_cb=lambda: _open_path_in_os_default(
+                        os.path.expanduser("~/.whisper_app/logs")
+                    ),
+                )
+            except Exception:
+                pass
 
     def _processing_timeout_check(self) -> None:
         """processing 狀態超過動態 timeout 沒結束 → 強制切回 idle（Fix 4 / 2026-05-21、
@@ -2418,6 +3067,13 @@ class AppWindow(ctk.CTkFrame):
                                has_polish_pending=self.cfg.ollama_enabled)
             except Exception:
                 log_error("history_insert_on_transcription_done")
+
+        # 「最近」區去重用：這筆剛存進歷史的 id 記回 latest block，
+        # _build_recent_block 才知道要排除掉、避免同一段內容卡片與
+        # 「最近」列重複出現。_transition_to_idle 上面已經呼叫過
+        # _display_result（→ block 已存在於 _utterance_blocks[0]）。
+        if self._skeleton_mode and self._current_history_id is not None and self._utterance_blocks:
+            self._utterance_blocks[0].history_id = self._current_history_id
 
         # 決定路徑：能潤飾就走潤飾流程，失敗自動降級回原文。
         # 規劃書 6.4「策略 B」：等潤飾完再貼，因此 auto-paste 也延到潤飾後。
@@ -2542,6 +3198,10 @@ class AppWindow(ctk.CTkFrame):
         # polish 跑回來時這個 ref 可能已被 delete（不在 list 內）或不再是 latest，
         # _finish_polish 用 identity 比對來決定是否安全 set_polished。
         target_block = self._utterance_blocks[0] if self._utterance_blocks else None
+        if self._skeleton_mode and target_block is not None:
+            # Aperture 卡片：segmented「潤飾」格切到載入態，讓使用者看得出
+            # AI 正在跑、不是卡住或忘記按。
+            target_block.set_polish_pending()
 
         # C2：三段式標題狀態（preset 名稱不會被後續 status 吃掉）
         self._title_preset = preset.display_name if preset_name != "default" else None
@@ -2675,6 +3335,11 @@ class AppWindow(ctk.CTkFrame):
             self._rebuild_result_title()
             self._show_toast(f"AI 潤飾失敗：{resp.error}")
             paste_text = raw_text
+            # Aperture 卡片：segmented「潤飾」格顯示失敗提示、降級回原文顯示。
+            # 只要求 block 還在 list 內（不要求仍是 latest）——即使使用者已經
+            # 錄了下一段，這張舊卡片自己潤飾失敗的事實不會變，仍可以標示。
+            if self._skeleton_mode and target_block is not None and target_block in self._utterance_blocks:
+                target_block.set_polish_failed()
         else:
             # 成功：把潤飾版寫進 target_block，但只在 block identity 仍成立時才寫
             polished = resp.text
@@ -2987,13 +3652,17 @@ class AppWindow(ctk.CTkFrame):
         _pipe_clear()
 
     def _display_result(self, result: TranscriptionResult) -> None:
-        """新增一個 UtteranceBlock，取代之前在 textbox 累積插入文字的做法。
+        """新增一段結果，取代之前在 textbox 累積插入文字的做法。
 
         Fix 19 Path B / 2026-05-23：
           • 每段獨立 block（時間戳 / 時長 / 文字 / 動作圖示）
           • 自動把前一段的「最新」邊框取消
-          • 新 block pack 在底部 + 自動 scroll-to-bottom 讓使用者看到
+          • 新 block pack 在頂端 + 自動 scroll-to-top 讓使用者看到
           • 標題仍顯示「最近一段的元資料」（時長 / 語言 / 模型）
+
+        v2.29.0：skeleton 模式（cfg.record_visual != "chamber"）分派給
+        _display_result_skeleton（新版 UtteranceBlockV2 卡片，含轉錄中骨架卡
+        收尾、失敗紅卡、時間分隔線）；chamber 逃生門走下面原封不動的舊路徑。
         """
         dur   = float(result.duration_seconds)
         lang  = (result.language.upper() if result.language else "?")
@@ -3004,6 +3673,11 @@ class AppWindow(ctk.CTkFrame):
         self._title_status = None
         self._rebuild_result_title()
 
+        if self._skeleton_mode:
+            self._display_result_skeleton(result, dur=dur, lang=lang, model=model)
+            return
+
+        # ── chamber 逃生門：原封不動的舊路徑 ──────────────────────────────
         # 清掉佔位符
         self._clear_placeholder()
 
@@ -3053,6 +3727,110 @@ class AppWindow(ctk.CTkFrame):
         self.after(0, _scroll_to_top)
         # 150ms 後再試一次（保險：layout 慢於預期）
         self.after(150, _scroll_to_top)
+        self._refresh_stream_stats()
+
+    # ── Aperture 卡片路徑（skeleton 模式限定）──────────────────────────────
+
+    _FAIL_TEXTS = (
+        "（轉錄失敗，請查看 log）",
+        "（轉錄超時，請重試）",
+    )
+
+    def _display_result_skeleton(
+        self, result: TranscriptionResult, *, dur: float, lang: str, model: str,
+    ) -> None:
+        """skeleton 模式的 _display_result：優先重用 _transition_to_processing
+        建立的轉錄中骨架卡（_pending_block），把它就地填成 ready／failed，
+        避免「骨架卡消失、新卡片彈出」的版面跳動；沒有 pending block（例如
+        測試直接呼叫、或 pending 已被其他流程清掉）才新建一張。
+        """
+        self._clear_placeholder()
+
+        import datetime as _dt
+        now = _dt.datetime.now()
+        timestamp_iso = now.strftime("%H:%M")
+        epoch = now.timestamp()
+
+        is_fail = result.text in self._FAIL_TEXTS
+
+        if self._pending_block is not None:
+            block = self._pending_block
+            self._pending_block = None
+        else:
+            block = UtteranceBlockV2(
+                self._blocks_container, on_copy=self._on_block_copy, on_save=self._on_block_save,
+            )
+
+        block.timestamp_iso = timestamp_iso
+        if is_fail:
+            block.set_failed(result.text)
+        else:
+            corrections = list(dict.fromkeys(getattr(result, "corrections", None) or []))
+            block.set_result(
+                raw_text=result.text, timestamp_iso=timestamp_iso,
+                duration_s=dur, language=lang, model=model, corrections=corrections,
+            )
+
+        self._stream_insert_latest_block(block, epoch)
+
+    def _stream_insert_latest_block(self, block, epoch: float) -> None:
+        """把 block 插入 _blocks_container 最頂端、標為最新、必要時插入時間
+        分隔線（相鄰兩段間隔 > 10 分鐘）。供 _display_result_skeleton 與
+        _repolish_from_history 共用（都是 skeleton 模式限定）。
+        """
+        block.timestamp_epoch = epoch
+        prev_top = self._utterance_blocks[0] if self._utterance_blocks else None
+
+        if prev_top is not None:
+            gap_s = epoch - getattr(prev_top, "timestamp_epoch", epoch)
+            prev_top.highlight_as_latest(False)
+            if gap_s > 600:
+                sep = self._make_time_separator(gap_s)
+                sep.pack(fill="x", pady=(0, 8), before=prev_top)
+                self._time_separators.append(sep)
+                block.pack(fill="x", pady=(0, 8), before=sep)
+            else:
+                block.pack(fill="x", pady=(0, 8), before=prev_top)
+        else:
+            block.pack(fill="x", pady=(0, 8))
+
+        block.highlight_as_latest(True)
+        self._utterance_blocks.insert(0, block)
+
+        # 兩段式 auto-scroll（同 legacy 路徑的既有做法，見上方 _scroll_to_top）
+        def _scroll_to_top():
+            try:
+                self._blocks_container.update_idletasks()
+                self._blocks_container._parent_canvas.yview_moveto(0.0)
+            except Exception:
+                pass
+        self.after(0, _scroll_to_top)
+        self.after(150, _scroll_to_top)
+        self._refresh_stream_stats()
+
+    def _make_time_separator(self, gap_s: float) -> ctk.CTkFrame:
+        """時間分隔：高 20、左右 1pt HAIR 線、中間文字（間隔 N 分鐘/小時）。
+
+        letter-spacing .12em 未實作——tkinter 無原生支援，且用細空格模擬
+        字距會讓數字（分鐘數）可讀性變差，改用正常字距。
+        """
+        row = ctk.CTkFrame(self._blocks_container, fg_color="transparent", height=20)
+        row.pack_propagate(False)
+
+        m = max(1, int(gap_s // 60))
+        label = f"間隔 {m} 分鐘" if m < 60 else f"間隔 {m // 60} 小時"
+
+        ctk.CTkFrame(row, height=1, fg_color=HAIR).pack(
+            side="left", fill="x", expand=True, padx=(0, 10)
+        )
+        ctk.CTkLabel(
+            row, text=label,
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 10), text_color=TEXT_4,
+        ).pack(side="left")
+        ctk.CTkFrame(row, height=1, fg_color=HAIR).pack(
+            side="left", fill="x", expand=True, padx=(10, 0)
+        )
+        return row
 
     # ═══════════════════════════════════════════════════════════════════════
     #  AMBIENT CHAMBER — render loop + draw + events
@@ -3101,8 +3879,12 @@ class AppWindow(ctk.CTkFrame):
         """三態統一的 Aperture bar 視覺（46 bar，idle／recording／processing 共用）。
 
         只在 cfg.record_visual != "chamber" 時被 _draw_chamber() 呼叫（逃生
-        門）。同一個 canvas、同一份 46 bar 幾何、同一支 _draw_aperture_bars()，
-        三態的差異只在「bar 高度從哪來」與「顏色怎麼查」：
+        門）。v2.28.0 主視窗骨架重寫後，這支函式畫的是 StatusSlot 的壓扁版
+        LevelMeter（640×32，見 LEVEL_METER_* 常數），不再是舊版 712×160 大
+        record card——固定 big=False／show_highlight=False（32px 高度畫不下
+        峰值帽與白色高光，會糊成一團），bar:gap 密度也改用 LEVEL_METER_GAP
+        （9:5，比舊版更疏）。同一個 canvas、同一份 46 bar 幾何、同一支
+        _draw_aperture_bars()，三態的差異只在「bar 高度從哪來」與「顏色怎麼查」：
 
           idle       —— engine 用 rms=0 持續 update()，bars 落在行波地板附近
                         （呼吸律動），顏色查 idle_color（無彩度）。
@@ -3143,8 +3925,11 @@ class AppWindow(ctk.CTkFrame):
 
             if state == "recording":
                 color_fn = lambda i, v: energy_color(v)  # noqa: E731
+                # show_highlight 固定 False（見本函式 docstring：壓扁版 32px
+                # 高度畫不下白色高光）——tuple 第三個位置沿用既有結構、只是
+                # 值不再是 True，維持跟 idle 分支同一種「三元組」讀法。
                 peaks, clipping, show_highlight = (
-                    self._wave_engine.peaks, self._wave_engine.clipping, True,
+                    self._wave_engine.peaks, self._wave_engine.clipping, False,
                 )
             else:  # idle
                 # 閒置行波振幅：把引擎的「錄音態地板」1.6%→3.0% 線性映射到
@@ -3163,11 +3948,12 @@ class AppWindow(ctk.CTkFrame):
                 peaks, clipping, show_highlight = None, False, False
 
         _draw_aperture_bars(
-            c, WAVE_N_BARS_MAIN, self._chamber_w, self._chamber_h,
+            c, WAVE_N_BARS_MAIN, LEVEL_METER_DRAW_W, self._chamber_h,
             values, color_fn,
-            big=True, show_highlight=show_highlight,
+            big=False, show_highlight=show_highlight,
             peaks=peaks, clipping=clipping,
             elapsed_ms=elapsed_ms,
+            gap=LEVEL_METER_GAP, x0=LEVEL_METER_X0,
         )
 
     def _draw_chamber(self) -> None:
@@ -3602,6 +4388,31 @@ class AppWindow(ctk.CTkFrame):
             log_error("copy_failed", text_len=len(text))
             self._show_toast(f"複製失敗: {e}")
 
+    def _on_block_save(self, block: "UtteranceBlockV2") -> None:
+        """Aperture 卡片存檔圖示：只存這一段目前顯示的文字（跟舊版全域「存
+        檔」不同——那個存的是全部 block 串接，見 _on_save／_get_result_text）。
+        """
+        text = block.get_current_text().strip()
+        if not text:
+            log_action("save_clicked_empty", scope="block")
+            return
+        path = fd.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("文字檔", "*.txt"), ("所有檔案", "*.*")],
+            title="儲存這一段",
+        )
+        if path:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                log_action("save_succeeded", path=path, text_len=len(text), scope="block")
+                self._show_toast("已儲存")
+            except Exception as e:
+                log_error("save_file_failed", path=path, scope="block")
+                self._show_toast(f"儲存失敗: {e}")
+        else:
+            log_action("save_cancelled", scope="block")
+
     def _on_block_delete(self, block: "UtteranceBlock") -> None:
         """Per-block 刪除圖示：把這個 block 從畫面與列表中移除。
 
@@ -3618,6 +4429,7 @@ class AppWindow(ctk.CTkFrame):
         except Exception:
             pass
         log_action("block_deleted", remaining=len(self._utterance_blocks))
+        self._refresh_stream_stats()
 
         if not self._utterance_blocks:
             # 全清空 → 重置標題、toggle、顯示 placeholder
@@ -3677,6 +4489,23 @@ class AppWindow(ctk.CTkFrame):
             except Exception:
                 pass
         self._utterance_blocks.clear()
+        if self._skeleton_mode:
+            # 時間分隔線不在 _utterance_blocks 裡，要另外清；轉錄中骨架卡若
+            # 剛好還沒收尾（使用者在 processing 途中按清除）也一併砍掉——
+            # _display_result_skeleton 發現 _pending_block 是 None 時會自己
+            # 新建一張，不會因此炸掉。
+            for sep in self._time_separators:
+                try:
+                    sep.destroy()
+                except Exception:
+                    pass
+            self._time_separators.clear()
+            if self._pending_block is not None:
+                try:
+                    self._pending_block.destroy()
+                except Exception:
+                    pass
+                self._pending_block = None
         # 重置三段式標題
         self._title_base   = "轉錄結果"
         self._title_preset = None
@@ -3689,6 +4518,7 @@ class AppWindow(ctk.CTkFrame):
         self._showing_polished = True
         self._apply_toggle_style()
         self._show_placeholder()
+        self._refresh_stream_stats()
 
     def _toggle_auto_paste(self) -> None:
         """自動貼上按鈕：切換 auto_paste 開關並即時更新按鈕樣式。"""
@@ -3697,6 +4527,19 @@ class AppWindow(ctk.CTkFrame):
         self.cfg.save()
         log_settings("changed", field="auto_paste", old=old, new=self.cfg.auto_paste)
         on = self.cfg.auto_paste
+        self._refresh_ap_btn_style()
+        self._show_toast("自動貼上已開啟" if on else "自動貼上已關閉")
+
+    def _refresh_ap_btn_style(self) -> None:
+        """自動貼上按鈕外觀，依 self._skeleton_mode 分派——skeleton 走二態
+        pill（形狀＋字元編碼，見 _style_pill）；chamber 逃生門維持舊版
+        幽靈按鈕（實色 vs 描邊 + icon 變色）。共用於初始建置與切換後刷新，
+        避免同一段配色邏輯散落在 _build_topbar(_v2) / _toggle_auto_paste /
+        _on_settings_saved 三處各寫一份。"""
+        on = self.cfg.auto_paste
+        if self._skeleton_mode:
+            self._style_pill(self._ap_btn, on, "自動貼上")
+            return
         self._ap_btn.configure(
             fg_color=INDIGO if on else SURF_1,
             border_color=INDIGO if on else SURF_3,
@@ -3704,7 +4547,6 @@ class AppWindow(ctk.CTkFrame):
             hover_color=INDIGO_HV if on else SURF_2,
             image=get_icon("keyboard", 15, TEXT_1 if on else TEXT_3),
         )
-        self._show_toast("自動貼上已開啟" if on else "自動貼上已關閉")
 
     def _on_ollama(self) -> None:
         """手動按「潤飾」鈕：對「最新一段 block」執行一次潤飾。
@@ -3743,6 +4585,8 @@ class AppWindow(ctk.CTkFrame):
         self._polish_generation += 1
         gen = self._polish_generation
         target_block = latest
+        if self._skeleton_mode:
+            target_block.set_polish_pending()
 
         self._ollama_btn.configure(state="disabled", text="處理中…")
         self._polish_busy = True
@@ -3764,6 +4608,8 @@ class AppWindow(ctk.CTkFrame):
                 return
             if result.error:
                 self._show_toast(f"AI 潤飾失敗：{result.error}")
+                if self._skeleton_mode and target_block in self._utterance_blocks:
+                    target_block.set_polish_failed()
                 return
             block_ok = (
                 target_block in self._utterance_blocks
@@ -3825,7 +4671,17 @@ class AppWindow(ctk.CTkFrame):
         self.ollama.health_check_async(on_result=_on_result)
 
     def _apply_polish_button_style(self, enabled: bool, healthy: bool) -> None:
-        """把潤飾按鈕依「啟用 × 連線」四種組合畫出正確樣式。"""
+        """把潤飾按鈕依樣式規則畫出來。
+
+        v2.28.0 骨架重寫：skeleton 模式走二態 pill——跟自動貼上 pill 同一種
+        語意，pill 只反映「使用者有沒有打開這個功能」（enabled），不看
+        healthy；服務離線的提醒改由 _on_ollama() 點擊當下的 toast 負責，
+        不佔用 pill 的視覺語言（形狀＋字元編碼，沒有第三態）。chamber 逃生
+        門維持舊版「啟用 × 連線」四種組合的三態 ghost button，不動。
+        """
+        if self._skeleton_mode:
+            self._style_pill(self._ollama_btn, enabled, "潤飾")
+            return
         if not enabled:
             # 未啟用：完全灰態、不可按；點擊會顯示提示 toast（保留 state=normal 才能觸發）
             self._ollama_btn.configure(
@@ -4075,43 +4931,60 @@ class AppWindow(ctk.CTkFrame):
         # _finish_polish 完成時會更新「最新 block」（= 剛 append 的這個）的 polished_text。
         # 之前是塞回 textbox 整坨清空再 insert；block 化後改成 append + 標示最新。
         self._clear_placeholder()
-        if self._utterance_blocks:
-            self._utterance_blocks[0].highlight_as_latest(False)
 
         import datetime as _dt
         try:
             ts = _dt.datetime.fromtimestamp(entry.timestamp).strftime("%H:%M")
         except Exception:
             ts = _dt.datetime.now().strftime("%H:%M")
-        block = UtteranceBlock(
-            self._blocks_container,
-            raw_text=entry.raw_text,
-            timestamp_iso=f"{ts} (history)",
-            duration_s=float(entry.duration_s or 0.0),
-            language=entry.language or "?",
-            model=entry.model_whisper or "?",
-            on_copy=self._on_block_copy,
-            on_delete=self._on_block_delete,
-        )
-        # Bug 3（v2.8.0）：插最頂 + insert(0)
-        if self._utterance_blocks:
-            block.pack(
-                fill="x", padx=SPACE_XS, pady=(0, 8),
-                before=self._utterance_blocks[0],
+
+        if self._skeleton_mode:
+            block = UtteranceBlockV2(
+                self._blocks_container,
+                on_copy=self._on_block_copy, on_save=self._on_block_save,
             )
+            block.set_result(
+                raw_text=entry.raw_text, timestamp_iso=f"{ts}（歷史）",
+                duration_s=float(entry.duration_s or 0.0),
+                language=entry.language or "?", model=entry.model_whisper or "?",
+            )
+            block.history_id = entry.id
+            # _stream_insert_latest_block 內部已含「插頂端 + 標最新 + 兩段式
+            # scroll + _refresh_stream_stats」，不用再重複那串邏輯。
+            self._stream_insert_latest_block(block, epoch=float(entry.timestamp))
         else:
-            block.pack(fill="x", padx=SPACE_XS, pady=(0, 8))
-        block.highlight_as_latest(True)
-        self._utterance_blocks.insert(0, block)
-        # D3-S5：兩段式 scroll（同 _display_result）
-        def _scroll_to_top_history():
-            try:
-                self._blocks_container.update_idletasks()
-                self._blocks_container._parent_canvas.yview_moveto(0.0)
-            except Exception:
-                pass
-        self.after(0, _scroll_to_top_history)
-        self.after(150, _scroll_to_top_history)
+            if self._utterance_blocks:
+                self._utterance_blocks[0].highlight_as_latest(False)
+            block = UtteranceBlock(
+                self._blocks_container,
+                raw_text=entry.raw_text,
+                timestamp_iso=f"{ts} (history)",
+                duration_s=float(entry.duration_s or 0.0),
+                language=entry.language or "?",
+                model=entry.model_whisper or "?",
+                on_copy=self._on_block_copy,
+                on_delete=self._on_block_delete,
+            )
+            # Bug 3（v2.8.0）：插最頂 + insert(0)
+            if self._utterance_blocks:
+                block.pack(
+                    fill="x", padx=SPACE_XS, pady=(0, 8),
+                    before=self._utterance_blocks[0],
+                )
+            else:
+                block.pack(fill="x", padx=SPACE_XS, pady=(0, 8))
+            block.highlight_as_latest(True)
+            self._utterance_blocks.insert(0, block)
+            # D3-S5：兩段式 scroll（同 _display_result）
+            def _scroll_to_top_history():
+                try:
+                    self._blocks_container.update_idletasks()
+                    self._blocks_container._parent_canvas.yview_moveto(0.0)
+                except Exception:
+                    pass
+            self.after(0, _scroll_to_top_history)
+            self.after(150, _scroll_to_top_history)
+            self._refresh_stream_stats()
 
         self._apply_toggle_style()
         self._frontmost_app = entry.target_app   # 讓 preset 路由走原本的 app
@@ -4219,14 +5092,7 @@ class AppWindow(ctk.CTkFrame):
                 log_settings("device_applied", device="(system default)")
         except Exception:
             log_error("settings_apply_device_failed")
-        on = cfg.auto_paste
-        self._ap_btn.configure(
-            fg_color=INDIGO if on else SURF_1,
-            border_color=INDIGO if on else SURF_3,
-            text_color=TEXT_1 if on else TEXT_3,
-            hover_color=INDIGO_HV if on else SURF_2,
-            image=get_icon("keyboard", 15, TEXT_1 if on else TEXT_3),
-        )
+        self._refresh_ap_btn_style()
         # Ollama 設定同步：把新 cfg 推給 client，然後重新非同步探測一次
         self.ollama.apply_app_config(cfg)
         # v2.18.0：Vertex 設定同步 + polish backend router 更新
@@ -4749,9 +5615,18 @@ class AppWindow(ctk.CTkFrame):
             self.after(500, self._poll_window_visibility)
 
     def _warmup_model(self) -> None:
-        """背景預熱 Whisper 模型（延遲 1.5s 後執行，避免阻礙 UI 初始化）。"""
+        """背景預熱 Whisper 模型（延遲 1.5s 後執行，避免阻礙 UI 初始化）。
+
+        v2.28.0 骨架重寫：skeleton 模式下這是唯一會觸發 StatusSlot「Progress」
+        payload 的地方（AMBER 暖機中），完成後（成功或失敗）都要把 StatusSlot
+        換回常態 LevelMeter——三個入口都會排程到這裡（App 啟動、頂列模型
+        下拉選單、設定視窗儲存），單點處理不用在每個呼叫端各自複製一份。
+        """
         model = self._model_var.get()
         log.info(f"WARMUP: starting for model={model}")
+        if self._skeleton_mode:
+            self._set_status("暖機中", WARN)
+            self._status_slot_show_progress()
 
         def _load():
             try:
@@ -4759,14 +5634,26 @@ class AppWindow(ctk.CTkFrame):
                 backend = self.transcriber.active_backend()
                 label   = "⚡ Metal" if backend == "mlx" else "CPU"
                 log.info(f"WARMUP: complete (model={model} backend={backend})")
-                self.after(0, lambda: self._status_label.configure(
-                    text=f"  就緒 ({model} · {label})"
-                ))
-                self.after(0, lambda: self._status_dot.configure(text_color=SUCCESS))
+                def _done_ok():
+                    if self._skeleton_mode:
+                        self._set_status("就緒", ACCENT)
+                        self._status_slot_show_meter()
+                    else:
+                        self._status_label.configure(
+                            text=f"  就緒 ({model} · {label})"
+                        )
+                        self._status_dot.configure(text_color=SUCCESS)
+                self.after(0, _done_ok)
             except Exception:
                 log_error("warmup_failed", model=model)
-                self.after(0, lambda: self._status_label.configure(text="  模型載入失敗"))
-                self.after(0, lambda: self._status_dot.configure(text_color=DANGER))
+                def _done_fail():
+                    if self._skeleton_mode:
+                        self._set_status("錯誤", DANGER)
+                        self._status_slot_show_meter()
+                    else:
+                        self._status_label.configure(text="  模型載入失敗")
+                        self._status_dot.configure(text_color=DANGER)
+                self.after(0, _done_fail)
 
         threading.Thread(target=_load, daemon=True).start()
 
@@ -4970,8 +5857,17 @@ class AppWindow(ctk.CTkFrame):
         threading.Thread(target=_load, daemon=True).start()
 
     def _show_placeholder(self) -> None:
-        """沒有任何 UtteranceBlock 時，顯示置中的佔位符 label。"""
+        """沒有任何 UtteranceBlock 時，顯示置中的佔位符。
+
+        skeleton 模式：Aperture 空狀態組合（R⌘ 鍵帽 + 標題 + 說明 + 「最近」
+        4 筆，見 _build_empty_state_v2）——「空狀態不是空的」，用歷史紀錄
+        填掉，而不是單純一句「尚無內容」。chamber 逃生門維持原本的單行文字。
+        """
         if self._placeholder_label is not None or self._utterance_blocks:
+            return
+        if self._skeleton_mode:
+            self._placeholder_label = self._build_empty_state_v2()
+            self._placeholder_label.pack(fill="x", pady=(SPACE_XL, 0))
             return
         self._placeholder_label = ctk.CTkLabel(
             self._blocks_container,
@@ -4989,6 +5885,152 @@ class AppWindow(ctk.CTkFrame):
             except Exception:
                 pass
             self._placeholder_label = None
+
+    # ── Aperture 空狀態＋「最近」區（skeleton 模式限定）─────────────────────
+
+    def _build_empty_state_v2(self) -> ctk.CTkFrame:
+        """空狀態組合：R⌘ 鍵帽（依目前設定的熱鍵動態顯示）+ 標題 + 說明，
+        下方接「最近」4 筆（history_store 未啟用或沒有紀錄時該區塊不顯示）。
+        """
+        wrap = ctk.CTkFrame(self._blocks_container, fg_color="transparent")
+
+        plate = ctk.CTkFrame(wrap, fg_color="transparent")
+        plate.pack(fill="x", pady=(34, 40))
+
+        # R⌘ 鍵帽：74×60 radius 11 + 下緣多露 3px 的同色底框做出「立體感」
+        # （CTkFrame 的 corner_radius 是四角統一套用、無法只加粗某一邊
+        # border，用兩片堆疊模擬鍵帽厚度，比較貼近真實鍵帽的視覺）。
+        keycap_wrap = ctk.CTkFrame(plate, fg_color="transparent", width=74, height=63)
+        keycap_wrap.pack_propagate(False)
+        keycap_wrap.pack()
+        ctk.CTkFrame(
+            keycap_wrap, width=74, height=60, corner_radius=11, fg_color=KEY_LINE,
+        ).place(x=0, y=3)
+        keycap = ctk.CTkFrame(
+            keycap_wrap, width=74, height=60, corner_radius=11,
+            fg_color=KEY_BG, border_width=1, border_color=KEY_LINE,
+        )
+        keycap.place(x=0, y=0)
+        ctk.CTkLabel(
+            keycap, text=self.cfg.format_hotkey_display(),
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 20), text_color=TEXT_1,
+        ).place(relx=0.5, rely=0.46, anchor="center")
+
+        ctk.CTkLabel(
+            plate, text="按一下開始，再按一下結束",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 16, "bold"), text_color=TEXT_1,
+        ).pack(pady=(20, 0))
+        ctk.CTkLabel(
+            plate, text="轉錄會出現在這裡，並依設定自動貼到最前景的輸入框",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 13), text_color=TEXT_3,
+        ).pack(pady=(7, 0))
+
+        recent = self._build_recent_block(wrap, count=4, exclude_ids=set())
+        if recent is not None:
+            recent.pack(fill="x")
+
+        return wrap
+
+    def _refresh_recent_section(self) -> None:
+        """依「本次內容高度 ≤ 520pt」規則決定要不要在 blocks 下方顯示「最近」
+        區（3 筆）。空狀態（無 block）的 4 筆是 _build_empty_state_v2 自己的
+        一部分，不歸這支管。
+        """
+        if not self._skeleton_mode:
+            return
+        frame = self._recent_below_frame
+        for w in frame.winfo_children():
+            w.destroy()
+        frame.pack_forget()
+        if not self._utterance_blocks:
+            return
+        try:
+            self._blocks_container.update_idletasks()
+            total_h = sum(b.winfo_height() for b in self._utterance_blocks)
+        except Exception:
+            total_h = 0
+        if total_h > 520:
+            return
+        exclude_ids = {
+            getattr(b, "history_id", None) for b in self._utterance_blocks
+        } - {None}
+        inner = self._build_recent_block(frame, count=3, exclude_ids=exclude_ids)
+        if inner is not None:
+            inner.pack(fill="x")
+            frame.pack(fill="x", pady=(SPACE_LG, 0))
+
+    def _build_recent_block(
+        self, parent, count: int, exclude_ids: set,
+    ) -> Optional[ctk.CTkFrame]:
+        """「最近」eyebrow +最多 count 筆歷史列 +「全部歷史 ›」連結。
+
+        history_store 未啟用、初始化尚未跑到（_build_ui 早於 __init__ 設定
+        self.history_store，見 __init__ 補的那次重建）、或沒有可顯示的紀錄
+        時回 None，呼叫端不 pack。
+        """
+        store = getattr(self, "history_store", None)
+        if store is None:
+            return None
+        try:
+            entries = store.list_recent(limit=count + len(exclude_ids))
+        except Exception:
+            return None
+        entries = [e for e in entries if e.id not in exclude_ids][:count]
+        if not entries:
+            return None
+
+        box = ctk.CTkFrame(parent, fg_color="transparent")
+
+        head = ctk.CTkFrame(box, fg_color="transparent")
+        head.pack(fill="x", pady=(0, 6))
+        ctk.CTkLabel(
+            head, text="最近", anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 11), text_color=TEXT_4,
+        ).pack(side="left")
+        link = ctk.CTkLabel(
+            head, text="全部歷史 ›", anchor="e", cursor="hand2",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 11), text_color=CYAN_TEXT,
+        )
+        link.pack(side="right")
+        link.bind("<Button-1>", lambda e: self._open_history())
+
+        for entry in entries:
+            self._build_recent_row(box, entry)
+
+        return box
+
+    def _build_recent_row(self, parent, entry) -> None:
+        """「最近」區單一列：高 42 radius 7、時間欄寬 74、gap 14、
+        摘要單行截斷、hover 底 ROW_HI、點擊開啟歷史紀錄視窗。
+        """
+        row = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=7, height=42)
+        row.pack(fill="x", pady=(0, 1))
+        row.pack_propagate(False)
+
+        inner = ctk.CTkFrame(row, fg_color="transparent")
+        inner.pack(fill="both", expand=True, padx=12)
+
+        import datetime as _dt
+        ctk.CTkLabel(
+            inner, text=_dt.datetime.fromtimestamp(entry.timestamp).strftime("%H:%M"),
+            width=74, anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 11), text_color=TEXT_3,
+        ).pack(side="left")
+        ctk.CTkLabel(
+            inner, text=entry.summary(46), anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 12), text_color=TEXT_2,
+        ).pack(side="left", padx=(14, 0), fill="x", expand=True)
+
+        def _on_enter(_e=None, r=row):
+            r.configure(fg_color=ROW_HI)
+
+        def _on_leave(_e=None, r=row):
+            r.configure(fg_color="transparent")
+
+        for w in (row, inner, *_walk_children(inner)):
+            w.bind("<Enter>", _on_enter, add="+")
+            w.bind("<Leave>", _on_leave, add="+")
+            w.bind("<Button-1>", lambda e: self._open_history())
 
     def _get_result_text(self) -> str:
         """所有 block 串接（換行分隔）；給「存檔」用。"""
@@ -8282,6 +9324,509 @@ class UtteranceBlock(ctk.CTkFrame):
         """視窗 resize 時呼叫，讓文字 wrap 寬度跟著變。"""
         self._wraplength = new_wraplength
         self._text_label.configure(wraplength=new_wraplength)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  UtteranceBlockV2（Aperture 主視窗內容層 / v2.29.0）── 新骨架專用卡片
+# ─────────────────────────────────────────────────────────────────────────────
+#  只在 self._skeleton_mode（cfg.record_visual != "chamber"）時被建立；chamber
+#  逃生門完全走上面的舊 UtteranceBlock，兩個類別故意不共用一行程式碼、互不
+#  相依——改這裡不會波及 chamber 逃生門，反之亦然。
+#
+#  三個外部狀態（由 AppWindow 呼叫對應方法驅動，決定卡片整體長相）：
+#      loading ──set_result()──▶ ready
+#              ──set_failed()──▶ failed（終態，不會再變回 loading/ready）
+#  潤飾狀態疊加在 ready 之上（不影響 loading/failed）：
+#      none ──set_polish_pending()──▶ pending ──set_polished()──▶ ready
+#                                              └─set_polish_failed()─▶ failed
+#
+#  每次狀態切換都整段清掉子元件重建（_clear + _build_*），不做局部 patch。
+#  切換頻率低（一次轉錄、一次潤飾、一次 toggle），用「重建」換「不用維護
+#  一堆局部更新分支」的簡單，划算（簡單優先）。
+#
+#  公開 API 刻意跟舊 UtteranceBlock 同名同義（get_current_text / set_polished /
+#  set_showing_polished / highlight_as_latest / update_wraplength / raw_text /
+#  polished_text / showing_polished），AppWindow 既有呼叫點（_on_block_copy、
+#  _finish_polish 的 identity 比對等）才能兩種卡片共用同一段程式碼，只有
+#  「怎麼畫」不一樣、「怎麼被呼叫」維持一致。
+# ─────────────────────────────────────────────────────────────────────────────
+
+class UtteranceBlockV2(ctk.CTkFrame):
+    """Aperture 卡片：見本區塊頂部的狀態機說明。"""
+
+    BODY_MAX_LINES = 8   # 顯示行數 > 8 才截斷（≈200pt），見 _relayout_body
+
+    def __init__(self, master, *, on_copy, on_save, wraplength: int = 608) -> None:
+        super().__init__(master, corner_radius=9, border_width=1)
+        self._on_copy_cb = on_copy
+        self._on_save_cb = on_save
+        # tk.Text 用 pack(fill="x") 讓 Tk 自己依實際渲染寬度 reflow（見
+        # _build_body），不需要像舊版 CTkLabel.wraplength 那樣手動算像素寬。
+        # 保留這個欄位只是為了跟呼叫端既有的 update_wraplength(w) 簽章相容。
+        self._wraplength = wraplength
+
+        # ── 對外可見狀態（跟舊 UtteranceBlock 同名同義）──────────────────
+        self.raw_text: str            = ""
+        self.polished_text: Optional[str] = None
+        self.showing_polished: bool   = False
+        self.timestamp_iso: str       = ""
+        self.timestamp_epoch: float   = 0.0
+        self.duration_s: float        = 0.0
+        self.language: str            = ""
+        self.model: str                = ""
+        self.history_id: Optional[int] = None   # 供「最近」區跟目前 session 去重用
+
+        # ── 內部狀態 ─────────────────────────────────────────────────────
+        self._card_state: str    = "loading"   # loading / ready / failed
+        self._polish_state: str  = "none"      # none / pending / ready / failed
+        self._corrections: list[str] = []
+        self._is_latest  = True
+        self._hovering   = False
+        self._expanded   = False
+        self._body_text: Optional[tk.Text] = None
+        self._body_wrap: Optional[ctk.CTkFrame] = None
+        self._expand_row: Optional[ctk.CTkFrame] = None
+        self._expand_link: Optional[ctk.CTkLabel] = None
+        self._fail_message = ""
+
+        self._build_loading()
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  外部驅動 API（AppWindow 呼叫）
+    # ══════════════════════════════════════════════════════════════════════
+
+    def set_result(
+        self, *, raw_text: str, timestamp_iso: str, duration_s: float,
+        language: str, model: str, corrections: Optional[list[str]] = None,
+    ) -> None:
+        """loading → ready：填入真正的轉錄內容。"""
+        self.raw_text          = raw_text
+        self.polished_text     = None
+        self.showing_polished  = False
+        self.timestamp_iso     = timestamp_iso
+        self.duration_s        = duration_s
+        self.language          = language
+        self.model              = model
+        self._corrections      = list(corrections or [])
+        self._polish_state     = "none"
+        self._card_state       = "ready"
+        self._expanded          = False
+        self._build_ready()
+
+    def set_failed(self, message: str = "轉錄失敗") -> None:
+        """→ failed（終態）。呼叫端須自行先設好 self.timestamp_iso。"""
+        self._card_state   = "failed"
+        self._fail_message = message
+        self._build_failed()
+
+    def set_polish_pending(self) -> None:
+        """ready 狀態下、AI 潤飾已送出還沒回來——segmented「潤飾」格顯示載入態。"""
+        if self._card_state != "ready":
+            return
+        self._polish_state = "pending"
+        self._build_ready()
+
+    def set_polished(self, polished_text: str) -> None:
+        """潤飾完成：寫入潤飾版並切換顯示為潤飾版。"""
+        self.polished_text    = polished_text
+        self.showing_polished = True
+        self._polish_state    = "ready"
+        if self._card_state == "ready":
+            self._build_ready()
+
+    def set_polish_failed(self) -> None:
+        """潤飾失敗：降級回原文，segmented「潤飾」格顯示失敗提示。"""
+        if self._card_state != "ready":
+            return
+        self.polished_text    = None
+        self.showing_polished = False
+        self._polish_state    = "failed"
+        self._build_ready()
+
+    def get_current_text(self) -> str:
+        """目前顯示的文字（failed 卡沒有正文可複製、回空字串）。"""
+        if self._card_state != "ready":
+            return ""
+        if self.showing_polished and self.polished_text is not None:
+            return self.polished_text
+        return self.raw_text
+
+    def set_showing_polished(self, show_polished: bool) -> None:
+        """切換原文／潤飾版；無潤飾版時 noop。"""
+        if self.polished_text is None:
+            return
+        if show_polished == self.showing_polished:
+            return
+        self.showing_polished = show_polished
+        self._build_ready()
+
+    def highlight_as_latest(self, is_latest: bool) -> None:
+        """視覺標示「我是最新一段」（CARD_HI/LINE_HI vs CARD/LINE + 模型名顯示）。"""
+        self._is_latest = is_latest
+        self._apply_card_colors()
+        # 模型名只在最新段顯示、meta 行需要整段重建才能反映
+        if self._card_state == "ready":
+            self._build_ready()
+
+    def update_wraplength(self, new_width: int) -> None:
+        """視窗 resize 時呼叫：tk.Text 已經靠 pack(fill="x") 自動 reflow，
+        這裡只需要重新量一次顯示行數、決定要不要截斷（見 _relayout_body）。
+        """
+        self._wraplength = new_width
+        if self._body_text is not None:
+            self.after_idle(self._relayout_body)
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  版面重建
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _clear(self) -> None:
+        for w in self.winfo_children():
+            w.destroy()
+        self._body_text   = None
+        self._body_wrap   = None
+        self._expand_row  = None
+        self._expand_link = None
+
+    def _apply_card_colors(self) -> None:
+        if self._card_state == "failed":
+            self.configure(fg_color=RED_BG, border_color=RED_LINE)
+            return
+        fg = CARD_HI if self._is_latest else CARD
+        # 最新段邊框恆為 LINE_HI；舊段平常 LINE、hover 時暫時轉 LINE_HI。
+        border = LINE_HI if (self._is_latest or self._hovering) else LINE
+        self.configure(fg_color=fg, border_color=border)
+
+    def _bind_hover(self) -> None:
+        """整張卡（含所有子元件）hover 時邊框變化。add="+" 是必要的——子元件
+        裡的圖示鈕／segmented 按鈕自己已經綁了 <Enter>/<Leave> 做 hover_color，
+        不加 "+" 會直接蓋掉那些既有 binding、按鈕自己的 hover 回饋會消失。
+        """
+        def _enter(_e=None):
+            self._hovering = True
+            self._apply_card_colors()
+
+        def _leave(_e=None):
+            self._hovering = False
+            self._apply_card_colors()
+
+        for w in (self, *_walk_children(self)):
+            w.bind("<Enter>", _enter, add="+")
+            w.bind("<Leave>", _leave, add="+")
+
+    # ── loading 態：卡片高度固定 88，避免下一段內容填入時跳動 ──────────────
+
+    def _build_loading(self) -> None:
+        self._clear()
+        self.configure(height=88)
+        self.pack_propagate(False)
+        self._apply_card_colors()
+
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=16, pady=14)
+
+        # 3 條骨架：11pt 高、gap 9、寬 96%/88%/54%、色 SKEL/SKEL_2 交替。
+        bar_specs = ((0.96, SKEL), (0.88, SKEL_2), (0.54, SKEL))
+        for i, (frac, color) in enumerate(bar_specs):
+            row = ctk.CTkFrame(body, fg_color="transparent", height=11)
+            row.pack(fill="x", pady=(0 if i == 0 else 9, 0))
+            row.pack_propagate(False)
+            ctk.CTkFrame(row, fg_color=color, corner_radius=3).place(
+                relx=0, rely=0, relwidth=frac, relheight=1.0
+            )
+
+        self._bind_hover()
+
+    # ── failed 態：RED_BG/RED_LINE 卡片（終態）──────────────────────────
+
+    def _build_failed(self) -> None:
+        self._clear()
+        self.pack_propagate(True)
+        self._apply_card_colors()
+
+        wrap = ctk.CTkFrame(self, fg_color="transparent")
+        wrap.pack(fill="both", expand=True, padx=16, pady=(14, 16))
+
+        row = ctk.CTkFrame(wrap, fg_color="transparent", height=22)
+        row.pack(fill="x")
+        row.pack_propagate(False)
+        ctk.CTkLabel(
+            row, text=self.timestamp_iso, anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 11, "bold"), text_color=RED_TEXT,
+        ).pack(side="left")
+
+        ctk.CTkLabel(
+            wrap, text=f"⚠ {self._fail_message}", anchor="w", justify="left",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 13), text_color=RED_TEXT,
+            wraplength=560,
+        ).pack(fill="x", pady=(8, 0))
+
+        self._bind_hover()
+
+    # ── ready 態 ─────────────────────────────────────────────────────────
+
+    def _build_ready(self) -> None:
+        self._clear()
+        self.pack_propagate(True)
+        self._apply_card_colors()
+
+        # padding 14 上／16 左右／16 下（下比上多 2、補正文最後一行的行高餘白）
+        wrap = ctk.CTkFrame(self, fg_color="transparent")
+        wrap.pack(fill="both", expand=True, padx=16, pady=(14, 16))
+
+        self._build_meta_row(wrap)
+        self._build_body(wrap)
+
+        self._bind_hover()
+
+    def _build_meta_row(self, parent) -> None:
+        """meta 行：高 22、margin-bottom 10、元素 gap 9——時間｜長度·模型｜
+        校正 chip｜segmented｜圖示鈕（複製／存檔），單一橫向 flow，非兩端對齊。
+        """
+        row = ctk.CTkFrame(parent, fg_color="transparent", height=22)
+        row.pack(fill="x", pady=(0, 10))
+        row.pack_propagate(False)
+
+        time_color = META_HI if self._is_latest else META
+        ctk.CTkLabel(
+            row, text=self.timestamp_iso, anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 11, "bold"), text_color=time_color,
+        ).pack(side="left", padx=(0, 9))
+
+        # 規格「長度·模型」只列這兩項（語言刻意不放，維持 meta 行精簡）
+        meta_bits = [f"{self.duration_s:.0f}s"]
+        if self._is_latest and self.model:   # 模型名只在最新段顯示
+            meta_bits.append(self.model)
+        ctk.CTkLabel(
+            row, text=" · ".join(meta_bits), anchor="w",
+            font=ctk.CTkFont(FONT_FAMILY_MONO, 11), text_color=TEXT_4,
+        ).pack(side="left", padx=(0, 9))
+
+        if self._corrections:
+            chip_font = ctk.CTkFont(FONT_FAMILY_TEXT, 10, "bold")
+            chip_text = f"校正 {len(self._corrections)}"
+            ctk.CTkLabel(
+                row, text=chip_text, fg_color=CHIP_BG, text_color=CYAN_TEXT,
+                corner_radius=5, height=20,
+                width=chip_font.measure(chip_text) + 7 * 2,
+                font=chip_font,
+            ).pack(side="left", padx=(0, 9))
+
+        self._build_segmented(row)
+
+        icons = ctk.CTkFrame(row, fg_color="transparent")
+        icons.pack(side="left")
+        self._icon_btn(icons, "copy", self._handle_copy).pack(side="left", padx=(0, 4))
+        self._icon_btn(icons, "download", self._handle_save).pack(side="left")
+
+    def _icon_btn(self, parent, icon_name: str, command) -> ctk.CTkButton:
+        """圖示鈕 24×24 radius 6（複製 ⧉、存檔）——貼著它作用的那一段，
+        取代舊版放在底部工具列的複製/存檔按鈕。
+        """
+        color = META_HI if self._is_latest else META
+        return ctk.CTkButton(
+            parent, text="", image=get_icon(icon_name, 12, color),
+            width=24, height=24, corner_radius=6,
+            fg_color="transparent", hover_color=ROW_HI,
+            command=command,
+        )
+
+    def _handle_copy(self) -> None:
+        self._on_copy_cb(self)
+
+    def _handle_save(self) -> None:
+        self._on_save_cb(self)
+
+    def _build_segmented(self, parent) -> None:
+        """segmented（原文｜潤飾）：高 22 radius 6、SEG_BG+SEG_LINE 外殼、
+        選中格 SEG_ON+SEG_ON_FG。潤飾中 → 「潤飾中…」disabled；潤飾失敗 →
+        「潤飾失敗」RED_TEXT disabled；沒有潤飾版 → 「潤飾」disabled。
+        """
+        has_polished = self.polished_text is not None
+        pending = self._polish_state == "pending"
+        failed  = self._polish_state == "failed"
+
+        shell = ctk.CTkFrame(
+            parent, fg_color=SEG_BG, border_width=1, border_color=SEG_LINE,
+            corner_radius=6, height=22,
+        )
+        shell.pack(side="left", padx=(0, 9))
+        shell.pack_propagate(False)
+        inner = ctk.CTkFrame(shell, fg_color="transparent")
+        inner.pack(padx=1, pady=1)
+
+        seg_font = ctk.CTkFont(FONT_FAMILY_TEXT, 11)
+
+        raw_selected = not self.showing_polished
+        ctk.CTkButton(
+            inner, text="原文", font=seg_font,
+            width=seg_font.measure("原文") + 9 * 2, height=20, corner_radius=5,
+            fg_color=(SEG_ON if raw_selected else "transparent"),
+            text_color=(SEG_ON_FG if raw_selected else TEXT_3),
+            hover_color=(SEG_ON if raw_selected else SEG_BG),
+            command=lambda: self.set_showing_polished(False),
+        ).pack(side="left")
+
+        if pending:
+            pol_text, pol_enabled = "潤飾中…", False
+        elif failed:
+            pol_text, pol_enabled = "潤飾失敗", False
+        else:
+            pol_text, pol_enabled = "潤飾", has_polished
+
+        pol_selected = self.showing_polished and has_polished
+        if failed:
+            pol_text_color = RED_TEXT
+        elif pol_selected:
+            pol_text_color = SEG_ON_FG
+        elif pol_enabled:
+            pol_text_color = TEXT_3
+        else:
+            pol_text_color = TEXT_4
+
+        ctk.CTkButton(
+            inner, text=pol_text, font=seg_font,
+            width=seg_font.measure(pol_text) + 9 * 2, height=20, corner_radius=5,
+            fg_color=(SEG_ON if pol_selected else "transparent"),
+            text_color=pol_text_color,
+            hover_color=(SEG_ON if pol_selected else SEG_BG),
+            state=("normal" if pol_enabled else "disabled"),
+            command=(lambda: self.set_showing_polished(True)) if pol_enabled else None,
+        ).pack(side="left")
+
+    BODY_FONT_SIZE = 15   # 規格 14.5、取整
+    BODY_SPACING2  = 6    # 行距（≈1.75）
+
+    _body_linespace: Optional[int] = None   # class-level cache，見 _get_body_linespace
+
+    @classmethod
+    def _get_body_linespace(cls) -> int:
+        """正文字型的原生行高（不含 spacing2），只算一次、跨 instance 共用。
+
+        用來把「顯示行數」換算成精確像素高度（見 _relayout_body 的
+        needed_px 公式）——這步是必要的，不能直接把行數丟給 tk.Text 的
+        height= 選項，見下方 _relayout_body 開頭那段長註解。
+        """
+        if cls._body_linespace is None:
+            f = tkfont.Font(family=FONT_FAMILY_TEXT, size=cls.BODY_FONT_SIZE)
+            cls._body_linespace = f.metrics("linespace")
+        return cls._body_linespace
+
+    def _build_body(self, parent) -> None:
+        """正文：14.5、tk.Text spacing2=6（行距≈1.75）、字典校正詞加底線。
+
+        用 tk.Text 而非 CTkLabel 是因為 spacing2（行距）與 tag_configure
+        （校正詞底線）CTkLabel 都做不到。寬度用 pack(fill="x") 讓 Tk 依實際
+        渲染寬度自動 reflow，不用像舊版那樣手動算 wraplength 像素值。
+
+        Text 外面多包一層 _body_wrap（固定像素高、pack_propagate(False)）——
+        見 _relayout_body 開頭的長註解：tk.Text 自己的 height= 選項是「N ×
+        字型原生行高」，不會把 spacing2 的行距加成算進去，直接拿去截斷會把
+        最後一行文字整條吃掉又不觸發展開連結（用真實視窗截圖重現過的 bug）。
+        改成自己算精確像素高度、灌到外層 wrapper，繞開這個 Tk 既有限制。
+        """
+        fg = TEXT_BODY if self._is_latest else TEXT_BODY_2
+        bg = CARD_HI if self._is_latest else CARD
+
+        self._body_wrap = ctk.CTkFrame(parent, fg_color="transparent")
+        self._body_wrap.pack_propagate(False)
+        self._body_wrap.pack(fill="x")
+
+        text = tk.Text(
+            self._body_wrap, wrap="word", font=ctk.CTkFont(FONT_FAMILY_TEXT, self.BODY_FONT_SIZE),
+            spacing2=self.BODY_SPACING2, bg=bg, fg=fg, insertwidth=0, bd=0, highlightthickness=0,
+            relief="flat", padx=0, pady=0, cursor="arrow", width=1, height=1,
+            selectbackground=bg, selectforeground=fg,
+        )
+        text.pack(fill="both", expand=True)
+        text.tag_configure("mark", foreground=MARK, underline=1)
+        text.insert("1.0", self.get_current_text() or "")
+
+        # 字典校正詞加底線：對 self._corrections 裡每個詞在最終文字中的所有
+        # 出現位置加 "mark" tag（實線，tk.Text 沒有虛線可用）。
+        for term in dict.fromkeys(t for t in self._corrections if t):
+            start = "1.0"
+            while True:
+                pos = text.search(term, start, stopindex="end")
+                if not pos:
+                    break
+                end_idx = f"{pos}+{len(term)}c"
+                text.tag_add("mark", pos, end_idx)
+                start = end_idx
+
+        text.configure(state="disabled")   # 唯讀，避免使用者不小心改到
+        self._body_text = text
+        self._last_body_width = -1
+
+        # 展開列先建好但不 pack；_relayout_body 依實際顯示行數決定要不要秀。
+        self._expand_row = ctk.CTkFrame(parent, fg_color="transparent", height=24)
+        self._expand_row.pack_propagate(False)
+        self._expand_link = ctk.CTkLabel(
+            self._expand_row, text="展開", cursor="hand2",
+            font=ctk.CTkFont(FONT_FAMILY_TEXT, 12, "bold"), text_color=CYAN_TEXT,
+        )
+        self._expand_link.pack(side="left")
+        self._expand_link.bind("<Button-1>", lambda e: self._toggle_expand())
+
+        # 用 <Configure> 而非 after_idle 排一次「猜」——CTkScrollableFrame 巢狀
+        # 好幾層 CTkFrame 才到這顆 tk.Text，實測 Tk 在最終寬度 commit 前會連續
+        # 送好幾個中間值（例：width=18 → displaylines=173 這種明顯錯的數字），
+        # after_idle 只排一次很可能剛好抓到還沒穩定的那個中間值，量出來的行數
+        # 會偏小。<Configure> 每次 Tk 真的改動這顆 widget 的幾何時都會 fire，
+        # 包含最後穩定下來那一次，用「跟上次量到的寬度不同才重算」擋掉多餘重工。
+        text.bind("<Configure>", self._on_body_configure, add="+")
+
+    def _on_body_configure(self, event) -> None:
+        if event.width == self._last_body_width:
+            return
+        self._last_body_width = event.width
+        self._relayout_body()
+
+    def _toggle_expand(self) -> None:
+        self._expanded = not self._expanded
+        self._relayout_body()
+
+    def _relayout_body(self) -> None:
+        """量測目前顯示行數，> 8 行才截斷 + 顯示展開列（未展開時鎖 8 行高）。
+
+        不能直接用 `text.configure(height=k)`：tk.Text 的 height= 選項只用
+        「N × 字型原生 linespace」估高度，完全不管 spacing2（行距）疊加的
+        額外像素——實測 6 行文字（linespace=19、spacing2=6）height=6 只給
+        116px，但 6 行真正要 6×19 + 5×6 = 144px，短少的 28px 剛好等於吃掉
+        最後一行還多一點，而且無聲無息（沒有捲軸、沒有省略號）。改成自己
+        用 linespace + spacing2 算出精確像素高度、直接設定 _body_wrap（見
+        _build_body）的固定高度，繞開這個 Tk 限制。
+        """
+        text = self._body_text
+        if text is None:
+            return
+        try:
+            raw = text.count("1.0", "end", "displaylines")
+            n = raw[0] if isinstance(raw, tuple) else (raw or 1)
+        except Exception:
+            n = 1
+        n = max(1, n)
+
+        linespace = self._get_body_linespace()
+
+        def _px_for(k: int) -> int:
+            # +2 安全邊界：字型 hinting／widget 內部留白造成的次像素誤差，
+            # 寧可多留 2px 空白也不要再吃字（實測過差 1 行的慘況）。
+            return k * linespace + max(0, k - 1) * self.BODY_SPACING2 + 2
+
+        if n <= self.BODY_MAX_LINES:
+            self._body_wrap.configure(height=_px_for(n))
+            if self._expand_row is not None:
+                self._expand_row.pack_forget()
+            return
+
+        if self._expanded:
+            self._body_wrap.configure(height=_px_for(n))
+            self._expand_link.configure(text="收合")
+        else:
+            self._body_wrap.configure(height=_px_for(self.BODY_MAX_LINES))
+            self._expand_link.configure(text="展開")
+        self._expand_row.pack(fill="x", pady=(8, 0))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

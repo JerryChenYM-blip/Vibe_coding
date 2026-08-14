@@ -637,6 +637,11 @@ class TranscriptionResult:
     duration_seconds: float          # 音訊長度（秒）
     elapsed_seconds:  float          # 推論耗時（秒）
     segments:         list[dict] = field(default_factory=list)  # 逐 segment 資訊
+    # Aperture 卡片「校正 chip」用（v2.28.0）：套用個人字典 corrections 規則後
+    # 實際命中的校正詞（目標字，非規則總數）。只在 transcribe() 主路徑（非
+    # streaming 合併路徑）被填；空 list = 這次沒有任何校正命中或無法得知。
+    corrections:       list[str] = field(default_factory=list)
+    corrections_count: int       = 0
 
 
 # ── 主要類別 ──────────────────────────────────────────────────────────────────
@@ -1183,13 +1188,18 @@ class Transcriber:
                 before = result.text
                 result.text = apply_corrections(result.text, corrections)
                 if before != result.text:
-                    corrections_count = len(corrections)
                     # v2.20.3 N7：算具體 hits（哪幾條規則命中）順手填 corrections_hit。
                     # corrections 形態是 list[tuple[str, str]]（見 dictionary.load_corrections）。
                     hits: dict = {}
                     for src, tgt in corrections:
                         if src in before and src not in result.text:
                             hits[src] = tgt
+                    # Aperture 卡片「校正 N」chip（v2.28.0）：原本這裡是
+                    # `len(corrections)`（字典裡定義的規則總數），跟這次真正命中
+                    # 的數量無關——字典有 12 條規則、這次只有 1 條命中，chip
+                    # 卻會顯示「校正 12」。改用實際命中數 len(hits)，卡片顯示的
+                    # 數字才對得上文字裡真的被改了幾處。
+                    corrections_count = len(hits)
                     log.info(
                         f"WHISPER: applied {len(hits)} corrections"
                         f" (len {len(before)}→{len(result.text)})"
@@ -1230,6 +1240,9 @@ class Transcriber:
                             f"WHISPER: pinyin guard fixed {len(pinyin_fixes)} term(s): "
                             f"{pinyin_fixes[:5]}"
                         )
+                        # Aperture 卡片「校正 N」chip：拼音校正跟規則式校正共用
+                        # 同一份 corrections_hit，count 一起算，chip 不用分兩種來源。
+                        corrections_hit.update(dict(pinyin_fixes))
                         # v2.20.3 N7：per-filter audit 統一 schema = post_filter_applied
                         try:
                             if _audit_log is not None:
@@ -1271,6 +1284,16 @@ class Transcriber:
                         )
                 except Exception:
                     pass
+
+        # Aperture 卡片「校正 N」chip（v2.28.0）：corrections_hit 到這裡已收集完
+        # 規則式校正 + pinyin guard 兩種來源，統一算一次 count、寫回 result 給
+        # gui.py 的 UtteranceBlockV2 用（校正詞加底線 + chip 文字）。
+        # 用 dict 已天然去重（同一個 src 被多次命中只留一筆），corrections_count
+        # 跟著改成看 corrections_hit 長度，不再依賴上面 apply_corrections 區塊
+        # 自己算的那份（該份現在只涵蓋規則式校正、少算 pinyin guard 命中）。
+        corrections_count = len(corrections_hit)
+        result.corrections = list(corrections_hit.values())
+        result.corrections_count = corrections_count
 
         # 記錄轉錄結果（前 100 字，方便未來 debug hallucination / 準確度）
         preview = result.text[:100].replace("\n", " ")

@@ -54,8 +54,9 @@ def test_unknown_theme_falls_back_to_dark():
     with patch("config.Config.load", return_value=fake_cfg):
         import tokens
         importlib.reload(tokens)
-        # 即使 config.theme="purple"、tokens.BG 應該是 dark 的值（#000000）
-        assert tokens.BG == "#000000"
+        # 即使 config.theme="purple"、tokens.BG 應該是 dark 的值
+        # （Aperture 主視窗重寫調整：#000000 → #0F1012）
+        assert tokens.BG == "#0F1012"
         assert tokens._THEME == "dark"
 
     # Cleanup：reload 回正常 cfg.theme（restore default state for其他 test）

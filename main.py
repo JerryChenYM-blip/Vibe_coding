@@ -175,7 +175,10 @@ log.debug(f"DIAG: gui.py location: {gui.__file__}")
 log.debug(f"DIAG: Python executable: {sys.executable}")
 
 from config import Config
-from gui import WIN_W, WIN_H, AppWindow, AccessibilityDialog
+from gui import (
+    WIN_W, WIN_H, AppWindow, AccessibilityDialog,
+    SKELETON_WIN_W, SKELETON_WIN_H, SKELETON_MIN_W, SKELETON_MIN_H,
+)
 from _version import __version__
 from hotkey_manager import check_accessibility, is_pynput_available
 
@@ -497,10 +500,17 @@ def main() -> None:
     # ── 3. 建立 tkinter 根視窗 ────────────────────────────────────────────────
     root = ctk.CTk()
     root.title("🎙 Whisper Pro")
-    root.geometry(f"{WIN_W}x{WIN_H}")   # 與 gui.py 的 WIN_W / WIN_H 保持一致
-    # minsize 高度 860：AppWindow 自然 reqheight ≈ 858（含 ActionBar 58 +
-    # StatusBar 32 + 分隔線），舊值 750 會把底部兩列擠掉。寬度 640 維持不變。
-    root.minsize(640, 860)
+    # v2.28.0 主視窗骨架重寫：新骨架（預設）用 704×900 + minsize 640×640；
+    # cfg.record_visual == "chamber" 逃生門維持舊尺寸 776×880 + minsize
+    # 640×860，一行都不動舊使用者的版面。
+    if getattr(cfg, "record_visual", "waveform") == "chamber":
+        root.geometry(f"{WIN_W}x{WIN_H}")   # 與 gui.py 的 WIN_W / WIN_H 保持一致
+        # minsize 高度 860：AppWindow 自然 reqheight ≈ 858（含 ActionBar 58 +
+        # StatusBar 32 + 分隔線），舊值 750 會把底部兩列擠掉。寬度 640 維持不變。
+        root.minsize(640, 860)
+    else:
+        root.geometry(f"{SKELETON_WIN_W}x{SKELETON_WIN_H}")
+        root.minsize(SKELETON_MIN_W, SKELETON_MIN_H)
     root.resizable(True, True)
 
     # ── 3a. App Icon（Phase 4.1）──────────────────────────────────────────
