@@ -32,13 +32,26 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
 # ── 常數 ──────────────────────────────────────────────────────────────────────
 
-LOG_DIR  = Path.home() / ".whisper_app" / "logs"
+# v2.28.0：pytest 執行期間把 log 導到暫存目錄，不寫使用者的真實 log。
+#   事故（2026-08-15 code review 發現）：測試會寫進 ~/.whisper_app/logs/，
+#   我一度把 82 筆「錄音看門狗觸發」誤判成使用者天天忘記關錄音——實際上
+#   全是測試產生的（quiet_min 恆為 8.1 / 15.1，正是測試裡寫的 8*60+5 與
+#   15*60+5 秒；同一毫秒內連發、且 warn 與 auto_stop 次數剛好都是 41）。
+#   危害：① 真實使用分析會被誤導 ② log 只留 5MB×5、測試噪音會把真實紀錄
+#   提早擠出去。這與先前「測試把使用者設定重置成出廠值」是同一類問題：
+#   自動化測試沒有任何正當理由碰使用者的真實資料夾。
+if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
+    LOG_DIR = Path(tempfile.gettempdir()) / "whisper_pro_test_logs"
+else:
+    LOG_DIR = Path.home() / ".whisper_app" / "logs"
 LOG_FILE = LOG_DIR / "whisper_app.log"
 
 # 單檔最大 5 MB，保留最近 5 份（加起來約 25 MB 上限）

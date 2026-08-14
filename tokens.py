@@ -13,15 +13,17 @@ v2.6.0（2026-05-23）：theme-aware 重構
 調色盤設計理念：
   • 深色（v2.5.0 起預設）：Zinc 暖灰 + Cyan #06B6D4，OLED 最佳化、技術感
   • 淺色（v2.6.0 新增）：Hybrid — Apple 結構 + Claude 溫度
-      - 背景 #FAFAF7 微暖白（Apple-bright with Claude tint）
+      - 背景 #F4F4F5（Aperture 主視窗重寫調整，v2.6.0 原值 #FAFAF7 微暖白）
       - 卡片 #FFFFFF 純白（Apple cleanness）
-      - 主 ACCENT #D97757 Claude 珊瑚（CTA / active state）
+      - 主 ACCENT #D97757 Claude 珊瑚（CTA / active state，Aperture 第二輪後語意收窄，CTA 改用 BTN_BG/BTN_FG）
       - LINK #007AFF Apple 藍（連結 / info icon）
 
 參考文件：docs/superpowers/plans/2026-05-23-light-theme-and-appearance-toggle.md
 """
 
 from __future__ import annotations
+
+from animation import blend as _blend   # PROC_DIM 計算用（不寫死 hex，見下方 Aperture 主視窗重寫區塊）
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -33,7 +35,8 @@ from __future__ import annotations
 _PALETTES: dict[str, dict[str, str]] = {
     "dark": {
         # ── 表面層次 ─────────────────────────────────────
-        "BG":          "#000000",   # dp=0  虛空黑
+        # BG：Aperture 主視窗重寫調整（轉錄流底／視窗底），從 v2.5.0 純黑 #000000 改 #0F1012
+        "BG":          "#0F1012",   # dp=0  轉錄流底、視窗底
         "SURF_1":      "#0E0E10",   # dp=1  卡片、頂部
         "SURF_2":      "#18181B",   # dp=2  狀態列、hover
         "SURF_3":      "#27272A",   # dp=3  pressed
@@ -69,12 +72,13 @@ _PALETTES: dict[str, dict[str, str]] = {
         "WAVE_LIVE":   "#FAFAFA",   # = TEXT_1
         # ── Aperture 第二輪新增（13 key，兩套 palette 的 key 必須完全一致）──
         # 能量色溫 5 停留點（錄音態，音量 0→1，供 ENERGY_RAMP_DARK 組裝）
-        "WAVE_E0":     "#3F4A55",
-        "WAVE_E1":     "#0891B2",
-        "WAVE_E2":     "#22D3EE",
-        "WAVE_E3":     "#A5F3FC",
-        "WAVE_E4":     "#FFFFFF",
-        # 閒置 2 停留點（呼吸律動）
+        # Aperture 主視窗重寫：斜坡末端從白熾改琥珀（削波預警內建在色溫裡），數值全面更新
+        "WAVE_E0":     "#1E7A8C",
+        "WAVE_E1":     "#22D3EE",
+        "WAVE_E2":     "#67E8F9",
+        "WAVE_E3":     "#FDE68A",
+        "WAVE_E4":     "#F59E0B",
+        # 閒置 2 停留點（呼吸律動）—— Aperture 主視窗重寫：dark 端點不變，沿用原值
         "WAVE_I0":     "#2A2E33",
         "WAVE_I1":     "#4A525C",
         # 處理 3 停留點（旋轉弧 / 頻譜掃描）
@@ -85,10 +89,47 @@ _PALETTES: dict[str, dict[str, str]] = {
         "WAVE_DIM":    "#3C424A",
         # 搜尋高亮底色（歷史紀錄 FTS5 命中）
         "MARK_BG":     "#164E63",
+
+        # ── Aperture 主視窗重寫新增（32 key，兩套 palette 的 key 必須完全一致）──
+        "CHROME":      "#141518",   # 頂列／狀態槽／底列
+        "CARD":        "#15161A",   # 舊段落卡片
+        "CARD_HI":     "#191A1E",   # 最新段卡片
+        "LINE":        "#232427",   # 所有 1pt 分隔線、卡片邊框
+        "LINE_HI":     "#2A2B31",   # 最新段邊框、hover
+        "ROW_HI":      "#1B1C21",   # 列／圖示鈕 hover 底
+        "META":        "#8A8A90",   # 舊段時間
+        "META_HI":     "#9A9BA2",   # 最新段時間、常駐圖示鈕
+        "CYAN_TEXT":   "#67C7DC",   # 校正 chip 文字、展開連結
+        "MARK":        "#A5E9F5",   # 字典校正詞
+        "BTN_DIS":     "#1E1F23",   # 主鈕 disabled 底（實色，非 alpha）
+        "BTN_DIS_FG":  "#55565D",   # 主鈕 disabled 文字（實色，非 alpha）
+        "PILL_OFF":    "#34353A",   # 模式關（只有邊框）
+        "PILL_OFF_FG": "#7E7F86",
+        "SEG_BG":      "#101114",   # segmented 外殼
+        "SEG_LINE":    "#2A2B31",
+        "SEG_ON":      "#A1A1AA",   # segmented 選中格
+        "SEG_ON_FG":   "#0F1012",
+        "CHIP_BG":     "#1B2430",   # 校正 N 徽章底
+        "KEY_BG":      "#1E1F23",   # R⌘ 鍵帽
+        "KEY_LINE":    "#2E2F35",
+        "ICON":        "#8A8A90",   # 頂列導覽圖示
+        "SCROLL":      "#2E2F35",   # 捲動條 thumb
+        "SKEL":        "#26283A",   # 轉錄中骨架條
+        "SKEL_2":      "#212330",
+        "RED_TEXT":    "#FCA5A5",
+        "RED_BG":      "#2A1518",
+        "RED_LINE":    "#3F1D22",
+        "TEXT_BODY":   "#E8E8EA",
+        "TEXT_BODY_2": "#D4D4D8",
+        # 主鈕（record CTA）背景／前景：ACCENT 第二輪語意收窄後不再兼任 CTA 色，
+        # 由 BTN_BG/BTN_FG 專職——dark BTN_BG 恰等於既有 ACCENT_HV（#22D3EE），非巧合。
+        "BTN_BG":      "#22D3EE",
+        "BTN_FG":      "#06212A",
     },
     "light": {
         # ── 表面層次（Variant C Hybrid）──────────────
-        "BG":          "#FAFAF7",   # 微暖白（Apple-bright with Claude tint）
+        # BG：Aperture 主視窗重寫調整（轉錄流底／視窗底），從 v2.6.0 微暖白 #FAFAF7 改 #F4F4F5
+        "BG":          "#F4F4F5",   # 轉錄流底、視窗底
         "SURF_1":      "#FFFFFF",   # 卡片：純白 Apple-clean
         "SURF_2":      "#F1F0EC",   # raised / 副表面
         "SURF_3":      "#E5E3DC",   # pressed / hover
@@ -101,23 +142,32 @@ _PALETTES: dict[str, dict[str, str]] = {
         # ── 語意色 ───────────────────────────────────────
         # ACCENT：Aperture 第二輪（語意收窄）淺色珊瑚 #D97757 退場，
         # 改用互動色 #0E7490（選取列/焦點/連結），不再兼任主 CTA 色。
-        # 注意：ACCENT_HV / ACCENT_BG 仍是舊珊瑚色系、本輪未列入收窄範圍，
-        # 沿用舊值（hover / chip 底色若要跟進需另開任務）。
+        # v2.28.0 總管 code review 修：ACCENT 在第二輪已收窄成藍綠 #0E7490，
+        #   但 ACCENT_HV / ACCENT_BG 還留著舊珊瑚色 #C66445 / #F6E8DE。
+        #   ACCENT_HV 在 gui.py 被用了 18 處——淺色主題下滑鼠移過去會從藍綠
+        #   「跳成珊瑚橘」，是實際看得到的色相斷裂（深色主題無此問題：
+        #   ACCENT #06B6D4 → HV #22D3EE 同屬青色系）。
+        #   規格第二輪明講「淺色的珊瑚 #D97757 退場」，這兩個是漏網的。
+        #   淺色 hover 往「更深」走（白底上加深才是強調），底色沿用同色系淡底。
         "ACCENT":      "#0E7490",
-        "ACCENT_HV":   "#C66445",
-        "ACCENT_BG":   "#F6E8DE",   # 珊瑚 chip 淡底
+        "ACCENT_HV":   "#0B5D73",   # 藍綠加深（白底上 hover 要更深、不是更亮）
+        "ACCENT_BG":   "#DFF1F6",   # 藍綠淡底（與 CHIP_BG 同一支色系）
         # SUCCESS：Aperture 第二輪（語意收窄）只給「已貼上」toast 與權限已授權，從閒置態撤出
         "SUCCESS":     "#2E8B57",   # balanced green
         "SUCCESS_HV":  "#246E47",
         "SUCCESS_DIM": "#E0EFE5",
-        "DANGER":      "#D14B41",   # warm Apple red
+        # DANGER：Aperture 主視窗重寫調整（既有分支調整 RED），從 #D14B41 改 #DC2626
+        "DANGER":      "#DC2626",
         "DANGER_HV":   "#B53A30",
         "DANGER_DIM":  "#F8E2DF",
         # WARN：Aperture 第二輪（語意收窄）只給削波（clipping），從處理態撤出
-        "WARN":        "#C7842B",   # muted amber
+        # Aperture 主視窗重寫調整（既有分支調整 AMBER），從 #C7842B 改 #B45309
+        "WARN":        "#B45309",
         "WARN_HV":     "#A56E22",
         "WARN_DIM":    "#F5E9D4",
-        "INDIGO":      "#6366F1",
+        # INDIGO：Aperture 主視窗重寫調整（既有分支調整 PROC，PROCESS 別名跟著變），
+        # 從 #6366F1 改 #4F46E5
+        "INDIGO":      "#4F46E5",
         "INDIGO_HV":   "#4F46E5",
         "INDIGO_DIM":  "#E0E1FA",
         # ── 衍生 ─────────────────────────────────────────
@@ -125,18 +175,57 @@ _PALETTES: dict[str, dict[str, str]] = {
         "WAVE_IDLE":   "#D4D2C8",   # = SURF_4
         "WAVE_LIVE":   "#1A1612",   # = TEXT_1
         # ── Aperture 第二輪新增（13 key，兩套 palette 的 key 必須完全一致）──
-        "WAVE_E0":     "#94A3B8",
-        "WAVE_E1":     "#0E7490",
-        "WAVE_E2":     "#0B4A5C",
-        "WAVE_E3":     "#062A36",
-        "WAVE_E4":     "#041C25",
-        "WAVE_I0":     "#C9C7BE",
-        "WAVE_I1":     "#94928F",
+        # Aperture 主視窗重寫：斜坡末端從墨水濃度改琥珀（削波預警內建在色溫裡），數值全面更新
+        "WAVE_E0":     "#7FBFCE",
+        "WAVE_E1":     "#0891B2",
+        "WAVE_E2":     "#0E7490",
+        "WAVE_E3":     "#C2740A",
+        "WAVE_E4":     "#B45309",
+        # 閒置 2 停留點（呼吸律動）—— Aperture 主視窗重寫：光底無法靠「更亮」分層，改用這組更冷的灰階
+        "WAVE_I0":     "#D9DBDE",
+        "WAVE_I1":     "#98A0A8",
         "WAVE_P0":     "#D6D7FA",
         "WAVE_P1":     "#6366F1",
         "WAVE_P2":     "#3730A3",
         "WAVE_DIM":    "#C4C2BA",
         "MARK_BG":     "#FDE68A",   # 兩套色相不同是刻意的（深色沿用 cyan-900、淺色用琥珀提亮）
+
+        # ── Aperture 主視窗重寫新增（32 key，兩套 palette 的 key 必須完全一致）──
+        # 淺色沒有「更亮」可用來分層（白底之上不會更亮），改靠邊框深淺（LINE → LINE_HI）
+        # 分層；CARD 與 CARD_HI 在淺色因此是同一個白，不像深色靠底色階差區分。
+        "CHROME":      "#FFFFFF",
+        "CARD":        "#FFFFFF",
+        "CARD_HI":     "#FFFFFF",
+        "LINE":        "#E4E4E7",
+        "LINE_HI":     "#A9B0B8",
+        "ROW_HI":      "#F4F4F5",
+        "META":        "#71717A",
+        "META_HI":     "#3F3F46",
+        # CYAN_TEXT：淺色不用 #22D3EE（對白底僅 1.6:1 對比，不能當文字／1pt 邊框），改 #0E7490
+        "CYAN_TEXT":   "#0E7490",
+        "MARK":        "#0E7490",
+        "BTN_DIS":     "#E4E4E7",   # 實色，非 alpha
+        "BTN_DIS_FG":  "#A1A1AA",   # 實色，非 alpha
+        "PILL_OFF":    "#D4D4D8",
+        "PILL_OFF_FG": "#71717A",
+        "SEG_BG":      "#F4F4F5",
+        "SEG_LINE":    "#D4D4D8",
+        "SEG_ON":      "#52525B",
+        "SEG_ON_FG":   "#FFFFFF",
+        "CHIP_BG":     "#DFF1F6",
+        "KEY_BG":      "#FFFFFF",
+        "KEY_LINE":    "#C9CDD2",
+        "ICON":        "#71717A",
+        "SCROLL":      "#C9CDD2",
+        "SKEL":        "#DEDFF4",
+        "SKEL_2":      "#E9EAF8",
+        "RED_TEXT":    "#991B1B",
+        "RED_BG":      "#FEF2F2",
+        "RED_LINE":    "#FECACA",
+        "TEXT_BODY":   "#27272A",
+        "TEXT_BODY_2": "#3F3F46",
+        "BTN_BG":      "#0E7490",   # 恰等於既有 ACCENT（cyan 語意在淺色下必須是 #0E7490），非巧合
+        "BTN_FG":      "#FFFFFF",
     },
 }
 
@@ -227,6 +316,75 @@ PROCESS     = INDIGO
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Aperture 主視窗重寫新增 token（32 key，兩套 palette 對稱）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── 表面／邊框 ───────────────────────────────────────────────────────────────
+CHROME      = _P["CHROME"]      # 頂列／狀態槽／底列
+CARD        = _P["CARD"]        # 舊段落卡片
+CARD_HI     = _P["CARD_HI"]     # 最新段卡片（淺色下與 CARD 同值，靠邊框分層）
+LINE        = _P["LINE"]        # 所有 1pt 分隔線、卡片邊框
+LINE_HI     = _P["LINE_HI"]     # 最新段邊框、hover
+ROW_HI      = _P["ROW_HI"]      # 列／圖示鈕 hover 底
+
+# HAIR：時間分隔線——判斷後直接沿用 LINE，不另開新色階（同一種「細線」語意，
+# 沒有理由分岔成兩個 token；活 alias，LINE 改色會自動跟著變）。
+HAIR        = LINE
+
+# ── 文字（次階） ─────────────────────────────────────────────────────────────
+META        = _P["META"]        # 舊段時間
+META_HI     = _P["META_HI"]     # 最新段時間、常駐圖示鈕
+TEXT_BODY   = _P["TEXT_BODY"]
+TEXT_BODY_2 = _P["TEXT_BODY_2"]
+
+# ── 校正 chip／字典標記 ──────────────────────────────────────────────────────
+CYAN_TEXT   = _P["CYAN_TEXT"]   # 校正 chip 文字、展開連結（淺色不能用 ACCENT_HV，對比不夠）
+MARK        = _P["MARK"]        # 字典校正詞
+CHIP_BG     = _P["CHIP_BG"]     # 校正 N 徽章底
+
+# ── 主鈕（record CTA）── ACCENT 第二輪語意收窄後不再兼任 CTA 色，改由這組專職 ──
+BTN_BG      = _P["BTN_BG"]
+BTN_FG      = _P["BTN_FG"]
+BTN_DIS     = _P["BTN_DIS"]     # disabled 底，實色、非 alpha
+BTN_DIS_FG  = _P["BTN_DIS_FG"]  # disabled 文字，實色、非 alpha
+
+# ── 模式 pill／segmented 控制項 ──────────────────────────────────────────────
+PILL_OFF     = _P["PILL_OFF"]      # 模式關（只有邊框）
+PILL_OFF_FG  = _P["PILL_OFF_FG"]
+
+# PILL_ON／PILL_ON_FG（主視窗骨架重寫新增）：模式 pill 開狀態——沿用
+# BTN_BG/BTN_FG 同一組「實色強調」語意，活 alias（同 PROCESS = INDIGO 的
+# 既有慣例），不另開一份 hex。
+PILL_ON      = BTN_BG
+PILL_ON_FG   = BTN_FG
+SEG_BG       = _P["SEG_BG"]        # segmented 外殼
+SEG_LINE     = _P["SEG_LINE"]
+SEG_ON       = _P["SEG_ON"]        # segmented 選中格
+SEG_ON_FG    = _P["SEG_ON_FG"]
+
+# ── 其餘小元件 ───────────────────────────────────────────────────────────────
+KEY_BG   = _P["KEY_BG"]     # R⌘ 鍵帽
+KEY_LINE = _P["KEY_LINE"]
+ICON     = _P["ICON"]       # 頂列導覽圖示
+SCROLL   = _P["SCROLL"]     # 捲動條 thumb
+SKEL     = _P["SKEL"]       # 轉錄中骨架條
+SKEL_2   = _P["SKEL_2"]
+
+# ── 錯誤狀態（紅） ───────────────────────────────────────────────────────────
+RED_TEXT = _P["RED_TEXT"]
+RED_BG   = _P["RED_BG"]
+RED_LINE = _P["RED_LINE"]
+
+# ── 處理態掠掃窗口外淡化色（computed，不寫死）─────────────────────────────────
+# PROC_DIM = blend(PROC, CHROME, 0.30)。PROC 即 PROCESS（=INDIGO 別名），
+# 沿用既有 blend() 混色公式（animation.py，import 見檔案開頭），兩套 palette
+# 各自算一份供獨立驗證，再依 active theme 選出 module-level PROC_DIM。
+PROC_DIM_DARK  = _blend(_PALETTES["dark"]["INDIGO"], _PALETTES["dark"]["CHROME"], 0.30)
+PROC_DIM_LIGHT = _blend(_PALETTES["light"]["INDIGO"], _PALETTES["light"]["CHROME"], 0.30)
+PROC_DIM = PROC_DIM_LIGHT if _THEME == "light" else PROC_DIM_DARK
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  波形顏色（Waveform）
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -254,12 +412,11 @@ MARK_BG  = _P["MARK_BG"]     # 搜尋高亮底色（兩套 palette 色相不同�
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  能量色溫斜坡（Aperture D2）— 音量 0→1 映射成色溫
-#  深色主題：石板灰→青→冰藍→白熾；淺色主題反轉成墨水濃度
-#  （白底上「越亮」讀不出「越大聲」，改用「越深」表達能量）
-#  Aperture 第二輪：斜坡不再另存一份 hex，改從 _PALETTES 的 WAVE_E0..E4 token 讀，
-#  單一真相來源在 palette 字典。停留點位置固定為 [0, 0.30, 0.55, 0.80, 1.0]
-#  （淺色主題原本只有 4 停留點，第二輪補上 WAVE_E4 #041C25 當第 5 個 100% 端點，
-#  端點顏色因此變得更深——這是刻意的語意收窄，不是 bug）。
+#  深色主題：石板藍→青→冰藍→琥珀；淺色主題：淺青→深青→琥珀
+#  （Aperture 主視窗重寫：末端從「白熾」改「琥珀」——削波預警內建在色溫裡，
+#  越接近削波顏色越暖，不用另外跳警示色）
+#  斜坡不再另存一份 hex，改從 _PALETTES 的 WAVE_E0..E4 token 讀，
+#  單一真相來源在 palette 字典。停留點位置固定為 [0, 0.30, 0.55, 0.80, 1.0]。
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _hex_to_rgb(h: str) -> tuple[int, int, int]:

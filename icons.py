@@ -199,6 +199,16 @@ def _i_square(p: _Pen) -> None:
     p.rect(6, 6, 18, 18, r=1.5)
 
 
+def _i_more_horizontal(p: _Pen) -> None:
+    """更多選項圖示（Lucide 'more-horizontal'）：三個水平排列的實心圓點。
+
+    主視窗骨架重寫（v2.28.0）頂列「⋯」溢出選單用——功能性圖示一律走
+    icons.py 手繪，不直接寫死 Unicode 省略號字元。
+    """
+    for x in (5, 12, 19):
+        p.dot(x, 12, r=1.6)
+
+
 def _i_history(p: _Pen) -> None:
     """歷史圖示（Lucide 'history' 風格）：逆時針箭頭 + 時鐘指針。
 
@@ -237,6 +247,7 @@ _REGISTRY: dict[str, Callable[[_Pen], None]] = {
     "mic":        _i_mic,
     "square":     _i_square,
     "history":    _i_history,
+    "more-horizontal": _i_more_horizontal,
 }
 
 ICON_NAMES = list(_REGISTRY.keys())   # 供外部查詢可用圖示名稱
