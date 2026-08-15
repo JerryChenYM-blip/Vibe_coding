@@ -19,4 +19,4 @@
   與 git latest tag，build 時不一致就警告。
 """
 
-__version__ = "2.27.0"
+__version__ = "2.28.0"
