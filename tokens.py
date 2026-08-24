@@ -125,6 +125,29 @@ _PALETTES: dict[str, dict[str, str]] = {
         # 由 BTN_BG/BTN_FG 專職——dark BTN_BG 恰等於既有 ACCENT_HV（#22D3EE），非巧合。
         "BTN_BG":      "#22D3EE",
         "BTN_FG":      "#06212A",
+
+        # ── 液態玻璃改造 Phase 2 新增（10 key，兩套 palette 對稱，抄自
+        #    Claude Design 的 設計系統.dc.html dark media block）──────────
+        # G1_*／G2_*：刻意保留 rgba() 字串、不拆成純 hex——拆掉 alpha 會讓
+        # fill 看起來像不透明白/黑，誤導下一個讀這份檔案的人。這裡是「跟
+        # 設計稿原始值對得起來」的文件用途；真正餵給 PIL 畫圖的參數是
+        # glass_render.py 的 GlassSpec／specs_for()（已換算成 hex + 0-255
+        # 整數 alpha、並實測驗證過），gui.py 畫玻璃不需要讀這裡。
+        # G1_SHADOW／G2 陰影只取 CSS 兩層陰影中較深那層的顏色代表整組陰影。
+        "G1_BG":     "rgba(44,47,54,.70)",
+        "G1_EDGE":   "rgba(255,255,255,.10)",
+        "G1_HI":     "rgba(255,255,255,.11)",
+        "G1_SHADOW": "rgba(0,0,0,.86)",
+        "G2_BG":     "rgba(255,255,255,.045)",
+        "G2_EDGE":   "rgba(255,255,255,.06)",
+        "G2_HI":     "rgba(255,255,255,.06)",
+        # BACKDROP_BASE：radial_backdrop() 的純色底——玻璃需要「有東西可以
+        # 模糊」，不能疊在平的近黑底上（見 glass_render.py module docstring）。
+        "BACKDROP_BASE": "#0B0C0F",
+        # 玻璃上的灰字：半透明底把對比吃掉一階，比 TEXT_3／停用態文字要再
+        # 亮一階，玻璃上禁止直接沿用 TEXT_3／TEXT_4（見設計稿 02 號註記）。
+        "TEXT_3_GLASS":       "#B7B7BE",
+        "TEXT_PENDING_GLASS": "#8C8C95",
     },
     "light": {
         # ── 表面層次（Variant C Hybrid）──────────────
@@ -226,6 +249,21 @@ _PALETTES: dict[str, dict[str, str]] = {
         "TEXT_BODY_2": "#3F3F46",
         "BTN_BG":      "#0E7490",   # 恰等於既有 ACCENT（cyan 語意在淺色下必須是 #0E7490），非巧合
         "BTN_FG":      "#FFFFFF",
+
+        # ── 液態玻璃改造 Phase 2 新增（10 key，兩套 palette 對稱，抄自
+        #    Claude Design 的 設計系統.dc.html :root）──────────────────────
+        # 說明見 dark palette 同名區塊的註解（G1_*／G2_* 保留 rgba() 字串的
+        # 原因、BACKDROP_BASE／TEXT_*_GLASS 的用途，兩邊完全一致不重複寫）。
+        "G1_BG":     "rgba(255,255,255,.72)",
+        "G1_EDGE":   "rgba(15,23,42,.10)",
+        "G1_HI":     "rgba(255,255,255,.92)",
+        "G1_SHADOW": "rgba(15,23,42,.30)",
+        "G2_BG":     "rgba(255,255,255,.46)",
+        "G2_EDGE":   "rgba(15,23,42,.07)",
+        "G2_HI":     "rgba(255,255,255,.66)",
+        "BACKDROP_BASE": "#F4F5F7",
+        "TEXT_3_GLASS":       "#52525B",
+        "TEXT_PENDING_GLASS": "#6B6B75",
     },
 }
 
@@ -382,6 +420,27 @@ RED_LINE = _P["RED_LINE"]
 PROC_DIM_DARK  = _blend(_PALETTES["dark"]["INDIGO"], _PALETTES["dark"]["CHROME"], 0.30)
 PROC_DIM_LIGHT = _blend(_PALETTES["light"]["INDIGO"], _PALETTES["light"]["CHROME"], 0.30)
 PROC_DIM = PROC_DIM_LIGHT if _THEME == "light" else PROC_DIM_DARK
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  液態玻璃改造 Phase 2 新增（10 key，兩套 palette 對稱）
+#  數值抄自 Claude Design 的 設計系統.dc.html；G1_*／G2_* 是文件用途的原始
+#  rgba() 字串，實際渲染參數在 glass_render.py 的 GlassSpec／specs_for()
+#  （已換算 + 實測驗證，見 _PALETTES 裡的完整說明）。
+# ═══════════════════════════════════════════════════════════════════════════════
+
+G1_BG     = _P["G1_BG"]
+G1_EDGE   = _P["G1_EDGE"]
+G1_HI     = _P["G1_HI"]
+G1_SHADOW = _P["G1_SHADOW"]
+G2_BG     = _P["G2_BG"]
+G2_EDGE   = _P["G2_EDGE"]
+G2_HI     = _P["G2_HI"]
+
+BACKDROP_BASE = _P["BACKDROP_BASE"]
+
+TEXT_3_GLASS       = _P["TEXT_3_GLASS"]
+TEXT_PENDING_GLASS = _P["TEXT_PENDING_GLASS"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
