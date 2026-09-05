@@ -402,20 +402,86 @@ def _silero_no_voice(audio, threshold: float = 0.35) -> bool:
         # threshold 是「>= threshold 才算 speech」、不是「<」
         # min_speech_duration_ms=200：比 faster-whisper 內建 VAD（50ms）嚴格、
         # 避免極短噪聲（按鍵 click）被當人聲；min_silence 給 300ms 是 VAD 預設值。
-        speech_segments = get_speech_timestamps(
-            audio_tensor,
-            model,
-            threshold=threshold,
-            sampling_rate=16_000,
-            min_speech_duration_ms=200,
-            min_silence_duration_ms=300,
-            return_seconds=False,
-        )
+        # T01-A（2026-09-05）：_silero_vad_lock 原本只保護模型載入，這裡補上——
+        # 共用的 torch.jit 模型物件推論本身不是執行緒安全的，兩個背景執行緒同時
+        # 呼叫 get_speech_timestamps() 會讓整個行程當掉（已用併發壓力測試重現、
+        # 屬於改動前就存在的既有缺陷，這次補鎖修掉）。streaming 架構每個 chunk
+        # 各開一條背景執行緒、彼此不等待，必須靠鎖序列化這一步。
+        with _silero_vad_lock:
+            speech_segments = get_speech_timestamps(
+                audio_tensor,
+                model,
+                threshold=threshold,
+                sampling_rate=16_000,
+                min_speech_duration_ms=200,
+                min_silence_duration_ms=300,
+                return_seconds=False,
+            )
         # 沒任何 speech segment = 整段純雜音
         return len(speech_segments) == 0
     except Exception as e:
         log_error("silero_vad_inference_failed", error=str(e))
         return False   # 故障時不擋
+
+
+def _silero_speech_stats(audio, threshold: float = 0.35) -> Optional[dict]:
+    """T01-A（2026-09-05）：量測用途，算出整段音檔的 Silero VAD 語音統計。
+
+    跟 _silero_no_voice() 用同一組門檻參數（threshold / min_speech_duration_ms /
+    min_silence_duration_ms），確保這裡的 no_voice 判斷跟既有 gate 邏輯一致。
+    純觀測用途：回傳值只會被寫進 audit log，不影響任何送不送 ASR 的判斷
+    ——呼叫端不可以用這裡的回傳值做 gate 決策。
+
+    回傳 None：VAD 不可用或推論失敗（呼叫端記 silero_ran=False）。
+    回傳 dict：
+      speech_ratio  — speech segment 總長 ÷ 音檔總長（0~1）
+      segment_count — speech segment 數量
+      max_gap_s     — 最長的無語音間隔（含音檔開頭到第一段、最後一段到結尾）
+      no_voice      — len(segments) == 0
+    """
+    import numpy as np
+    model = _ensure_silero_vad()
+    if model is None:
+        return None
+    try:
+        from silero_vad import get_speech_timestamps
+        import torch
+        audio_tensor = torch.from_numpy(audio.astype(np.float32))
+        duration_s = len(audio) / 16_000
+        # T01-A（2026-09-05）：同一把 _silero_vad_lock，理由見 _silero_no_voice()。
+        with _silero_vad_lock:
+            segments = get_speech_timestamps(
+                audio_tensor,
+                model,
+                threshold=threshold,
+                sampling_rate=16_000,
+                min_speech_duration_ms=200,
+                min_silence_duration_ms=300,
+                return_seconds=True,
+            )
+        if not segments:
+            return {
+                "speech_ratio": 0.0,
+                "segment_count": 0,
+                "max_gap_s": duration_s,
+                "no_voice": True,
+            }
+        speech_total = sum(seg["end"] - seg["start"] for seg in segments)
+        gaps = [segments[0]["start"]]
+        gaps.extend(
+            segments[i + 1]["start"] - segments[i]["end"]
+            for i in range(len(segments) - 1)
+        )
+        gaps.append(duration_s - segments[-1]["end"])
+        return {
+            "speech_ratio": speech_total / duration_s if duration_s > 0 else 0.0,
+            "segment_count": len(segments),
+            "max_gap_s": max(gaps),
+            "no_voice": False,
+        }
+    except Exception as e:
+        log_error("silero_vad_stats_failed", error=str(e))
+        return None
 
 
 def _is_dict_terms_hallucination(text: str, dict_terms: Optional[list[str]] = None) -> bool:
@@ -927,6 +993,20 @@ class Transcriber:
                 language="", duration_seconds=duration,
                 elapsed_seconds=time.perf_counter() - t0,
             )
+
+        # T01-A（2026-09-05）：量測用，不影響任何 gate 行為——照樣送 ASR，只是多記
+        # 幾個數字。刻意跑在下面 941 行那道閘的「duration <= 4.0」限制之外、不分
+        # 秒數都算一次，才能回答「10-12 秒的串流 chunk 到底像不像人聲」
+        # （那道閘因為 duration<=4.0 的限制，串流 chunk 永遠不會走到 _silero_no_voice()）。
+        silero_stats = (
+            _silero_speech_stats(audio, self._silero_vad_threshold)
+            if self._silero_vad_enabled else None
+        )
+        quality["silero_speech_ratio"] = silero_stats["speech_ratio"] if silero_stats else None
+        quality["silero_segment_count"] = silero_stats["segment_count"] if silero_stats else None
+        quality["silero_max_gap_s"] = silero_stats["max_gap_s"] if silero_stats else None
+        quality["silero_ran"] = silero_stats is not None
+        quality["silero_no_voice"] = silero_stats["no_voice"] if silero_stats else None
 
         # v2.19.x Silero VAD gate：抓「有能量但非人聲」的雜音。
         # 放在 RMS gate 之後——RMS 砍掉真靜音、Silero 砍掉鍵盤/紙張/冷氣/背景音樂。
@@ -1442,6 +1522,11 @@ class Transcriber:
                     "rms_last_500ms": float(quality.get("rms_last_500ms", 0.0)),
                     "clipping_ratio": float(quality.get("clipping_ratio", 0.0)),
                     "samples": int(quality.get("samples", 0)),
+                    # T01-A（2026-09-05）：量測欄位，None = 沒算到（VAD 關閉／不可用／
+                    # 提早 return 於此量測點之前，例如 empty_audio、duration_short、rms_silent）。
+                    "silero_speech_ratio": quality.get("silero_speech_ratio"),
+                    "silero_segment_count": quality.get("silero_segment_count"),
+                    "silero_max_gap_s": quality.get("silero_max_gap_s"),
                 },
                 "backend": backend,
                 "model": model_size,
@@ -1454,11 +1539,15 @@ class Transcriber:
                 "gates": {
                     "duration_short": bool(gate_short),
                     "rms_silent": bool(gate_silent),
-                    # v2.19.x：Silero VAD 觸發時 transcribe() 直接 return、不會走到
-                    # _emit_audit，所以這個欄位在 transcribe entry 裡永遠是 False；
-                    # 真實 VAD block 統計請看 audit_log 的 silero_vad_block events。
-                    # 留欄位讓未來 schema 完整（避免 jq filter 寫 .gates.silero_no_voice 找不到）。
-                    "silero_no_voice": False,
+                    # v2.19.x：Silero VAD 在 941 行那道閘觸發時 transcribe() 直接
+                    # return、不會走到 _emit_audit，所以「被那道閘擋下」這件事本來
+                    # 就不會出現在 transcribe entry 裡；真實 VAD block 統計請看
+                    # audit_log 的 silero_vad_block events。
+                    # T01-A（2026-09-05）：這裡原本寫死 False 當佔位，改記
+                    # _silero_speech_stats() 的真實結果——None = 沒算到（VAD 關閉／
+                    # 不可用／提早 return 於量測點之前）。
+                    "silero_no_voice": quality.get("silero_no_voice"),
+                    "silero_ran": bool(quality.get("silero_ran", False)),
                     "is_warmup": False,   # 標記給未來 warmup 路徑；此 emit 點固定 False
                 },
                 "raw_text": raw_text or final_text or "",
