@@ -43,6 +43,16 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter
 import tokens
 
 
+#  淺色主題的波形墨色（抄自參考設計 `淺色玻璃強化.html` 的 .bar）
+_INK        = (0x4a, 0x4a, 0x52)   # 主體
+_INK_TRACK  = (0xd8, 0xd8, 0xde)   # 未達到的軌道底——讓人看得出「還有多少空間」
+_INK_WARN   = (0xb4, 0x53, 0x09)   # 接近削波
+_INK_CLIP   = (0xb9, 0x1c, 0x1c)   # 削波
+#  開始上色的振幅門檻：低於此一律深墨。0.78 是目視調的——再低會讓正常說話
+#  就開始泛色、又回到「一直喊狼來了」的老problem。
+_INK_TINT_FROM = 0.78
+
+
 def _hex_rgb(h: str) -> tuple[int, int, int]:
     h = h.lstrip("#")
     return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
@@ -146,10 +156,22 @@ class GlowWaveRenderer:
         max_h = self.band_h / 2.0 - 14               # 上下各留 14px 讓輝光有地方擴散
         gs = self._GLOW_SCALE
 
-        # 色溫吃整體音量而非單根 bar 高度（見 module docstring「刻意不做的事」）
-        tip = _hex_rgb(tokens.energy_color(min(1.0, max(0.0, level))))
-        # 中軸線附近更亮：往白（深色主題）或往深墨（淺色主題）推
-        core = _mix(tip, (255, 255, 255) if not self._is_light else (10, 30, 38), 0.45)
+        # ── 顏色策略：深色主題「色溫斜坡」、淺色主題「墨色為主、只有削波才上色」──
+        #
+        # 為什麼兩套不一樣：色溫斜坡（青→琥珀→橘）在深色底上是漂亮的能量指示，
+        # 但在淺色底上①對比不夠、②整條一直在變色反而讓「破音」這件事看不出來
+        # ——講話時色相一直動，使用者其實分不出「有點大聲」和「真的破音」。
+        #
+        # 淺色改成參考設計的做法（MeetingNotes `淺色玻璃強化.html`）：
+        # 主體 #4a4a52 深墨、軌道 #d8d8de 淺灰、同色柔影（淺色底上用陰影不用發光，
+        # 白底加亮還是白——這在本檔的輝光合成那段已經踩過同一個坑）。
+        # **顏色只保留給削波**，符合專案 v2.26.0 定的「WARN 只給削波」原則。
+        if self._is_light:
+            tip = _INK          # 平常就是深墨，不隨音量變色
+            core = _mix(_INK, (10, 30, 38), 0.35)
+        else:
+            tip = _hex_rgb(tokens.energy_color(min(1.0, max(0.0, level))))
+            core = _mix(tip, (255, 255, 255), 0.45)
 
         # ── 第一遍：只畫輝光圖層（半解析度）─────────────────────────────────
         heights = []
@@ -180,12 +202,53 @@ class GlowWaveRenderer:
 
         d = ImageDraw.Draw(img)
 
+        # 音量超過門檻多少（0 = 還很安全、1 = 已達削波邊緣）。算一次給下面用。
+        lvl_t = 0.0
+        if self._is_light and level > _INK_TINT_FROM:
+            lvl_t = min(1.0, (level - _INK_TINT_FROM) / (1.0 - _INK_TINT_FROM))
+
+        # ── 淺色主題專屬：先畫「軌道底」（滿高的淺灰 bar）──────────────────
+        # 為什麼只有淺色有：深色主題的 bar 本身就是發光體，背後再放一條灰軌道
+        # 會把輝光壓掉；淺色主題的 bar 是墨色實體，有軌道才看得出「這根還有
+        # 多少空間可以長」——那是音量餘裕的視覺線索，抄自參考設計的 .bar 底層。
+        if self._is_light:
+            full_h = max(1.5, max_h)
+            for i in range(n):
+                x0 = i * (bw + self._GAP)
+                d.rounded_rectangle(
+                    [x0, cy - full_h, x0 + bw, cy + full_h],
+                    radius=bw / 2.0, fill=_INK_TRACK,
+                )
+
         # ── 第二遍：畫 bar 本體（蓋在輝光上）───────────────────────────────
         for i in range(n):
             h = heights[i]
             x0 = i * (bw + self._GAP)
             x1 = x0 + bw
             r = bw / 2.0
+
+            # 淺色主題：只有「接近或超過削波」的那幾根才上色，其餘維持深墨。
+            # 這是刻意的資訊設計——連續色溫斜坡會讓整條一直變色、反而讓真正的
+            # 削波看不出來；改成「平常全灰、爆掉的那幾根變紅」，一眼就看得到
+            # 是哪幾根爆掉。符合專案「WARN 只給削波」的既有原則。
+            if self._is_light:
+                # **上色與否由「整體音量 level」決定，不是由「這根 bar 多高」。**
+                #   第一版用 bar 高度比例判斷，結果普通音量（level 0.45）中央就
+                #   整片變橘——因為頻譜形狀讓中央的 bar 本來就接近滿格，跟使用者
+                #   講多大聲無關。存 PNG 一看就知道錯了。
+                #   正確語意：level 才是「你多大聲」，bar 高度是「頻譜長什麼形狀」。
+                if clipping:
+                    tip = _INK_CLIP
+                    core = _mix(_INK_CLIP, (60, 0, 0), 0.25)
+                elif lvl_t > 0.0:
+                    # 只有真的偏大聲時才染，且越高的 bar 染得越明顯
+                    v_ratio = h / max(1e-6, max_h)
+                    t = lvl_t * min(1.0, v_ratio / 0.85)
+                    tip = _mix(_INK, _INK_WARN, t)
+                    core = _mix(tip, (10, 30, 38), 0.35)
+                else:
+                    tip = _INK
+                    core = _mix(_INK, (10, 30, 38), 0.35)
 
             # 本體：由中軸線往外做垂直漸層（核心亮 → 尖端回到色溫本色）。
             # 一根 bar 切成 STEPS 段畫，段數固定不隨高度變——高度變時段數也變的話

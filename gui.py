@@ -54,6 +54,7 @@ from icons import get_icon, get_canvas_icon
 from animation import blend, breathe, ease_in_out_cubic, Ripple
 from waveform import WaveformEngine
 from waveform_render import GlowWaveRenderer
+import glass_render
 import auto_paste as _ap
 from platform_util import IS_MAC, IS_WINDOWS
 
@@ -195,6 +196,10 @@ from tokens import (
     CYAN_TEXT, MARK, CHIP_BG,
     SEG_BG, SEG_LINE, SEG_ON, SEG_ON_FG,
     KEY_BG, KEY_LINE, SKEL, SKEL_2,
+    # 液態玻璃改造 Phase 2 新增（主視窗玻璃底，見 _build_glass_backdrop）
+    BACKDROP_BASE,
+    # 液態玻璃改造 —— mini HUD（見 MiniRecordingWindow）
+    TEXT_3_GLASS,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -279,6 +284,14 @@ PROCESS_SWEEP_CYCLE_MS = 1900.0
 PROCESS_SWEEP_BAND_HALF_BARS = 1.0
 
 
+#  淺色主題的小波形墨色，與 waveform_render.py 的大波形同一組值（那邊是 RGB
+#  tuple、這邊 tkinter 要 hex 字串）。改一邊記得改另一邊。
+_INK_HEX        = "#4a4a52"
+_INK_WARN_HEX   = "#b45309"
+_INK_CLIP_HEX   = "#b91c1c"
+_INK_TINT_LEVEL = 0.78     # 音量超過這個才開始上色
+
+
 def _draw_spectral_bars(
     canvas: "tk.Canvas",
     engine: WaveformEngine,
@@ -286,6 +299,7 @@ def _draw_spectral_bars(
     height: int,
     elapsed_ms: float,
     big: bool,
+    level: float = 0.0,
 ) -> None:
     """畫 Spectral Bands 波形（L3 核心層）到指定 canvas。
 
@@ -319,7 +333,22 @@ def _draw_spectral_bars(
 
         v = bars[i]
         h = max(1.2, v * max_h)
-        color = blend(energy_color(v), SURF_1, WAVE_CORE_ALPHA)
+        # v2.30.0：淺色改「深墨為主、只有削波才上色」，跟大波形同一套語言。
+        #   不再用 energy_color(v)——那是「逐根 bar 依自己高度查色溫」，而 bar
+        #   高度來自頻譜形狀、跟講多大聲無關（中央本來就最高），結果普通音量
+        #   中間就整片泛橘、真的破音反而看不出來。顏色只留給削波。
+        #   深色主題維持色溫斜坡：深底上那是讀得出來的能量指示。
+        if _IS_LIGHT_THEME:
+            if engine.clipping:
+                base_col = _INK_CLIP_HEX
+            elif level > _INK_TINT_LEVEL:
+                t = min(1.0, (level - _INK_TINT_LEVEL) / (1.0 - _INK_TINT_LEVEL))
+                base_col = blend(_INK_WARN_HEX, _INK_HEX, 1.0 - t)
+            else:
+                base_col = _INK_HEX
+        else:
+            base_col = energy_color(v)
+        color = blend(base_col, SURF_1, WAVE_CORE_ALPHA)
         canvas.create_rectangle(x0, cy - h, x1, cy + h, fill=color, outline="")
 
         # 高光：v > 0.22 時在 bar 中線加一道白色細線（照抄 JS，不分 big/mini）。
@@ -336,7 +365,9 @@ def _draw_spectral_bars(
         # 峰值帽：只有 big（主視窗）才畫，照抄 JS 的 `rig.big` 旗標
         if big and peaks[i] > 0.08:
             ph = peaks[i] * max_h
-            peak_color = blend(energy_color(peaks[i]), SURF_1, 0.42)
+            peak_color = blend(
+                _INK_HEX if _IS_LIGHT_THEME else energy_color(peaks[i]), SURF_1, 0.42
+            )
             canvas.create_rectangle(
                 x0, cy - ph - 2.4, x1, cy - ph - 0.6, fill=peak_color, outline=""
             )
@@ -928,6 +959,14 @@ class AppWindow(ctk.CTkFrame):
 
         # Streaming
         self._stream_samples: int       = 0
+        # 這次錄音的「完整」秒數。為什麼要另外存：分段串流轉錄時，最後合併
+        #   出來的 result 是拿 **尾段** 的 result 去複製欄位的，它的
+        #   duration_seconds 只有尾段那幾秒——但 text 是全部段落接起來的。
+        #   結果就是存進歷史的時長嚴重失真：實測 738 筆裡有 371 筆（50.3%）
+        #   出現「每秒講超過 12 個字」這種物理上不可能的組合，最誇張一筆
+        #   寫 6.9 秒卻有 4612 字。這個欄位壞掉會讓任何依賴時長的分析與
+        #   功能（統計、UI 顯示、錄音長度判斷）全部說謊，所以在拿得到
+        #   full_audio 的當下就把真實長度記起來。
         self._stream_chunks:  list[str] = []   # 按 chunk index 排序、placeholder "" 占位
         self._stream_tick_id            = None
         # v2.16.0 streaming：dispatch / complete 計數、_run_transcription 用來等
@@ -1152,6 +1191,13 @@ class AppWindow(ctk.CTkFrame):
         self._content.pack_propagate(False)
         self.bind("<Configure>", self._on_skeleton_root_resize, add="+")
 
+        # 液態玻璃改造 Phase 2：底層玻璃 canvas。必須在四段 _build_*_v2() 之前
+        # 建立——tkinter 同層 sibling 疊放順序預設「後建立蓋前建立」，先建這個
+        # 才會自然落在四段下面（_build_glass_backdrop 內部還會另外用
+        # lift(aboveThis=...) 精確卡位，不只依賴這裡的建立順序，見該函式
+        # 內的說明）。
+        self._build_glass_backdrop()
+
         self._build_topbar_v2()
         self._build_status_slot()
         self._build_stream_v2()
@@ -1171,6 +1217,101 @@ class AppWindow(ctk.CTkFrame):
         content_w = min(event.width - 2 * SKELETON_CONTENT_PAD, SKELETON_CONTENT_MAX)
         content_w = max(content_w, 200)   # 安全下限，避免視窗被硬拖到極端小時算出負值
         self._content.configure(width=int(content_w))
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  液態玻璃改造 Phase 2 —— 主視窗玻璃底（見 glass_render.py）
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _build_glass_backdrop(self) -> None:
+        """底層玻璃 canvas：徑向光暈底 + 頂列／底列玻璃面板，鋪滿 `_content`。
+
+        ① 為什麼要鋪光暈、不能只鋪純色：玻璃的視覺原理是「模糊＋透出底下的
+        東西」。疊在平的近白／近黑底上，模糊完還是同一片平色，玻璃會完全看
+        不出來（見 glass_render.py module docstring 的實測結論——參考設計
+        自己就把某一組標成「這就是你覺得看不出來的那一組」）。
+        radial_backdrop() 鋪的兩團大而淡的光暈就是「給玻璃透的東西」。
+
+        ③ 快取策略：玻璃本身是**靜態**的（不像波形每幀都要重畫），只在
+        「視窗尺寸變了」才需要重算，平常每幀成本是零。所以這裡不建立任何
+        render loop，只綁一次 <Configure>，靠尺寸有沒有變化決定要不要重畫
+        （見 _on_glass_backdrop_resize 的快取比對）。主題不需要另外比對——
+        tokens.py 的 theme 在 import 時鎖定、不支援 live switch（換主題要
+        整個 App 重啟，見 SettingsWindow 的重啟提示），同一次執行裡
+        _IS_LIGHT_THEME 不會變，不會有「主題切換了但沒重畫」的問題。
+        """
+        self._backdrop_canvas = tk.Canvas(
+            self._content, highlightthickness=0, bd=0, bg=BG,
+        )
+        self._backdrop_canvas.place(relx=0, rely=0, relwidth=1, relheight=1)
+        # 不能用 .lower()（不帶參數＝退到「同一個 parent 底下所有 sibling」
+        # 的最底層）：`_content` 自己也是 CTkFrame，它的建構子已經在自己
+        # 底下鋪了一張畫滿 fg_color 的內部 `_canvas`（customtkinter 私有
+        # 屬性，同專案既有的 `_parent_frame`／`_scrollbar` 存取慣例）。
+        # `.lower()` 會連 `_content._canvas` 都退到它下面——那張內部背景
+        # canvas 蓋住整個 `_content` 矩形，我們的玻璃圖從此 100% 被蓋住，
+        # 實測截圖完全看不到任何光暈／玻璃才抓到這個坑（讀程式碼看不出來，
+        # 這條是存圖打開看才發現的）。改用 `lift(aboveThis=...)` 精確卡在
+        # `_content._canvas` 正上方，不管建立順序、也不管其他元件變動。
+        #
+        # 另外：不能用 self._backdrop_canvas.lift()——tkinter 的 Canvas 把
+        # 這個名字改綁成 tag_raise()（畫布「物件」疊放順序，要吃 tagOrId
+        # 參數），蓋掉了 Misc 原本「視窗」疊放順序的版本（同 _show_big_wave
+        # 既有的 tk.Misc.lift() 那個坑），要繞開、直接呼叫 Misc 版本。
+        try:
+            tk.Misc.lift(self._backdrop_canvas, self._content._canvas)
+        except Exception:
+            pass
+
+        # ② PhotoImage 沒有其他 Python 參考就會被 GC 回收、畫面變空白——這是
+        # tkinter 的經典坑（同 _update_big_wave 的既有處理），必須存成
+        # instance attribute 保留參考，不能只是局部變數丟給 create_image。
+        self._backdrop_photo: Optional[ImageTk.PhotoImage] = None
+        self._backdrop_image_id: Optional[int] = None
+        self._backdrop_size: Optional[tuple[int, int]] = None   # 快取鍵 (寬, 高)
+
+        self._backdrop_canvas.bind("<Configure>", self._on_glass_backdrop_resize, add="+")
+
+    def _on_glass_backdrop_resize(self, event) -> None:
+        """canvas 尺寸變化才重畫；同尺寸的 <Configure>（子元件內部 reflow
+        冒泡上來、跟這顆 canvas 實際尺寸無關的事件）直接跳過，不重算。
+        """
+        w, h = event.width, event.height
+        if w <= 1 or h <= 1:
+            return   # 剛 place() 完，geometry manager 這輪還沒跑到，量到預設 1×1
+        if self._backdrop_size == (w, h):
+            return
+        self._backdrop_size = (w, h)
+        self._redraw_glass_backdrop(w, h)
+
+    def _redraw_glass_backdrop(self, w: int, h: int) -> None:
+        """實際重畫底圖＋兩塊玻璃面板。只被 _on_glass_backdrop_resize 呼叫，
+        每次 resize 只算一次（不是每幀）。
+
+        glass_render.py module docstring 量的 13–15ms 是較小的原型測試畫布
+        （704×430、單塊面板）；主視窗實際內容區更高（640×900、兩塊面板），
+        實測約 30ms——resize 觸發一次感覺不到，但這不是每幀成本，不需要
+        額外優化（見 CLAUDE.md 開發流程：不要為了效能做超出範圍的優化）。
+
+        頂列玻璃用 G1（浮起來的主要面板）、底列玻璃用 G2（貼在底上的表
+        面），對應 Claude Design 原型 light_glass_test.py 驗證過的組合。
+        """
+        blobs = glass_render.LIGHT_BLOBS if _IS_LIGHT_THEME else glass_render.DARK_BLOBS
+        img = glass_render.radial_backdrop(w, h, BACKDROP_BASE, blobs)
+
+        g1, g2 = glass_render.specs_for(_IS_LIGHT_THEME)
+        top_h = SKELETON_TOPBAR_H + SKELETON_STATUS_SLOT_H
+        glass_render.draw_glass(img, (0, 0, w, top_h), 20, g1)
+        glass_render.draw_glass(img, (0, h - SKELETON_BOTTOMBAR_H, w, h), 20, g2)
+
+        self._backdrop_photo = ImageTk.PhotoImage(img)
+        if self._backdrop_image_id is None:
+            self._backdrop_image_id = self._backdrop_canvas.create_image(
+                0, 0, anchor="nw", image=self._backdrop_photo
+            )
+        else:
+            self._backdrop_canvas.itemconfig(
+                self._backdrop_image_id, image=self._backdrop_photo
+            )
 
     # ═══════════════════════════════════════════════════════════════════════
     #  v2.28.0 主視窗骨架重寫 —— 新版四段式版面（頂列／狀態槽／轉錄流／底列）
@@ -1251,9 +1392,41 @@ class AppWindow(ctk.CTkFrame):
 
         左：狀態點 + 兩行文字｜中：flex｜右：兩顆模式 pill + 分隔線 + 三顆
         導覽圖示（歷史／設定／⋯選單）。Canvas 物件 0（全 CTkFrame/Label/Button）。
+
+        v2.30.0「顏色匹配」而非真玻璃：跟底列（_build_bottombar_v2）不同，
+        頂列的狀態文字／pill 按鈕顏色與文字／hover 效果散在錄音狀態切換、
+        Ollama 輪詢、暖機進度等十幾處，全檔案共 30 個呼叫點會 .configure()
+        這裡建立的元件。全部重寫成 canvas 繪製風險太高——歷史清單那次
+        改寫規模比照，且出過「文字正常但整列點不到」的嚴重 bug。這裡改用
+        折衷：**保留全部既有 CTk 元件與 30 個呼叫點完全不動**，只把 `bar`
+        的背景色來源從固定 CHROME 換成「離屏算一張玻璃圖、取樣中心點顏
+        色」，視覺上跟其他真玻璃區塊協調。**這不是真玻璃**——沒有
+        backdrop-filter 模糊效果，只是純色貼近，程式碼與回報都要維持這個
+        區分，不能混報成真玻璃。
         """
+        # 離屏算一次玻璃圖只為了取色，不會顯示在畫面上（風險最低的版本：
+        # 先確認顏色匹配本身能不能跑，暫不疊視覺上的置底 canvas——見任務
+        # 規格 B 步驟 1 的說明）。取樣寬度用預設視窗寬度（704 =
+        # SKELETON_CONTENT_COL + 2×SKELETON_CONTENT_PAD）；radial_backdrop
+        # 在這個尺度內幾乎均勻，取中心點顏色已經夠接近（同 _build_status_slot
+        # 的既有結論）。
+        _sample_w = SKELETON_CONTENT_COL + 2 * SKELETON_CONTENT_PAD
+        _topbar_sample_img = glass_render.radial_backdrop(
+            _sample_w, SKELETON_TOPBAR_H, BACKDROP_BASE,
+            glass_render.LIGHT_BLOBS if _IS_LIGHT_THEME else glass_render.DARK_BLOBS,
+        )
+        _g1, _ = glass_render.specs_for(_IS_LIGHT_THEME)
+        # 頂列用 G1（浮起來的主要面板），跟主背景 _redraw_glass_backdrop
+        # 畫頂列／狀態槽那塊時的規格一致——取樣的是「這裡本來會是什麼玻璃」
+        # 的顏色，不是隨便一種玻璃。
+        glass_render.draw_glass(
+            _topbar_sample_img, (0, 0, _sample_w, SKELETON_TOPBAR_H), 20, _g1,
+        )
+        _sample_rgb = _topbar_sample_img.getpixel((_sample_w // 2, SKELETON_TOPBAR_H // 2))
+        _topbar_fg = "#%02x%02x%02x" % _sample_rgb[:3]
+
         bar = ctk.CTkFrame(self._content, height=SKELETON_TOPBAR_H,
-                            corner_radius=0, fg_color=CHROME)
+                            corner_radius=0, fg_color=_topbar_fg)
         bar.pack(fill="x")
         bar.pack_propagate(False)
 
@@ -1372,12 +1545,61 @@ class AppWindow(ctk.CTkFrame):
         self._status_slot = slot
         self._status_slot_active = "meter"
 
+        # ── 玻璃背景（v2.30.0）──────────────────────────────────────────
+        # 為什麼跟 MiniRecordingWindow 同一套模式（見該 class __init__ 裡
+        # 同段落的註解）：customtkinter 的 fg_color="transparent" 不是真
+        # 透明（_detect_color_of_master() 只會往上找祖先的實色平塗），一般
+        # tk.Frame／tk.Label 的 bg 也只吃實色——不管哪一種，疊在玻璃圖上都
+        # 只是拿一塊實色蓋掉底下畫好的模糊＋高光，玻璃等於白畫。要透得出來
+        # 就得整個交給 canvas 畫（同 _build_glass_backdrop 的做法）。
+        #
+        # 尺寸固定 640×40（LEVEL_METER_W × SKELETON_STATUS_SLOT_H），不像
+        # _build_glass_backdrop 那樣掛 <Configure> 動態重畫：狀態槽視覺上
+        # 不像頂/底列那麼需要跟滿版寬（頂/底列拉寬視窗會露出明顯留白邊界，
+        # 這裡本來就窄，多出的留白不明顯），用置中對齊帶過即可，換取少一套
+        # resize 快取機制的複雜度。
+        g1, _ = glass_render.specs_for(_IS_LIGHT_THEME)
+        _slot_glass_img = glass_render.radial_backdrop(
+            LEVEL_METER_W, SKELETON_STATUS_SLOT_H, BACKDROP_BASE,
+            glass_render.LIGHT_BLOBS if _IS_LIGHT_THEME else glass_render.DARK_BLOBS,
+        )
+        # 圓角用設計稿 --r3=9：這種 40pt 高的細長條，頂/底列用的 20 會太
+        # 誇張、Mini HUD 用的 14 也偏大，9 比例上比較合適。
+        glass_render.draw_glass(
+            _slot_glass_img, (0, 0, LEVEL_METER_W, SKELETON_STATUS_SLOT_H),
+            radius=9, spec=g1,
+        )
+        # PhotoImage 沒有其他 Python 參考就會被 GC 回收、畫面變空白——
+        # tkinter 經典坑，必須存成 instance attribute 保留參考。
+        self._status_slot_glass_photo = ImageTk.PhotoImage(_slot_glass_img)
+        self._status_slot_glass_canvas = tk.Canvas(
+            slot, width=LEVEL_METER_W, height=SKELETON_STATUS_SLOT_H,
+            highlightthickness=0, bd=0, bg=CHROME,
+        )
+        self._status_slot_glass_canvas.create_image(
+            0, 0, anchor="nw", image=self._status_slot_glass_photo
+        )
+        # 用 place 置中，不用 pack：這張純粹是背景裝飾、不參與 slot 的 pack
+        # 版面流程。建立順序排在 chamber／warmup_progress／banner 之前，
+        # tkinter 同層 sibling 疊放預設「後建立蓋前建立」，之後 pack 進來的
+        # 三個 payload 都會自然蓋在它上面，不需要額外 lift/lower。
+        self._status_slot_glass_canvas.place(relx=0.5, rely=0.5, anchor="center")
+
         # Payload 1：LevelMeter（常態，繪製邏輯見 _draw_chamber_bars）
         self._chamber_w = LEVEL_METER_W
         self._chamber_h = LEVEL_METER_H
+        # bg 改成從玻璃圖中心點取樣的實色，不是真的疊玻璃：_draw_chamber_bars()
+        # 每幀都會先 canvas.delete("all")（同 MiniRecordingWindow 波形 canvas
+        # 的限制），玻璃圖畫在同一張 canvas 上下一幀就會被清掉，所以只能用
+        # 「取樣近似色」讓兩張 canvas 疊在一起時像同一片玻璃、不是兩塊拼接
+        # 的色塊。玻璃在這個尺寸內幾乎均勻，取中心點的顏色已經夠接近。
+        _chamber_sample = _slot_glass_img.getpixel(
+            (LEVEL_METER_W // 2, SKELETON_STATUS_SLOT_H // 2)
+        )
+        _chamber_bg = "#%02x%02x%02x" % _chamber_sample[:3]
         self._chamber = tk.Canvas(
             slot, width=LEVEL_METER_W, height=LEVEL_METER_H,
-            bg=CHROME, highlightthickness=0, bd=0,
+            bg=_chamber_bg, highlightthickness=0, bd=0,
         )
         # 不綁 <Enter>/<Leave>/<Motion>/<ButtonPress-1>/<ButtonRelease-1>——
         # 這個 canvas 不再可點擊，錄音已有主場（R⌘ + 迷你條）。
@@ -1584,14 +1806,18 @@ class AppWindow(ctk.CTkFrame):
     def _refresh_stream_stats(self) -> None:
         """底列左側統計文字「本次 N 段 · M 字」+ 右側複製全部主鈕的
         enable/disable 狀態，兩者共用同一份「目前有沒有結果」判斷。
+
+        v2.30.0：底列改真玻璃後，左側統計文字是 canvas text item，原本依
+        n==0/n>0 切換 TEXT_3/TEXT_2 的顏色邏輯改成固定 TEXT_3_GLASS（原因
+        見 _build_bottombar_v2 建立該 text item 處的註解），這裡只更新
+        文字內容、不再更新顏色。
         """
         if not self._skeleton_mode:
             return
         n = len(self._utterance_blocks)
         chars = sum(len(b.get_current_text()) for b in self._utterance_blocks)
-        self._stream_stats_label.configure(
-            text=f"本次 {n} 段 · {chars:,} 字",
-            text_color=TEXT_3 if n == 0 else TEXT_2,
+        self._bottombar_glass_canvas.itemconfig(
+            self._stats_text_id, text=f"本次 {n} 段 · {chars:,} 字",
         )
         if n == 0:
             self._copy_all_btn.configure(state="disabled", fg_color=BTN_DIS, text_color=BTN_DIS_FG)
@@ -1630,9 +1856,15 @@ class AppWindow(ctk.CTkFrame):
     # ── 底列 52pt ──────────────────────────────────────────────────────────
 
     def _build_bottombar_v2(self) -> None:
-        """底列 52pt：取代舊 _build_action_bar 的六顆按鈕。左：統計文字；
-        右：主鈕「複製全部」。原六顆按鈕去向——自動貼上/潤飾→頂列 pill；
-        複製/存檔→移到卡片（下一階段）；歷史/設定→頂列圖示；清除→⋯選單。
+        """底列 52pt：v2.30.0 起改真玻璃（取代舊 _build_action_bar 的六顆
+        按鈕）。左：統計文字（canvas text item）；右：主鈕「複製全部」。
+        原六顆按鈕去向——自動貼上/潤飾→頂列 pill；複製/存檔→移到卡片
+        （下一階段）；歷史/設定→頂列圖示；清除→⋯選單。
+
+        跟頂列（_build_topbar_v2）不同的風險分級：底列只有 2 個元件、5 個
+        呼叫點（本函式 + _refresh_stream_stats），風險低，值得做真玻璃；
+        頂列有 30 個分散的呼叫點，改用顏色匹配折衷（見 _build_topbar_v2
+        開頭註解）。
         """
         ctk.CTkFrame(self._content, height=1, fg_color=LINE, corner_radius=0).pack(fill="x")
         bar = ctk.CTkFrame(self._content, height=SKELETON_BOTTOMBAR_H,
@@ -1640,20 +1872,59 @@ class AppWindow(ctk.CTkFrame):
         bar.pack(fill="x")
         bar.pack_propagate(False)
 
-        inner = ctk.CTkFrame(bar, fg_color="transparent")
-        inner.pack(fill="both", expand=True, padx=20)
-
-        self._stream_stats_label = ctk.CTkLabel(
-            inner, text="", anchor="w",
-            font=ctk.CTkFont(FONT_FAMILY_MONO, 12),   # 規格 11.5、取整
-            text_color=TEXT_3,
+        # ── 玻璃背景（v2.30.0）───────────────────────────────────────────
+        # 為什麼整塊交給 canvas 畫：customtkinter 的 fg_color="transparent"
+        # 不是真透明（_detect_color_of_master() 只會往上找祖先的實色平塗），
+        # 一般 tk.Frame／tk.Label 的 bg 更直接只吃實色——不管哪一種，疊在
+        # 玻璃圖上面都只是拿一塊實色蓋掉底下畫好的模糊＋高光，玻璃等於白
+        # 畫（同 MiniRecordingWindow.__init__ 與 _build_status_slot 的既有
+        # 結論，見兩處對應註解）。
+        #
+        # 跟狀態槽（固定 640 寬、不掛 <Configure>）不同：底列是滿版寬條，
+        # 視窗拉寬會露出明顯留白邊界，所以要掛 <Configure> 依新寬度動態
+        # 重畫（同 _build_glass_backdrop 的 resize 快取寫法：同尺寸的
+        # <Configure> 冒泡事件直接跳過，不是每次都重算）。
+        self._bottombar_glass_size: Optional[tuple[int, int]] = None
+        self._bottombar_glass_photo: Optional[ImageTk.PhotoImage] = None
+        self._bottombar_glass_canvas = tk.Canvas(
+            bar, highlightthickness=0, bd=0, bg=CHROME,
         )
-        self._stream_stats_label.pack(side="left", fill="y")
+        self._bottombar_glass_canvas.place(relx=0, rely=0, relwidth=1, relheight=1)
+        # 先建一個空的 image item 佔好「最底層」的疊放順序（stacking
+        # order）——之後 resize 只 itemconfig 換圖、不重新 create，z-order
+        # 才會穩定維持在文字下面（文字 item 緊接著在下面建立，tkinter
+        # 預設「後建立蓋前建立」）。PhotoImage 沒有其他 Python 參考就會被
+        # GC 回收、畫面變空白——tkinter 經典坑，必須存成 instance attribute
+        # 保留參考（見 _on_bottombar_resize）。
+        self._bottombar_glass_image_id = self._bottombar_glass_canvas.create_image(
+            0, 0, anchor="nw",
+        )
 
+        # 統計文字：canvas text item，不再是 CTkLabel（理由同上）。
+        # TEXT_3_GLASS 是玻璃底專用灰階（見 tokens.py）。原本 CTkLabel 版本
+        # 依「有沒有內容」在 TEXT_3／TEXT_2 兩色間切換強調，玻璃底目前只有
+        # TEXT_3_GLASS 這一階（沒有對應的「亮」玻璃灰字 token；新增屬於
+        # tokens.py 改動，本次任務範圍明確禁止）——改成單一色階，兩色切換
+        # 的視覺強調暫時消失，這是刻意的簡化、不是遺漏，見
+        # _refresh_stream_stats 的對應說明。
+        self._stats_text_id = self._bottombar_glass_canvas.create_text(
+            20, SKELETON_BOTTOMBAR_H / 2, text="", anchor="w",
+            font=(FONT_FAMILY_MONO, 12), fill=TEXT_3_GLASS,
+        )
+
+        self._bottombar_glass_canvas.bind("<Configure>", self._on_bottombar_resize, add="+")
+
+        # 複製全部主鈕：本次改造**唯一保留的 CTkButton**。它有 icon＋文字＋
+        # hover＋disabled 四種狀態，改成 canvas 手刻命中測試／hover 風險
+        # 不小（歷史清單那次全部重寫成 canvas 出過「文字正常但整列點不到」
+        # 的嚴重 bug，規模比照）；而且它本身就有實色底（BTN_BG，不透明），
+        # 不強求它本身透玻璃——玻璃只要在它周圍的空間讀得出來就達到效果。
+        # 這是風險 vs 效益的取捨，直接疊在玻璃 canvas 之上（place 定位，
+        # 不再靠 inner frame 的 pack 版面）。
         btn_font = ctk.CTkFont(FONT_FAMILY_TEXT, 13, "bold")   # 規格 12.5 semibold、取整
         btn_text = "複製全部"
         self._copy_all_btn = ctk.CTkButton(
-            inner, text=btn_text,
+            bar, text=btn_text,
             image=get_icon("copy", 14, BTN_FG),
             compound="left",
             height=32, corner_radius=8,
@@ -1662,9 +1933,37 @@ class AppWindow(ctk.CTkFrame):
             fg_color=BTN_BG, text_color=BTN_FG, hover_color=BTN_BG,
             command=self._on_copy_all,
         )
-        self._copy_all_btn.pack(side="right")
+        # x=-20：對齊原本 padx=20 的右邊界留白；rely=0.5 置中對齊原本
+        # pack(side="right") 在無 fill 時的預設垂直置中效果。
+        self._copy_all_btn.place(relx=1.0, rely=0.5, anchor="e", x=-20)
 
         self._refresh_stream_stats()
+
+    def _on_bottombar_resize(self, event) -> None:
+        """底列玻璃 canvas 尺寸變化才重畫；同尺寸的 <Configure>（子元件
+        內部 reflow 冒泡上來的事件）直接跳過，不重算。快取邏輯同
+        _on_glass_backdrop_resize，但獨立一份快取鍵——底列的圓角
+        （--r5=20）與素材（G2 表面玻璃）是自己單獨算的一張圖，跟主背景
+        玻璃（_build_glass_backdrop 也會在同一塊區域畫一次 G2）疊在一起，
+        兩者疊放不衝突（同狀態槽 _build_status_slot 的既有模式：主背景已
+        經畫過一次，這裡疊一張自己的蓋在最上面）。
+        """
+        w, h = event.width, event.height
+        if w <= 1 or h <= 1:
+            return   # 剛 place() 完，geometry manager 這輪還沒跑到，量到預設 1×1
+        if self._bottombar_glass_size == (w, h):
+            return
+        self._bottombar_glass_size = (w, h)
+        blobs = glass_render.LIGHT_BLOBS if _IS_LIGHT_THEME else glass_render.DARK_BLOBS
+        img = glass_render.radial_backdrop(w, h, BACKDROP_BASE, blobs)
+        _, g2 = glass_render.specs_for(_IS_LIGHT_THEME)
+        # 設計稿 --r5=20；底列夠寬（滿版寬條）適合大圓角，跟主背景底列那
+        # 塊用的半徑一致（見 _redraw_glass_backdrop）。
+        glass_render.draw_glass(img, (0, 0, w, h), 20, g2)
+        self._bottombar_glass_photo = ImageTk.PhotoImage(img)
+        self._bottombar_glass_canvas.itemconfig(
+            self._bottombar_glass_image_id, image=self._bottombar_glass_photo
+        )
 
     # ── Top bar ──────────────────────────────────────────────────────────────
 
@@ -2123,6 +2422,7 @@ class AppWindow(ctk.CTkFrame):
         self._state_start_time = time.perf_counter()
         self._rec_start        = self._state_start_time
         self._stream_samples   = 0
+        self._full_audio_s     = 0.0
         self._stream_chunks    = []
         self._ripples.clear()
         self._prev_rms         = 0.0
@@ -2341,6 +2641,8 @@ class AppWindow(ctk.CTkFrame):
             self._status_dot.configure(text_color=WARN)
             self._status_label.configure(text="  轉錄中，請稍候…")
 
+        # 真實總長＝整段錄音，不是尾段（見 _full_audio_s 宣告處的註解）
+        self._full_audio_s = len(full_audio) / 16_000.0
         tail  = full_audio[self._stream_samples:]
         model = self._model_var.get()
         lang  = self.cfg.get_whisper_language()
@@ -2997,7 +3299,13 @@ class AppWindow(ctk.CTkFrame):
                 result = result.__class__(
                     text=combined.strip() or "（未偵測到語音內容）",
                     language=result.language,
-                    duration_seconds=result.duration_seconds,
+                    # 不能用 result.duration_seconds——這裡的 result 是**尾段**的
+                    #   結果，只有最後幾秒；但 text 已經是全部段落合併後的完整
+                    #   逐字稿。用尾段秒數配全段文字，存進歷史就是壞資料。
+                    #   _full_audio_s 是錄音停止那刻量到的整段長度。
+                    #   取 or 是保險：萬一沒被設到（理論上不會，這條路徑一定
+                    #   經過 _transition_to_processing）就退回舊行為，不要變成 0。
+                    duration_seconds=self._full_audio_s or result.duration_seconds,
                     elapsed_seconds=result.elapsed_seconds,
                     segments=result.segments,
                 )
@@ -6377,7 +6685,40 @@ class SettingsWindow(ctk.CTkToplevel):
     def _build(self) -> None:
         """建立搜尋列 + 側欄導覽 + 6 個分類頁 + 底部儲存／取消按鈕。"""
         # ── 搜尋列 ───────────────────────────────────────────────────────────
-        search_bar = ctk.CTkFrame(self, height=52, fg_color=SURF_1, corner_radius=0)
+        # v2.29.0「顏色匹配」而非真玻璃（這輪玻璃改造最後一塊，搜尋列／
+        # 側欄／底部按鈕列三處都是同一個理由，只在這裡完整寫一次）。
+        # 上一輪歷史紀錄視窗左清單原本也想做「真玻璃」：疊一張跟前景
+        # canvas 同尺寸的獨立玻璃 canvas，靠元件間的縫隙露出玻璃內容。
+        # **事後用隔離實驗證實完全無效**——兩張 tk.Canvas 同尺寸疊放時，
+        # 上層 canvas 的 `bg` 是整塊 widget 矩形的不透明底色，不管上面畫
+        # 了幾個 item、內容裝不裝得滿，下層那張玻璃 canvas 100% 永遠看不
+        # 到（Tk 固定行為，不是機率問題），詳見
+        # `HistoryWindow._on_list_canvas_glass_sample` 的完整解說。這裡
+        # 搜尋列有 CTkEntry（自己的 focus／打字游標行為）、側欄有 6 顆
+        # 導覽按鈕（`_select_category()` 動態切換 active／inactive 樣式）、
+        # 底部按鈕列有「取消」「儲存」兩顆按鈕——三處都沒有「元件間留白」
+        # 這種明確會露出玻璃的縫隙可用，重寫成 canvas 手繪＋命中測試的
+        # 風險（歷史清單那次全部重寫出過「文字正常但整列點不到」的嚴重
+        # bug）換不回視覺效益。改用折衷：**內部元件與既有呼叫點完全不
+        # 動**，只把三塊外框的 `fg_color` 從固定 SURF_1 換成「離屏算一張
+        # 玻璃圖、取樣中心點顏色」，視覺上跟其他真玻璃區塊協調。這不是
+        # 真玻璃，沒有 backdrop-filter 模糊效果，只是純色貼近。視窗
+        # `resizable(False, False)` 尺寸固定，不需要像主視窗頂／底列那樣
+        # 掛 `<Configure>` 動態重算（同 `_build_topbar_v2`／
+        # `_build_status_slot` 的既有結論）。
+        _blobs = glass_render.LIGHT_BLOBS if _IS_LIGHT_THEME else glass_render.DARK_BLOBS
+        _g1, _g2 = glass_render.specs_for(_IS_LIGHT_THEME)
+
+        # 搜尋列是「頂部命令列」角色，跟主視窗頂列（_build_topbar_v2）／
+        # 歷史視窗搜尋+篩選列同一類，沿用 G1（浮起來的主要面板）規格；
+        # 圓角 14 比照歷史視窗（980×640，跟本視窗 840×680 同量級的子
+        # 視窗），不用主視窗骨架的 20（那是給更大的 900pt 全幅視窗用）。
+        _search_bar_img = glass_render.radial_backdrop(self._WIN_W, 52, BACKDROP_BASE, _blobs)
+        glass_render.draw_glass(_search_bar_img, (0, 0, self._WIN_W, 52), 14, _g1)
+        _search_bar_rgb = _search_bar_img.getpixel((self._WIN_W // 2, 26))
+        _search_bar_fg = "#%02x%02x%02x" % _search_bar_rgb[:3]
+
+        search_bar = ctk.CTkFrame(self, height=52, fg_color=_search_bar_fg, corner_radius=0)
         search_bar.pack(fill="x", side="top")
         search_bar.pack_propagate(False)
         self._search_var = ctk.StringVar(value="")
@@ -6397,7 +6738,15 @@ class SettingsWindow(ctk.CTkToplevel):
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True, side="top")
 
-        sidebar = ctk.CTkFrame(body, width=self._SIDEBAR_W, fg_color=SURF_1, corner_radius=0)
+        # 側欄是「側邊面板填滿高度」角色，跟歷史視窗左清單 list_col
+        # （固定寬、fill="y"）同一類，沿用它的 G2（次要表面玻璃）規格 +
+        # 14 圓角；理由見上方搜尋列的完整說明。
+        _sidebar_img = glass_render.radial_backdrop(self._SIDEBAR_W, self._WIN_H, BACKDROP_BASE, _blobs)
+        glass_render.draw_glass(_sidebar_img, (0, 0, self._SIDEBAR_W, self._WIN_H), 14, _g2)
+        _sidebar_rgb = _sidebar_img.getpixel((self._SIDEBAR_W // 2, self._WIN_H // 2))
+        _sidebar_fg = "#%02x%02x%02x" % _sidebar_rgb[:3]
+
+        sidebar = ctk.CTkFrame(body, width=self._SIDEBAR_W, fg_color=_sidebar_fg, corner_radius=0)
         sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
 
@@ -6438,7 +6787,16 @@ class SettingsWindow(ctk.CTkToplevel):
 
         # ── Buttons ──────────────────────────────────────────────────────────
         ctk.CTkFrame(self, height=1, fg_color=SURF_3, corner_radius=0).pack(fill="x", side="bottom")
-        btn_bar = ctk.CTkFrame(self, height=60, fg_color=SURF_1, corner_radius=0)
+        # 底部按鈕列是「底部操作列」角色，跟主視窗底列
+        # （_build_bottombar_v2）同一類，沿用它的 G2 規格；圓角維持 14
+        # （跟本視窗其餘兩塊一致，不用主視窗底列的 20）。理由見上方搜尋
+        # 列的完整說明。
+        _btn_bar_img = glass_render.radial_backdrop(self._WIN_W, 60, BACKDROP_BASE, _blobs)
+        glass_render.draw_glass(_btn_bar_img, (0, 0, self._WIN_W, 60), 14, _g2)
+        _btn_bar_rgb = _btn_bar_img.getpixel((self._WIN_W // 2, 30))
+        _btn_bar_fg = "#%02x%02x%02x" % _btn_bar_rgb[:3]
+
+        btn_bar = ctk.CTkFrame(self, height=60, fg_color=_btn_bar_fg, corner_radius=0)
         btn_bar.pack(fill="x", side="bottom")
         btn_bar.pack_propagate(False)
 
@@ -6577,7 +6935,13 @@ class SettingsWindow(ctk.CTkToplevel):
     # ── 分類頁：錄音 ─────────────────────────────────────────────────────────
 
     def _build_page_recording(self, page: ctk.CTkFrame) -> None:
-        """錄音分類：全域快捷鍵、麥克風、輸入電平（即時）、靜音自動停止。"""
+        """錄音分類：全域快捷鍵、麥克風、輸入電平（即時）、靜音自動停止。
+
+        v2.29.0 玻璃改造刻意不動 6 個分類頁本身（本頁與其餘 5 頁）：這裡
+        是開關／下拉選單／字典編輯器／快捷鍵綁定這種密集功能性內容，
+        不是介面裝飾，跟歷史視窗右側詳細面板、主視窗轉錄流本文同一個
+        原則——玻璃鋪在介面框架上、不鋪在內容上。
+        """
         self._page_header(page, "錄音")
 
         # 全域快捷鍵 --------------------------------------------------------
@@ -8199,7 +8563,7 @@ class SettingsWindow(ctk.CTkToplevel):
             _draw_spectral_bars(
                 self._level_canvas, self._level_engine,
                 width=self._LEVEL_METER_W, height=self._LEVEL_METER_H,
-                elapsed_ms=elapsed_ms, big=True,
+                elapsed_ms=elapsed_ms, big=True, level=rms,
             )
         except tk.TclError:
             return
@@ -8774,7 +9138,32 @@ class HistoryWindow(ctk.CTkToplevel):
         self.grid_columnconfigure(0, weight=1)
 
         # ── 搜尋 + 篩選列 ────────────────────────────────────────────────
-        top = ctk.CTkFrame(self, fg_color=SURF_1, corner_radius=0)
+        # v2.30.0「顏色匹配」而非真玻璃：跟頂列（_build_topbar_v2）同一等級
+        # 風險——這條列裡有 CTkEntry（有自己的 focus／打字游標行為）+ 4 顆
+        # CTkButton 篩選 chip（`_update_chip_styles()` 依 `_filter_key` 動態
+        # 切換 selected/unselected 樣式，散在別的方法裡呼叫）。全部重寫成
+        # canvas 手繪＋命中測試，風險跟歷史清單那次改寫（v2.28.0）同等級，
+        # 但這裡的元件互動邏輯（輸入、hover、選中態）比清單列複雜，值不回票。
+        # 折衷：**內部元件與既有呼叫點完全不動**，只把 `top` 的背景色來源
+        # 從固定 SURF_1 換成「離屏算一張玻璃圖、取樣中心點顏色」，視覺上跟
+        # 其他真玻璃區塊協調。這不是真玻璃，只是純色貼近。
+        _search_sample_w = self.WIN_W
+        _search_sample_h = 90   # 粗估搜尋列＋chip 列的實際高度（兩行 CTkLabel/
+        # CTkEntry/CTkButton 疊 pady），不用算到精確像素——radial_backdrop
+        # 在這個尺度內幾乎均勻，取中心點顏色就夠接近（同 _build_topbar_v2
+        # 的既有結論）。
+        _search_glass_img = glass_render.radial_backdrop(
+            _search_sample_w, _search_sample_h, BACKDROP_BASE,
+            glass_render.LIGHT_BLOBS if _IS_LIGHT_THEME else glass_render.DARK_BLOBS,
+        )
+        _g1, _ = glass_render.specs_for(_IS_LIGHT_THEME)
+        glass_render.draw_glass(
+            _search_glass_img, (0, 0, _search_sample_w, _search_sample_h), 14, _g1,
+        )
+        _search_rgb = _search_glass_img.getpixel((_search_sample_w // 2, _search_sample_h // 2))
+        _search_fg = "#%02x%02x%02x" % _search_rgb[:3]
+
+        top = ctk.CTkFrame(self, fg_color=_search_fg, corner_radius=0)
         top.grid(row=0, column=0, sticky="ew")
 
         search_row = ctk.CTkFrame(top, fg_color="transparent")
@@ -8857,6 +9246,9 @@ class HistoryWindow(ctk.CTkToplevel):
         list_canvas_wrap.grid_columnconfigure(0, weight=1)
 
         self._list_canvas = tk.Canvas(
+            # bg=SURF_1 只是首次 <Configure> 玻璃圖算出來之前的過渡色；真正
+            # 的顯示色由 `_on_list_glass_resize()` 取樣玻璃圖中心點顏色後
+            # `configure(bg=...)` 覆寫（v2.30.0，見下方玻璃背景區塊註解）。
             list_canvas_wrap, bg=SURF_1, highlightthickness=0, bd=0,
         )
         self._list_canvas.grid(row=0, column=0, sticky="nsew")
@@ -8868,6 +9260,14 @@ class HistoryWindow(ctk.CTkToplevel):
         self._list_canvas.bind("<MouseWheel>", self._on_list_mouse_wheel)
         # 寬度變了要重畫（首次 map、以及使用者拉動視窗）——見方法內註解
         self._list_canvas.bind("<Configure>", self._on_list_canvas_configure, add="+")
+        # `_list_glass_size` 必須在這裡先初始化，不能等下面建構玻璃背景那段
+        # 才設——`<Configure>` 可能在 bind 呼叫之後、下面那行程式碼執行之前
+        # 就先被 Tk 觸發一次（親自跑過整合測試才抓到：開真的視窗會直接炸
+        # `AttributeError: no attribute '_list_glass_size'`，不是理論上的
+        # 邊界案例）。跟 `_on_list_canvas_configure` 那票坑是同一類問題：
+        # 「以為程式碼由上到下線性執行」在 Tk 事件迴圈裡不成立。
+        self._list_glass_size: Optional[tuple[int, int]] = None
+        self._list_canvas.bind("<Configure>", self._on_list_canvas_glass_sample, add="+")
         self._list_canvas.bind("<Button-1>", self._on_list_canvas_click)
         self._list_canvas.bind("<Control-Button-1>", lambda e: self._on_list_canvas_click(e, toggle=True))
         if IS_MAC:
@@ -8890,10 +9290,30 @@ class HistoryWindow(ctk.CTkToplevel):
         self._autohide_list_scrollbar()
         self._install_scroll_hook()
 
+        # ── 左清單背景色（v2.30.0）── 顏色匹配，不是真玻璃 ──────────────
+        # 這裡原本疊了一張跟 `_list_canvas` 同尺寸的獨立玻璃 canvas、想做
+        # 「真玻璃」，但**用隔離實驗證實那個做法完全無效**：兩張 tk.Canvas
+        # 同尺寸疊放時，上層 canvas 的 `bg` 是整塊 widget 矩形的不透明底
+        # 色，不管上面畫了幾個 item、內容裝不裝得滿，一定蓋滿整個矩形——
+        # 下層那張「玻璃」canvas 100% 永遠看不到，不會因為捲動條收起或
+        # 筆數少而露出（Tk 的固定行為，不是機率問題）。留著只是白算一張
+        # 12-14ms 的玻璃圖然後完全沒有畫面效果，是死程式碼，已經拿掉。
+        #
+        # 改成跟狀態槽 `_chamber`、頂列 `_topbar_fg` 同一類「顏色匹配」：
+        # 離屏算一次玻璃圖只為了取樣中心點顏色，直接設進 `_list_canvas.bg`。
+        # 見下面 `_on_list_canvas_glass_sample()`。`_list_glass_size` 的
+        # 初始化已經提前到 `_list_canvas.bind("<Configure>", ...)` 那裡
+        # （必須搶在事件可能觸發之前），這裡不重複設。
+
         # 分隔線
         ctk.CTkFrame(body, width=1, fg_color=SURF_3).pack(side="left", fill="y")
 
-        # 右詳細
+        # 右詳細（v2.30.0：刻意維持實色 BG，不玻璃化）
+        # 這是刻意的取捨，不是漏做。比照主視窗「玻璃鋪在介面上、不鋪在
+        # 內容上」的既有原則——`_detail_frame` 是讀逐字稿內容的地方，跟
+        # 主視窗轉錄流本文（UtteranceBlock）同一類：長時間閱讀大段文字的
+        # 區域需要實色底撐住對比度，玻璃的半透明＋模糊只適合裝飾性的邊框／
+        # 工具列，疊在長文字底下反而會拖累可讀性。
         self._detail_frame = ctk.CTkFrame(body, fg_color=BG)
         self._detail_frame.pack(side="left", fill="both", expand=True)
 
@@ -8996,6 +9416,36 @@ class HistoryWindow(ctk.CTkToplevel):
             self._update_sticky_header()
         except Exception:
             pass
+
+    def _on_list_canvas_glass_sample(self, event) -> None:
+        """左清單背景色（v2.30.0，顏色匹配，不是真玻璃）：尺寸變化才重算。
+
+        原本這裡疊了一張獨立的玻璃 canvas 想做真玻璃，**用隔離實驗證實
+        完全無效**（兩張同尺寸 tk.Canvas 疊放，上層的 `bg` 一定蓋滿整塊
+        widget 矩形，下層那張 100% 永遠看不到、不會因為內容多寡而露出，
+        這是 Tk 的固定行為）。已拿掉那張死程式碼，改成離屏算一次玻璃圖
+        只為了取樣中心點顏色，跟狀態槽 `_chamber`／頂列 `_topbar_fg` 同一
+        類做法。
+
+        同尺寸的 `<Configure>`（子元件內部 reflow 冒泡上來的事件）直接
+        跳過；寬度固定 340（`list_col` 鎖死），只有窗高變動會真的觸發重算。
+        """
+        w, h = event.width, event.height
+        if w <= 1 or h <= 1:
+            return   # geometry manager 這輪還沒跑到，量到預設 1×1
+        if self._list_glass_size == (w, h):
+            return
+        self._list_glass_size = (w, h)
+        blobs = glass_render.LIGHT_BLOBS if _IS_LIGHT_THEME else glass_render.DARK_BLOBS
+        img = glass_render.radial_backdrop(w, h, BACKDROP_BASE, blobs)
+        _, g2 = glass_render.specs_for(_IS_LIGHT_THEME)
+        glass_render.draw_glass(img, (0, 0, w, h), radius=14, spec=g2)
+        # `_list_canvas` 的 bg 只需要在「尺寸真的變了」這裡設一次：
+        # `_render_grouped_rows()` 每次刷新清單都會 `canvas.delete("all")`
+        # 清畫面，但那清的是 canvas 上的「item」，`bg` 是 widget 層級的
+        # 組態選項、不是 item，不會被 `delete("all")` 動到。
+        sample = img.getpixel((w // 2, h // 2))
+        self._list_canvas.configure(bg="#%02x%02x%02x" % sample[:3])
 
     def _on_list_mouse_wheel(self, event) -> None:
         """滑鼠滾輪捲動清單 canvas。
@@ -10260,6 +10710,10 @@ class MiniRecordingWindow(tk.Toplevel):
     # 覆寫回舊值，見下方 self._legacy_visual 判斷
     WIN_W = 220
     WIN_H = 44
+    #  玻璃圓角。小元件用 14（設計稿 --r4），20 對 44px 高的條來說太圓、會變膠囊。
+    #  這個值同時給「畫布上的玻璃圖」與「NSWindow 的 layer 圓角遮罩」用，
+    #  兩者必須一致，否則會看到雙重圓角。
+    _GLASS_RADIUS = 14
     # 距螢幕底邊（Speakly 風格：中下方）
     BOTTOM_MARGIN = 120
 
@@ -10323,33 +10777,55 @@ class MiniRecordingWindow(tk.Toplevel):
         # 升級成 NSPanel-level（跨 Space / 全螢幕可見 / 不搶 focus）
         self._upgrade_to_panel_level()
 
-        # 1px SURF_4 邊框
-        outer = tk.Frame(self, bg=SURF_4, highlightthickness=0)
-        outer.pack(fill="both", expand=True)
-        inner = tk.Frame(outer, bg=SURF_2, highlightthickness=0)
-        inner.pack(fill="both", expand=True, padx=1, pady=1)
-
-        # 狀態圓點 + 文字 + 計時器
-        self._dot = tk.Label(
-            inner, text="●",
-            font=(FONT_FAMILY_TEXT, 14),
-            fg=DANGER, bg=SURF_2,
+        # ═══════════════════════════════════════════════════════════════
+        #  液態玻璃改造 —— mini HUD 主體
+        # ═══════════════════════════════════════════════════════════════
+        # 為什麼整塊改成單一 canvas：customtkinter 的 fg_color="transparent"
+        # 不是真透明，會往上找祖先的實色來平塗（見 ctk_base_class.py 的
+        # _detect_color_of_master()）；一般 tk.Frame／tk.Label 更直接——bg
+        # 只吃實色，沒有 alpha channel。不管哪一種，疊在玻璃圖上面都只是
+        # 拿一塊實色蓋掉底下畫好的模糊＋高光，玻璃等於白畫。要玻璃透得出來，
+        # 這塊區域就得整個交給 canvas 畫（同主視窗 _build_glass_backdrop
+        # 的做法，見 glass_render.py module docstring 的實測結論）。
+        g1, _ = glass_render.specs_for(_IS_LIGHT_THEME)
+        glass_img = glass_render.radial_backdrop(
+            self.WIN_W, self.WIN_H, BACKDROP_BASE,
+            glass_render.LIGHT_BLOBS if _IS_LIGHT_THEME else glass_render.DARK_BLOBS,
         )
-        self._dot.pack(side="left", padx=(12, 6))
-
-        self._label = tk.Label(
-            inner, text="錄音中",
-            font=(FONT_FAMILY_TEXT, 12),
-            fg=TEXT_1, bg=SURF_2,
+        # 圓角用 --r4=14（主視窗頂／底列用的 20 對這種 140~220px 寬的小
+        # 元件比例太大，四角會看起來像貼了兩個半圓)
+        glass_render.draw_glass(
+            glass_img, (0, 0, self.WIN_W, self.WIN_H), radius=14, spec=g1,
         )
-        self._label.pack(side="left")
+        # PhotoImage 沒有其他 Python 參考就會被 GC 回收、畫面變空白——
+        # tkinter 經典坑（同 _redraw_glass_backdrop 既有處理），必須存成
+        # instance attribute 保留參考。
+        self._glass_photo = ImageTk.PhotoImage(glass_img)
 
-        self._timer = tk.Label(
-            inner, text="00:00",
-            font=(FONT_FAMILY_MONO, 12),
-            fg=TEXT_3, bg=SURF_2,
+        self._canvas = tk.Canvas(
+            self, width=self.WIN_W, height=self.WIN_H,
+            highlightthickness=0, bd=0, bg=SURF_2,
         )
-        self._timer.pack(side="right", padx=SPACE_MD)
+        self._canvas.pack(fill="both", expand=True)
+        self._canvas.create_image(0, 0, anchor="nw", image=self._glass_photo)
+
+        # 狀態圓點 + 文字 + 計時器（畫成 canvas item；圓角框線／內緣高光
+        # draw_glass() 已經畫進玻璃圖了，不需要再疊一層 outer/inner 邊框）
+        cy = self.WIN_H / 2
+        self._dot_id = self._canvas.create_text(
+            20, cy, text="●", font=(FONT_FAMILY_TEXT, 14), fill=DANGER,
+        )
+        self._label_id = self._canvas.create_text(
+            34, cy, text="錄音中", font=(FONT_FAMILY_TEXT, 12),
+            fill=TEXT_1, anchor="w",
+        )
+        # 計時器用 TEXT_3_GLASS 不是 TEXT_3：玻璃底是半透明疊色，一般灰字
+        # 在上面對比不夠會被吃掉，TEXT_3_GLASS 是設計師另外定給玻璃底用的
+        # 灰階（見 tokens.py）。
+        self._timer_id = self._canvas.create_text(
+            self.WIN_W - SPACE_MD, cy, text="00:00",
+            font=(FONT_FAMILY_MONO, 12), fill=TEXT_3_GLASS, anchor="e",
+        )
 
         # v2.25.0 Aperture 波形：13 bar 極簡波形（不畫峰值帽／削波線，見
         # _draw_spectral_bars 的 big=False 分支）。錄音中取代「錄音中」文字
@@ -10357,23 +10833,33 @@ class MiniRecordingWindow(tk.Toplevel):
         # 逃生門模式（chamber）完全不建立。
         self._wave_engine: Optional[WaveformEngine] = None
         self._wave_canvas: Optional[tk.Canvas] = None
+        self._wave_pos = (34, int(cy - MINI_WAVE_H / 2))
         self._wave_tick_active = False
         self._wave_last_tick = 0.0
         self._wave_state_start = 0.0
         if not self._legacy_visual:
             self._wave_engine = WaveformEngine(n_bars=WAVE_N_BARS_MINI)
-            self._wave_canvas = tk.Canvas(
-                inner, width=MINI_WAVE_W, height=MINI_WAVE_H,
-                bg=SURF_2, highlightthickness=0, bd=0,
+            # 波形 canvas 不能跟主 canvas 共用一張圖：_draw_spectral_bars()
+            # 每幀都會先 canvas.delete("all")（見函式 docstring），玻璃圖若
+            # 畫在同一張 canvas 上，下一幀就被清空。所以波形維持獨立的小
+            # canvas，底色改用「從玻璃圖上取樣一個實色點」近似真玻璃——
+            # 玻璃在 28px 高的範圍內幾乎均勻，取這塊區域中心點的顏色已經
+            # 夠接近，不需要每幀重算模糊。
+            wx, wy = self._wave_pos
+            sample = glass_img.getpixel(
+                (wx + MINI_WAVE_W // 2, wy + MINI_WAVE_H // 2)
             )
-            # 不在這裡 pack：show_recording() 時取代 _label 顯示（見下方）
+            wave_bg = "#%02x%02x%02x" % sample[:3]
+            self._wave_canvas = tk.Canvas(
+                self, width=MINI_WAVE_W, height=MINI_WAVE_H,
+                bg=wave_bg, highlightthickness=0, bd=0,
+            )
+            # 不在這裡 place：show_recording() 時取代「錄音中」文字顯示（見下方）
 
         # 點擊任何處 → 把主視窗拉前
-        _click_targets = [self, outer, inner, self._dot, self._label, self._timer]
+        self._canvas.bind("<Button-1>", self._on_click)
         if self._wave_canvas is not None:
-            _click_targets.append(self._wave_canvas)
-        for w in _click_targets:
-            w.bind("<Button-1>", self._on_click)
+            self._wave_canvas.bind("<Button-1>", self._on_click)
 
         # 預設隱藏；由 AppWindow 透過 .show() 顯示
         self.withdraw()
@@ -10468,6 +10954,28 @@ class MiniRecordingWindow(tk.Toplevel):
         except Exception:
             pass
 
+        # v2.30.0 玻璃：讓**視窗本身**有圓角，而不是只有畫布上的玻璃圖有。
+        #
+        # 為什麼要動到 NSWindow：Tk 的 Toplevel 一定是矩形，畫布上畫圓角玻璃之後，
+        # 圓角外面那四個小三角形露出的是沒套玻璃樣式的底色——實測（放大截圖）
+        # 是四個明顯的灰色角，深色主題下更明顯。這在繪圖層無解：問題不是「畫錯」，
+        # 是「視窗是方的」。
+        # 解法是把 NSWindow 設成不透明背景清除 + contentView 的 layer 加圓角遮罩，
+        # 讓作業系統幫我們把角切掉。專案已經在用 PyObjC 操作 NSWindow
+        # （setLevel_ / setCollectionBehavior_），這裡沿用同一條路。
+        # 整段包 try/except：失敗只是回到「有灰角」的舊樣子，不影響功能。
+        try:
+            from AppKit import NSColor
+            ns_window.setOpaque_(False)
+            ns_window.setBackgroundColor_(NSColor.clearColor())
+            view = ns_window.contentView()
+            view.setWantsLayer_(True)
+            layer = view.layer()
+            layer.setCornerRadius_(self._GLASS_RADIUS)
+            layer.setMasksToBounds_(True)
+        except Exception:
+            log_error("mini_hud_corner_radius_failed")
+
     def _upgrade_to_panel_level(self) -> None:
         """把對應 NSWindow 升到 NSStatusWindowLevel + collectionBehavior。
 
@@ -10545,13 +11053,14 @@ class MiniRecordingWindow(tk.Toplevel):
             log.warning("MINI_HUD: show_recording on closed window, skip")
             return
         self._position_at_cursor_screen_bottom()
-        self._dot.configure(fg=DANGER)
-        self._label.configure(text="錄音中")
-        self._timer.configure(text="00:00")
+        self._canvas.itemconfig(self._dot_id, fill=DANGER)
+        self._canvas.itemconfig(self._label_id, text="錄音中")
+        self._canvas.itemconfig(self._timer_id, text="00:00")
         # v2.25.0 Aperture 波形：canvas 取代文字 label，啟動 20 FPS render tick
         if self._wave_canvas is not None:
-            self._label.pack_forget()
-            self._wave_canvas.pack(side="left", padx=(4, 4))
+            self._canvas.itemconfig(self._label_id, state="hidden")
+            wx, wy = self._wave_pos
+            self._wave_canvas.place(x=wx, y=wy)
             self._wave_engine.reset()
             self._wave_state_start = time.perf_counter()
             self._wave_last_tick = self._wave_state_start
@@ -10582,15 +11091,14 @@ class MiniRecordingWindow(tk.Toplevel):
         if self._closed:
             return
         self._position_at_cursor_screen_bottom()   # D3-S6：multi-monitor 跟手
-        self._dot.configure(fg=WARN)
-        self._label.configure(text="轉錄中")
+        self._canvas.itemconfig(self._dot_id, fill=WARN)
+        self._canvas.itemconfig(self._label_id, text="轉錄中", state="normal")
         # v2.25.0 Aperture 波形：處理中不畫波形（沒有錄音訊號），停 render
         # tick、canvas 收起來換回文字 label
         if self._wave_canvas is not None:
             self._wave_tick_active = False
-            self._wave_canvas.pack_forget()
+            self._wave_canvas.place_forget()
             self._wave_canvas.delete("all")
-            self._label.pack(side="left")
         self.deiconify()
         self._reapply_panel_level()
 
@@ -10618,7 +11126,7 @@ class MiniRecordingWindow(tk.Toplevel):
             _draw_spectral_bars(
                 self._wave_canvas, self._wave_engine,
                 width=MINI_WAVE_W, height=MINI_WAVE_H,
-                elapsed_ms=elapsed_ms, big=False,
+                elapsed_ms=elapsed_ms, big=False, level=rms,
             )
         except tk.TclError:
             return
@@ -10630,7 +11138,7 @@ class MiniRecordingWindow(tk.Toplevel):
         if self._closed:
             return
         s = int(seconds)
-        self._timer.configure(text=f"{s // 60:02d}:{s % 60:02d}")
+        self._canvas.itemconfig(self._timer_id, text=f"{s // 60:02d}:{s % 60:02d}")
 
     def hide(self) -> None:
         if self._closed:
