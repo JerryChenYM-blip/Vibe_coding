@@ -928,6 +928,14 @@ class AppWindow(ctk.CTkFrame):
 
         # Streaming
         self._stream_samples: int       = 0
+        # 這次錄音的「完整」秒數。為什麼要另外存：分段串流轉錄時，最後合併
+        #   出來的 result 是拿 **尾段** 的 result 去複製欄位的，它的
+        #   duration_seconds 只有尾段那幾秒——但 text 是全部段落接起來的。
+        #   結果就是存進歷史的時長嚴重失真：實測 738 筆裡有 371 筆（50.3%）
+        #   出現「每秒講超過 12 個字」這種物理上不可能的組合，最誇張一筆
+        #   寫 6.9 秒卻有 4612 字。這個欄位壞掉會讓任何依賴時長的分析與
+        #   功能（統計、UI 顯示、錄音長度判斷）全部說謊，所以在拿得到
+        #   full_audio 的當下就把真實長度記起來。
         self._stream_chunks:  list[str] = []   # 按 chunk index 排序、placeholder "" 占位
         self._stream_tick_id            = None
         # v2.16.0 streaming：dispatch / complete 計數、_run_transcription 用來等
@@ -2123,6 +2131,7 @@ class AppWindow(ctk.CTkFrame):
         self._state_start_time = time.perf_counter()
         self._rec_start        = self._state_start_time
         self._stream_samples   = 0
+        self._full_audio_s     = 0.0
         self._stream_chunks    = []
         self._ripples.clear()
         self._prev_rms         = 0.0
@@ -2341,6 +2350,8 @@ class AppWindow(ctk.CTkFrame):
             self._status_dot.configure(text_color=WARN)
             self._status_label.configure(text="  轉錄中，請稍候…")
 
+        # 真實總長＝整段錄音，不是尾段（見 _full_audio_s 宣告處的註解）
+        self._full_audio_s = len(full_audio) / 16_000.0
         tail  = full_audio[self._stream_samples:]
         model = self._model_var.get()
         lang  = self.cfg.get_whisper_language()
@@ -2997,7 +3008,13 @@ class AppWindow(ctk.CTkFrame):
                 result = result.__class__(
                     text=combined.strip() or "（未偵測到語音內容）",
                     language=result.language,
-                    duration_seconds=result.duration_seconds,
+                    # 不能用 result.duration_seconds——這裡的 result 是**尾段**的
+                    #   結果，只有最後幾秒；但 text 已經是全部段落合併後的完整
+                    #   逐字稿。用尾段秒數配全段文字，存進歷史就是壞資料。
+                    #   _full_audio_s 是錄音停止那刻量到的整段長度。
+                    #   取 or 是保險：萬一沒被設到（理論上不會，這條路徑一定
+                    #   經過 _transition_to_processing）就退回舊行為，不要變成 0。
+                    duration_seconds=self._full_audio_s or result.duration_seconds,
                     elapsed_seconds=result.elapsed_seconds,
                     segments=result.segments,
                 )

@@ -51,16 +51,6 @@ PRESETS: dict[str, Preset] = {
         triggers_keyword=[],
         prompt_attr="OLLAMA_POLISH_PROMPT",
     ),
-    "email": Preset(
-        name="email",
-        display_name="Email",
-        triggers_app={
-            "mail", "outlook", "thunderbird", "superhuman",
-            "airmail", "spark", "郵件",
-        },
-        triggers_keyword=["email to", "寄信給", "寫封信給", "發 email"],
-        prompt_attr="OLLAMA_EMAIL_PROMPT",
-    ),
     "chat": Preset(
         name="chat",
         display_name="即時通訊",
@@ -70,61 +60,6 @@ PRESETS: dict[str, Preset] = {
         },
         triggers_keyword=["傳訊息給", "dm ", "chat to"],
         prompt_attr="OLLAMA_CHAT_PROMPT",
-    ),
-    "note": Preset(
-        name="note",
-        display_name="筆記",
-        triggers_app={
-            "notion", "obsidian", "bear", "notes", "備忘錄",
-            "craft", "logseq", "apple notes",
-        },
-        triggers_keyword=["筆記", "note mode"],
-        prompt_attr="OLLAMA_NOTE_PROMPT",
-    ),
-    "code_comment": Preset(
-        name="code_comment",
-        display_name="程式註解",
-        triggers_app={
-            "xcode", "visual studio code", "code",  # vscode 的進程名有時是 code
-            "cursor", "zed", "sublime text", "pycharm", "intellij idea",
-            "webstorm", "goland", "rubymine", "android studio",
-            "jetbrains toolbox", "vscodium",
-        },
-        triggers_keyword=["// ", "# comment", "code comment"],
-        prompt_attr="OLLAMA_CODE_COMMENT_PROMPT",
-    ),
-    # ── Phase 3.1 Voice Shortcuts（action preset）────────────────────────────
-    # 只靠關鍵字觸發（triggers_app 留空），避免「在 Mail 裡說『翻譯英文…』」
-    # 這類句子被 target preset 搶走。
-    "translate_en": Preset(
-        name="translate_en",
-        display_name="翻英文",
-        triggers_app=set(),
-        triggers_keyword=[
-            "翻譯英文", "翻成英文", "翻英文",
-            "translate to english", "translate english", "in english",
-        ],
-        prompt_attr="OLLAMA_TRANSLATE_EN_PROMPT",
-    ),
-    "list": Preset(
-        name="list",
-        display_name="條列",
-        triggers_app=set(),
-        triggers_keyword=[
-            "條列", "列點", "列出",
-            "list mode", "bullet points", "bullet list",
-        ],
-        prompt_attr="OLLAMA_LIST_PROMPT",
-    ),
-    "meeting_notes": Preset(
-        name="meeting_notes",
-        display_name="會議紀錄",
-        triggers_app=set(),
-        triggers_keyword=[
-            "會議紀錄", "會議記錄", "會議摘要",
-            "meeting notes", "meeting minutes",
-        ],
-        prompt_attr="OLLAMA_MEETING_NOTES_PROMPT",
     ),
 }
 
