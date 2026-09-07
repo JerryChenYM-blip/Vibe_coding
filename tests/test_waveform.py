@@ -157,6 +157,43 @@ def test_reset_returns_to_initial_state():
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# 中心對稱（v2.28.0）
+#   改版前 f = i/(n-1)、能量全堆在最左邊三分之一，使用者回報「波都是從左邊
+#   開始，我原本的認知應該是在中間」。改成 f = 距離中央的正規化距離之後，
+#   最高點落在正中央、往兩側對稱衰減。下面兩支測試鎖住這個特性，避免日後
+#   有人「順手」把 f 改回由左到右。
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_energy_is_balanced_between_left_and_right_halves():
+    """左右兩半的總能量要接近——改版前實測是左重右輕、比值遠大於 1。"""
+    eng = WaveformEngine(n_bars=46, seed=1.0)
+    for _ in range(150):
+        eng.update(0.6, FRAME_MS)
+
+    bars = eng.bars
+    half = len(bars) // 2
+    left, right = sum(bars[:half]), sum(bars[half:])
+    ratio = left / right
+    # 容差 ±12%：jitter 刻意保留 i（不是 f），所以左右不是像素級完美鏡像
+    assert 0.88 <= ratio <= 1.12, f"左右能量失衡：左 {left:.2f} / 右 {right:.2f} = {ratio:.2f}"
+
+
+def test_peak_sits_near_the_centre_not_the_edge():
+    """最高的那根 bar 要落在中央附近，不是最左邊。"""
+    eng = WaveformEngine(n_bars=46, seed=1.0)
+    for _ in range(150):
+        eng.update(0.45, FRAME_MS)
+
+    bars = eng.bars
+    peak_i = bars.index(max(bars))
+    centre = (len(bars) - 1) / 2.0
+    # 允許離中央 1/6 的範圍內（jitter 會讓尖峰在中央附近小幅游移）
+    assert abs(peak_i - centre) <= len(bars) / 6, (
+        f"最高點在第 {peak_i} 根、中央是 {centre}——能量沒有以中央為中心"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # 能量色溫斜坡（tokens.energy_color / Aperture D2）
 #   註：這批測試原由色溫 agent 撰寫，但與波形引擎 agent 平行寫同一個檔案時
 #   被覆蓋掉，由總管依原始清單補回。
