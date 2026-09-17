@@ -239,3 +239,31 @@ def test_模型選單只在_macOS_出現這個選項():
     # 既有三個模型一個都不能少
     for m in ("large-v3-turbo", "qwen3-asr", "qwen3-asr-large"):
         assert m in MODEL_INFO
+
+
+# ── (f) 排版：全形標點前的多餘空白 ────────────────────────────────────────
+
+@pytest.mark.parametrize("原文,期望", [
+    # 蘋果引擎會在中文與全形標點之間插空格（2026-09-17 實測 81% 的輸出都有）
+    ("哈嘍 ，你這個北七。",        "哈嘍，你這個北七。"),
+    ("語音辨識引擎 ，看看它",      "語音辨識引擎，看看它"),
+    ("結束了 。",                 "結束了。"),
+    ("他說 「好」",               "他說 「好」"),      # 前引號不動，那是開頭不是結尾
+    # 中文與英數之間的空格是正確排版，**不可以**被砍掉
+    ("還不如 Qwen3 的那個",       "還不如 Qwen3 的那個"),
+    ("它只有 0.6B 的大小",        "它只有 0.6B 的大小"),
+    # 本來就正常的不要動
+    ("正常的句子，沒有問題。",      "正常的句子，沒有問題。"),
+    ("", ""),
+])
+def test_清掉全形標點前的空白(原文, 期望):
+    assert tr._tidy_apple_spacing(原文) == 期望
+
+
+def test_轉錄結果有套用排版清理(monkeypatch):
+    """不是只有純函式對——實際走 _transcribe_apple 出來也要是乾淨的。"""
+    monkeypatch.setattr(Transcriber, "_run_apple_helper",
+                        lambda self, args, timeout: {
+                            "ok": True, "text": "哈嘍 ，你這個北七。", "locale": "zh_TW"})
+    result = Transcriber()._transcribe_apple(_audio(), "apple-speech", None, None)
+    assert result.text == "哈嘍，你這個北七。"

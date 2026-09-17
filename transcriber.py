@@ -28,6 +28,7 @@ import gc
 import json
 import os
 import platform
+import re
 import subprocess
 import tempfile
 import time
@@ -282,6 +283,20 @@ def is_system_message(text: str) -> bool:
     t = text.strip()
     # 單行、且整句被全形括號包住才算——避免誤判「（笑）他說…」這種真的逐字稿
     return "\n" not in t and t.startswith("（") and t.endswith("）")
+
+
+# 全形標點前面的空白。蘋果引擎會在中文與全形標點之間插一個空格
+# （「語音辨識引擎 ，看看」），2026-09-17 實測 16 筆有效輸出中 13 筆有這個問題（81%），
+# 同時段 Qwen3 的 51 筆是 0%。這是排版瑕疵不是辨識錯誤，但每一句都會出現。
+#
+# 刻意只砍「全形標點前面」的空白：中文與英數之間的空格（「還不如 Qwen3」）是
+# 正確排版，要留著。實測資料裡也只出現這兩種型態，沒有「中文 空白 中文」。
+_SPACE_BEFORE_FULLWIDTH_PUNCT = re.compile(r"[ \t　]+(?=[，。、；：！？）」』】》〉…])")
+
+
+def _tidy_apple_spacing(text: str) -> str:
+    """清掉蘋果輸出在全形標點前多出來的空白。"""
+    return _SPACE_BEFORE_FULLWIDTH_PUNCT.sub("", text)
 
 
 def _is_apple_model(model_size: str) -> bool:
@@ -2482,7 +2497,7 @@ class Transcriber:
         # 依語言篩選的查詢漏掉一半資料。
         raw_locale = payload.get("locale") or locale
         return TranscriptionResult(
-            text=(payload.get("text") or "").strip(),
+            text=_tidy_apple_spacing((payload.get("text") or "").strip()),
             language=raw_locale.replace("-", "_").split("_")[0].lower(),
             duration_seconds=0.0,   # 由呼叫端 transcribe() 填入
             elapsed_seconds=0.0,
