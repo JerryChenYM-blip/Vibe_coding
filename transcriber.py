@@ -25,8 +25,11 @@ Whisper 語音轉文字封裝器。
 from __future__ import annotations
 
 import gc
+import json
 import os
 import platform
+import subprocess
+import tempfile
 import time
 import threading
 from dataclasses import dataclass, field
@@ -202,6 +205,95 @@ def _is_qwen3_model(model_size: str) -> bool:
 def _qwen3_hf_repo(model_size: str) -> str:
     """model_size → HuggingFace repo ID；未知名稱 fallback 到 0.6B。"""
     return _QWEN3_ASR_MODELS.get(model_size.lower(), _QWEN3_ASR_MODELS["qwen3-asr"])
+
+
+# ── 蘋果原生語音辨識（macOS 26 SpeechAnalyzer）────────────────────────────
+# v2.31.0：第四種後端。與前三種最大的差別是「模型不在這個 process 裡」——
+# 實際辨識由 native/apple_stt/ 編出來的 Swift helper 執行，Python 只負責寫一個
+# 暫存 wav、呼叫它、收一行 JSON 回來。
+#
+# 為什麼要繞 subprocess 這一圈、不直接用 PyObjC 呼叫（2026-09-17 實測）：
+#   • macOS 26 的新引擎（SpeechAnalyzer / SpeechTranscriber）是 Swift-only，
+#     Apple 沒有橋接給 Objective-C runtime，PyObjC 完全看不到這些型別
+#     ——objc.lookUpClass("SpeechAnalyzer") 直接 nosuchclass_error。
+#   • 舊的 SFSpeechRecognizer 確實 PyObjC 叫得到（zh-TW 可離線），但官方文件
+#     載明單次辨識約有 1 分鐘上限、長錄音會被截斷，所以刻意不走那條。
+#     ——不要因為「PyObjC 比較省事」就改回舊 API，那會讓長錄音默默被砍尾。
+_APPLE_STT_MODELS: dict[str, str] = {
+    # UI 名稱 → helper 的 --engine 參數
+    # 只開放 speech 一種：實測 speech 會輸出標點、dictation 不會，而這個 App
+    # 的輸出是直接貼進游標處，沒有標點幾乎不能用。helper 仍保留 dictation
+    # 引擎（--engine dictation）供日後比較，但不放進設定選單免得使用者選錯。
+    "apple-speech": "speech",
+}
+
+# helper 執行檔位置。跟 splash.py / app_icon.py 一樣以「專案原始碼目錄」為基準——
+# WhisperPro.app 的 launcher 會先 cd 回專案目錄才 exec Python，所以打包模式與
+# 開發模式（venv/bin/python3 main.py）解出來的路徑相同，不需要判斷執行環境。
+_APPLE_HELPER_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "native", "apple_stt", "bin", "whisperpro-apple-stt",
+)
+
+# Whisper 語言代碼 → 蘋果 locale。自動偵測（None）走 zh-TW：
+# 新引擎必須指定 locale、沒有「自動偵測」這個選項，而本 App 的使用者是
+# 中英夾雜的繁中使用者，zh-TW 模型本來就吃得下句中的英文詞。
+_APPLE_LOCALE_MAP: dict[str, str] = {
+    "zh": "zh-TW",
+    "en": "en-US",
+    "ja": "ja-JP",
+    "ko": "ko-KR",
+    "es": "es-ES",
+    "fr": "fr-FR",
+}
+_APPLE_DEFAULT_LOCALE = "zh-TW"
+
+# contextualStrings 的詞數上限。Apple 文件對舊 API 建議不超過 100 個，
+# 新 API 沒有明講上限，這裡沿用同一個保守值。
+_APPLE_MAX_TERMS = 100
+
+
+class AppleSTTError(RuntimeError):
+    """helper 回報的可預期失敗。
+
+    刻意用例外而不是「回傳一個 text 是錯誤訊息的 TranscriptionResult」——
+    後者會讓 transcribe() 走完整條成功路徑，audit log 記成 error=None 的成功紀錄，
+    日後統計成功率／RTF 時會把失敗算成成功（979bca9 那次分析被污染就是這樣來的）。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(code)
+        self.code = code
+        self.message = message   # 給使用者看的中文訊息
+
+
+def is_system_message(text: str) -> bool:
+    """判斷這段文字是系統訊息（而不是使用者講的話）。
+
+    全形括號包住整句是本專案既有的慣例（「（未偵測到語音內容）」等），
+    transcriber 內部的字典校正、幻覺過濾本來就靠 startswith("（") 跳過它們。
+
+    這個函式存在的原因是「白名單列舉」擋不住：原本 gui.py 用硬編碼的兩句話
+    當白名單，任何人新增一種失敗訊息、忘了同步那份清單，訊息就會被當成逐字稿
+    自動貼進使用者的游標、寫進歷史紀錄。閘要能判 FAIL，不能靠記得維護清單。
+    """
+    if not text:
+        return False
+    t = text.strip()
+    # 單行、且整句被全形括號包住才算——避免誤判「（笑）他說…」這種真的逐字稿
+    return "\n" not in t and t.startswith("（") and t.endswith("）")
+
+
+def _is_apple_model(model_size: str) -> bool:
+    """判斷 model_size 是不是蘋果原生辨識（走 Swift helper、不載任何本地權重）。"""
+    return model_size.lower() in _APPLE_STT_MODELS
+
+
+def _apple_locale_for(language: Optional[str]) -> str:
+    """Whisper 語言代碼 → 蘋果 locale 字串。"""
+    if not language:
+        return _APPLE_DEFAULT_LOCALE
+    return _APPLE_LOCALE_MAP.get(language.lower().split("-")[0], _APPLE_DEFAULT_LOCALE)
 
 
 # OpenCC 簡↔繁轉換器 lazy cache：variant → OpenCC 實例（或 None=載入失敗）
@@ -1050,10 +1142,71 @@ class Transcriber:
         t_prep_end = time.perf_counter()
 
         # v2.19.0：實際走的 backend（fallback 後會改、影響 audit 與可疑音檔 metadata）
-        actual_backend = "qwen3-asr" if _is_qwen3_model(model_size) else BACKEND
+        # v2.31.0：加入 apple-speech（第四種）
+        actual_backend = (
+            "apple-speech" if _is_apple_model(model_size)
+            else "qwen3-asr" if _is_qwen3_model(model_size)
+            else BACKEND
+        )
 
+        # v2.31.0：蘋果原生辨識走 Swift helper（模型在 OS 裡、本 process 不載權重）
+        if _is_apple_model(model_size):
+            if not IS_MAC:
+                log.warning("WHISPER: 蘋果原生辨識只有 macOS 有；當前平台不支援")
+                self._emit_audit(
+                    pid=pid, model_size=model_size, language=language,
+                    quality=quality, duration=duration, backend="apple-speech",
+                    result=None, dict_terms_snapshot=dict_terms_snapshot,
+                    gate_short=False, gate_silent=False,
+                    elapsed=time.perf_counter() - t0,
+                    error="apple_requires_macos",
+                    breakdown=self._make_breakdown(
+                        t_start_pipeline, t_prep_end, t_prep_end, t_prep_end,
+                    ),
+                    context=context,
+                )
+                return TranscriptionResult(
+                    text="（蘋果原生辨識只有 macOS 可用、請於設定切回其他模型）",
+                    language="", duration_seconds=duration,
+                    elapsed_seconds=time.perf_counter() - t0,
+                )
+            try:
+                result = self._transcribe_apple(
+                    audio, model_size, language, dict_terms_snapshot, chinese_variant
+                )
+            except Exception as exc:
+                # 與 Qwen3 一樣沒有 fallback：這是使用者明確選的後端，
+                # 默默換成別的模型會讓「為什麼結果變了」變成無頭公案。
+                #
+                # AppleSTTError 是 helper 回報的可預期失敗（模型沒裝、逾時…），
+                # 有專屬錯誤碼與給使用者看的訊息；其他例外才是真的非預期崩潰。
+                # 兩者都要走這裡，audit 才記得到 error——失敗不可以被寫成成功。
+                if isinstance(exc, AppleSTTError):
+                    err_code, user_msg = f"apple_{exc.code}", exc.message
+                else:
+                    log_error("apple_backend_crashed", model=model_size)
+                    err_code = f"apple_failed:{type(exc).__name__}"
+                    user_msg = "（蘋果語音辨識失敗、請重試或於設定切回其他模型）"
+                t_inference_end_fail = time.perf_counter()
+                self._emit_audit(
+                    pid=pid, model_size=model_size, language=language,
+                    quality=quality, duration=duration, backend="apple-speech",
+                    result=None, dict_terms_snapshot=dict_terms_snapshot,
+                    gate_short=False, gate_silent=False,
+                    elapsed=time.perf_counter() - t0,
+                    error=err_code,
+                    breakdown=self._make_breakdown(
+                        t_start_pipeline, t_prep_end, t_inference_end_fail, t_inference_end_fail,
+                    ),
+                    context=context,
+                )
+                return TranscriptionResult(
+                    text=user_msg,
+                    language="", duration_seconds=duration,
+                    elapsed_seconds=time.perf_counter() - t0,
+                )
         # v2.14.0：Qwen3-ASR 走獨立 backend（與 Whisper 不同套件、無 CTranslate fallback）
-        if _is_qwen3_model(model_size):
+        elif _is_qwen3_model(model_size):
             if BACKEND != "mlx":
                 # Qwen3-ASR 只有 MLX 實作、非 Apple Silicon 直接擋
                 log.warning(
@@ -1730,14 +1883,20 @@ class Transcriber:
             segments=segments,
         )
 
-    def warmup(self, model_size: str) -> None:
+    def warmup(self, model_size: str, language: Optional[str] = None) -> None:
         """預先載入模型並跑一次靜音片段，暖機完成後第一次錄音不會卡頓。
 
         Args:
             model_size: 要預熱的模型大小。
+            language:   語言代碼（None = 自動偵測）。只有蘋果後端會用到——
+                        它的模型是「一個語言一份」，暖機時要知道該裝哪一份。
+                        Whisper / Qwen3 是多語言單一模型，這個參數對它們無意義。
         """
+        # v2.31.0：蘋果原生辨識——這裡是唯一會觸發模型下載的地方（見 _warmup_apple）
+        if _is_apple_model(model_size):
+            self._warmup_apple(model_size, language)
         # v2.14.0：Qwen3-ASR 走獨立 backend
-        if _is_qwen3_model(model_size):
+        elif _is_qwen3_model(model_size):
             self._warmup_qwen3(model_size)
         elif BACKEND == "mlx":
             self._warmup_mlx(model_size)
@@ -2202,6 +2361,188 @@ class Transcriber:
             elapsed_seconds=0.0,
             segments=segments,
         )
+
+    # ── 蘋果原生語音辨識（macOS 26 SpeechAnalyzer，走 Swift helper）─────────
+
+    def _run_apple_helper(self, args: list[str], timeout: float) -> dict:
+        """呼叫 helper、把 stdout 那一行 JSON 解出來。
+
+        helper 的契約：stdout 永遠只有一行 JSON、診斷訊息一律走 stderr，
+        所以這裡不需要過濾雜訊。解析失敗一律轉成 {"ok": False, "error": ...}，
+        呼叫端只要看 ok 欄位，不必到處包 try。
+        """
+        if not os.path.exists(_APPLE_HELPER_PATH):
+            return {"ok": False, "error": "helper_missing", "detail": _APPLE_HELPER_PATH}
+        try:
+            proc = subprocess.run(
+                [_APPLE_HELPER_PATH, *args],
+                capture_output=True, timeout=timeout, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": "helper_timeout", "detail": f"{timeout:.0f}s"}
+        except Exception as exc:
+            return {"ok": False, "error": "helper_spawn_failed", "detail": type(exc).__name__}
+
+        stderr = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        if stderr:
+            log.info(f"WHISPER: apple helper stderr: {stderr[:300]}")
+        try:
+            return json.loads((proc.stdout or b"").decode("utf-8", "replace").strip() or "{}")
+        except Exception:
+            return {"ok": False, "error": "helper_bad_json",
+                    "detail": (proc.stdout or b"")[:200].decode("utf-8", "replace")}
+
+    def _transcribe_apple(
+        self,
+        audio,
+        model_size: str,
+        language: Optional[str],
+        dict_terms: Optional[list[str]] = None,
+        chinese_variant: str = "off",
+    ) -> TranscriptionResult:
+        """用 macOS 26 內建引擎轉錄（模型在系統裡、這個 process 不載任何權重）。
+
+        與其他三個後端的差異：
+          • 沒有 lazy load、沒有 RAM 佔用——模型歸 OS 管，unload() 不需要處理它
+          • 字典術語走 contextualStrings（辨識期偏好），不是 prompt 注入
+          • 音訊必須落地成檔案：helper 吃的是 AVAudioFile，不吃 numpy 陣列
+
+        暫存 wav 一定要刪：那是使用者的真實語音，不能留在 /tmp。
+        """
+        import numpy as np
+        import soundfile as sf
+
+        # 0 影格的 wav 會讓 helper 的 results 串流永遠等不到結束訊號、整支掛住，
+        # 只能靠 subprocess timeout 殺掉——使用者白等 20 秒才看到失敗。
+        # 上游的空音訊／時長／RMS 三道閘理論上擋得住，這裡是最後一道保險。
+        if audio is None or len(audio) == 0:
+            raise AppleSTTError("empty_audio", "（沒有偵測到音訊，請確認麥克風是否正常運作）")
+
+        engine = _APPLE_STT_MODELS.get(model_size.lower(), "speech")
+        locale = _apple_locale_for(language)
+        terms = [t for t in (dict_terms or []) if t][:_APPLE_MAX_TERMS]
+
+        tmp_dir = tempfile.mkdtemp(prefix="whisperpro_apple_")
+        wav_path = os.path.join(tmp_dir, "audio.wav")
+        terms_path = os.path.join(tmp_dir, "terms.txt")
+        try:
+            # float32 16 kHz 單聲道——與錄音端格式相同，不做任何重取樣
+            sf.write(wav_path, np.asarray(audio, dtype="float32"), 16_000,
+                     subtype="FLOAT", format="WAV")
+            args = ["--audio", wav_path, "--locale", locale, "--engine", engine]
+            if terms:
+                # 走檔案而不是命令列參數：詞可能上百個、還可能含空白，
+                # 塞進 argv 會被長度上限與 shell 跳脫咬到
+                with open(terms_path, "w", encoding="utf-8") as fh:
+                    fh.write("\n".join(terms))
+                args += ["--terms-file", terms_path]
+
+            duration = len(audio) / 16_000 if len(audio) else 0.0
+            # 實測 57 秒音訊只花 1.5 秒（約 37 倍實時）。這裡給的餘裕遠大於實測值，
+            # 目的是擋住「卡住不回來」而不是擋住「慢」——慢會被 audit log 抓到。
+            timeout = max(20.0, duration * 0.5)
+            payload = self._run_apple_helper(args, timeout=timeout)
+        finally:
+            for path in (wav_path, terms_path):
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except Exception:
+                    log_error("apple_tmp_cleanup_failed")
+            try:
+                os.rmdir(tmp_dir)
+            except Exception:
+                pass
+
+        if not payload.get("ok"):
+            code = payload.get("error", "unknown")
+            log_error("apple_backend_failed", model=model_size)
+            log.error(f"WHISPER: 蘋果原生辨識失敗 error={code} detail={payload.get('detail')}")
+            # 訊息用「（…）」包起來：這是本專案的系統訊息慣例，下游的字典校正、
+            # 幻覺過濾、以及 gui.py 的 is_system_message() 都靠它認出「這不是逐字稿」。
+            if code == "asset_not_installed":
+                msg = "（蘋果語音辨識模型尚未安裝、請重開 App 讓它在背景下載）"
+            elif code == "helper_missing":
+                msg = "（找不到蘋果辨識元件、請執行 native/apple_stt/build.sh 重新編譯）"
+            elif code == "locale_unsupported":
+                msg = f"（蘋果語音辨識不支援這個語言：{locale}）"
+            else:
+                msg = "（蘋果語音辨識失敗、請重試或於設定切回其他模型）"
+            # 用 raise 不用 return：回傳一個「text 是錯誤訊息」的正常結果，會讓
+            # transcribe() 走完成功路徑、audit log 記成 error=None 的成功紀錄，
+            # 日後統計成功率與 RTF 時會把失敗算成成功。
+            raise AppleSTTError(code, msg)
+
+        # 刻意不套 opencc：zh-TW 模型輸出本來就是繁體，再轉一次只會多一層
+        # 可能改動用詞的風險（s2twp 會動詞彙，不只字體）。chinese_variant
+        # 參數保留在簽名裡是為了與其他後端一致，這裡有意忽略它。
+        #
+        # language 要回 Whisper 風格的語言代碼（zh / en），不是 locale（zh_TW）——
+        # 結果卡片與歷史資料庫的這個欄位由四個後端共寫，格式混用會讓之後
+        # 依語言篩選的查詢漏掉一半資料。
+        raw_locale = payload.get("locale") or locale
+        return TranscriptionResult(
+            text=(payload.get("text") or "").strip(),
+            language=raw_locale.replace("-", "_").split("_")[0].lower(),
+            duration_seconds=0.0,   # 由呼叫端 transcribe() 填入
+            elapsed_seconds=0.0,
+            segments=[],
+        )
+
+    def _warmup_apple(self, model_size: str, language: Optional[str] = None) -> None:
+        """探測引擎狀態；模型沒裝就趁現在裝。
+
+        下載放在暖機而不是轉錄路徑上的原因：轉錄是「按完熱鍵等著貼上」的
+        即時流程，不能卡在一個可能要好幾分鐘的下載上。
+
+        locale 一定要跟轉錄時用的同一個。之前這裡寫死 zh-TW，結果選 English
+        的使用者：轉錄用 en-US → 沒裝 → 叫他重開 App → 重開後又只裝 zh-TW，
+        永遠修不好。
+        """
+        engine = _APPLE_STT_MODELS.get(model_size.lower(), "speech")
+        locale = _apple_locale_for(language)
+        probe = self._run_apple_helper(["--probe", "--locale", locale], timeout=20.0)
+        if not probe.get("ok"):
+            log_error("apple_warmup_probe_failed")
+            log.warning(f"WHISPER: 蘋果辨識探測失敗 error={probe.get('error')}")
+            return
+
+        info = probe.get(engine, {}) or {}
+        status = info.get("asset_status")
+        log.info(
+            f"WHISPER: 蘋果辨識 engine={engine} locale={info.get('supported_locale')} "
+            f"asset={status}"
+        )
+        if status == "installed":
+            return
+
+        # 用一段極短的靜音觸發安裝，順便把引擎第一次啟動的成本付掉
+        log.info("WHISPER: 蘋果辨識模型尚未安裝、暖機階段開始下載…")
+        import numpy as np
+        silent = np.zeros(int(16_000 * 0.5), dtype="float32")
+        tmp_dir = tempfile.mkdtemp(prefix="whisperpro_apple_warm_")
+        wav_path = os.path.join(tmp_dir, "warm.wav")
+        try:
+            import soundfile as sf
+            sf.write(wav_path, silent, 16_000, subtype="FLOAT", format="WAV")
+            result = self._run_apple_helper(
+                ["--audio", wav_path, "--locale", locale,
+                 "--engine", engine, "--allow-download"],
+                timeout=600.0,   # 下載可能很久；這條路不在使用者的等待路徑上
+            )
+            if result.get("ok"):
+                log.info("WHISPER: 蘋果辨識模型就緒")
+            else:
+                log_error("apple_warmup_install_failed")
+        except Exception:
+            log_error("apple_warmup_failed")
+        finally:
+            try:
+                if os.path.exists(wav_path):
+                    os.remove(wav_path)
+                os.rmdir(tmp_dir)
+            except Exception:
+                pass
 
     # ── 私有方法 ──────────────────────────────────────────────────────────────
 

@@ -56,3 +56,7 @@ node_modules/
 # macOS 截圖等本機 artefact
 image/iShot_*.png
 tests/reports/
+
+# 蘋果原生辨識 helper 的編譯產物（arm64 + macOS 26 綁定，不進版控）
+# 重建：bash native/apple_stt/build.sh
+native/apple_stt/bin/

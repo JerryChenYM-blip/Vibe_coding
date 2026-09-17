@@ -48,6 +48,15 @@ MODEL_INFO: dict[str, str] = {
 #   • transcribe_fast 內部仍用 "small"（已停用、但保留 fallback 路徑）
 #     對應 _MLX_MODEL_MAP 條目仍在 transcriber.py 不動、避免 dead code regression
 
+# v2.31.0：蘋果原生語音辨識（macOS 26 SpeechAnalyzer）。
+# 寫成條件式加入而不是直接列進上面的字典，是因為這個引擎屬於作業系統——
+# Windows 版沒有對應物，讓選項出現在 Windows 的下拉選單裡，使用者會選了才發現不能用。
+# 模型不佔本 App 的 RAM（在系統的辨識服務裡），所以說明不標記憶體用量。
+if IS_MAC:
+    MODEL_INFO["apple-speech"] = (
+        "蘋果原生辨識：系統內建引擎、離線、極快（不佔本 App 記憶體）"
+    )
+
 # 語言顯示名稱 → Whisper 語言代碼（None 代表自動偵測）
 LANGUAGE_OPTIONS: dict[str, str | None] = {
     "自動偵測": None,

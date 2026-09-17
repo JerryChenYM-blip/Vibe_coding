@@ -49,7 +49,7 @@ import dictionary as _dictionary
 from history import HistoryStore
 from prompt_reloader import PromptReloader
 from recorder import AudioRecorder
-from transcriber import Transcriber, TranscriptionResult
+from transcriber import Transcriber, TranscriptionResult, is_system_message, _is_apple_model
 from icons import get_icon, get_canvas_icon
 from animation import blend, breathe, ease_in_out_cubic, Ripple
 from waveform import WaveformEngine
@@ -3435,10 +3435,10 @@ class AppWindow(ctk.CTkFrame):
         self._show_toast(f"轉錄完成 · {result.elapsed_seconds:.1f}s")
 
         text  = result.text
-        valid = bool(text) and text not in (
-            "（未偵測到語音內容）",
-            "（沒有偵測到音訊，請確認麥克風是否正常運作）",
-        )
+        # v2.31.0：改用 is_system_message() 取代原本硬編碼的兩句白名單。
+        # 原本的寫法擋不住新增的失敗訊息——漏掉一句，那句就會被當成逐字稿
+        # 自動 ⌘V 貼進使用者當下的輸入框、寫進歷史、還送去 Ollama 潤飾。
+        valid = bool(text) and not is_system_message(text)
 
         # 每次新轉錄都 +1，遲到的潤飾結果可據此丟棄。
         self._polish_generation += 1
@@ -4132,10 +4132,8 @@ class AppWindow(ctk.CTkFrame):
 
     # ── Aperture 卡片路徑（skeleton 模式限定）──────────────────────────────
 
-    _FAIL_TEXTS = (
-        "（轉錄失敗，請查看 log）",
-        "（轉錄超時，請重試）",
-    )
+    # v2.31.0：原本這裡有 _FAIL_TEXTS 硬編碼清單，已被 is_system_message() 取代
+    # （唯一的使用點改掉之後它就沒人用了，一併移除，不留孤兒常數）
 
     def _display_result_skeleton(
         self, result: TranscriptionResult, *, dur: float, lang: str, model: str,
@@ -4152,7 +4150,8 @@ class AppWindow(ctk.CTkFrame):
         timestamp_iso = now.strftime("%H:%M")
         epoch = now.timestamp()
 
-        is_fail = result.text in self._FAIL_TEXTS
+        # v2.31.0：同上，改用前綴判斷，不再依賴 _FAIL_TEXTS 清單的維護
+        is_fail = is_system_message(result.text)
 
         if self._pending_block is not None:
             block = self._pending_block
@@ -6131,7 +6130,11 @@ class AppWindow(ctk.CTkFrame):
 
         def _load():
             try:
-                self.transcriber.warmup(model)
+                # v2.31.0：把語言一起傳進去。蘋果後端的模型是「一個語言一份」，
+                # 暖機時若不知道使用者選了哪個語言，就只會裝繁中那份——
+                # 選 English 的人每次轉錄都會拿到「模型尚未安裝、請重開 App」，
+                # 重開之後裝的還是繁中，變成永遠修不好的死循環。
+                self.transcriber.warmup(model, language=self.cfg.get_whisper_language())
                 backend = self.transcriber.active_backend()
                 label   = "⚡ Metal" if backend == "mlx" else "CPU"
                 log.info(f"WARMUP: complete (model={model} backend={backend})")
@@ -6231,6 +6234,12 @@ class AppWindow(ctk.CTkFrame):
         try:
             if self._state == "idle":
                 model = self._model_var.get()
+                # v2.31.0：蘋果原生辨識直接跳過——它的模型在作業系統裡，
+                # 本 process 沒有任何 weights 需要保溫，keepalive 只會每 90 秒
+                # 白開一支子程序；模型還沒裝好時更糟，會疊出多支 600 秒的
+                # 下載程序同時對外連線（使用者沒同意過的持續對外請求）。
+                if _is_apple_model(model):
+                    return
                 # 只對已載入的模型 keepalive（轉錄 lock 內、不撞用戶操作）
                 def _ping():
                     # v2.20.3 N5：量 ping 自身耗時（≈ 模型 warmup 推論時間）
