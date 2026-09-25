@@ -7711,12 +7711,22 @@ class SettingsWindow(ctk.CTkToplevel):
         self._page_header(page, "關於")
 
         from _version import __version__ as _app_ver
+        from _version import __release_date__ as _app_date
 
         def version_row(r):
+            # 版本號與更新日期上下疊、都靠右對齊。日期是 v2.31.2 使用者要求加的：
+            # 光看版本號判斷不出「這是不是最新版」，有日期一眼就知道。
             ctk.CTkLabel(
                 r, text=f"v{_app_ver}",
                 font=ctk.CTkFont(FONT_FAMILY_MONO, 13), text_color=TEXT_2,
-            ).pack(side="right")
+            ).pack(side="top", anchor="e")
+            # 日期空字串 = 發版時忘了在 _RELEASE_DATES 加一行。這裡刻意不顯示
+            # 「更新日期：未知」之類的字——那是開發端的錯，由測試擋，不該讓使用者看到。
+            if _app_date:
+                ctk.CTkLabel(
+                    r, text=f"{_app_date} 更新",
+                    font=ctk.CTkFont(FONT_FAMILY_MONO, 11), text_color=TEXT_3,
+                ).pack(side="top", anchor="e")
 
         self._row(
             page, "about", "about_version", "版本", "Whisper Pro（Mac／Windows 雙棲版）。",
