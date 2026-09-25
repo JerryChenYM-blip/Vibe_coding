@@ -414,6 +414,65 @@ def _apply_opencc(text: str, variant: str) -> str:
     return _apply_tw_vocab_fix(converted)
 
 
+# ── v2.31.1：蘋果後端的簡轉繁重整 ──────────────────────────────────────────────
+#
+# 問題：蘋果 zh-TW 引擎輸出的繁體是「自己轉的」，而且轉得很粗——一個簡體字對應
+#   好幾個繁體字時常挑錯：只有→隻有、前面→前麵、系統→係統、複雜→復雜、
+#   紫微斗數→紫微鬥數、表定→錶定。2026-09-21～24 使用者真實用了三天：
+#     蘋果          每千字 8.1 個簡轉繁錯字（3,938 字中 32 處）
+#     Qwen3 0.6B    每千字 0.0 個（2,703 字）
+#     Qwen3 1.7B    每千字 0.2 個（4,811 字）
+#   使用者感覺「蘋果不準」，主因就是這個——字其實聽對了，是寫錯了。
+#
+# 修法：先把蘋果的繁體退回簡體（t2s 是單向多對一，不會挑錯），再走 Qwen3 同一條
+#   opencc 轉換（會看上下文的詞組表）。拿那三天 116 段真實輸出影子驗證：
+#     32 個錯字 → 0 個；44 處改動中約 38 處是修正、5 處是換成台灣用語
+#     （了解→瞭解、聯係→聯絡、打開→開啟，與 Qwen3 輸出一致）、**1 處改壞**：
+#     「電話會裏」→「電話會里」（t2s 把裏退成里之後，s2twp 沒能還原成裡）。
+#   另外比過「只換字不換用語」(s2tw) 與「通用繁體」(s2t)：兩者都各剩 2 個錯字、
+#   同樣有「會里」問題，所以選跟 Qwen3 同一條。
+#
+# ⚠️ v2.31.0 曾寫「刻意不套 opencc：蘋果輸出本來就是繁體」——那個判斷是錯的，
+#    已由上面的實測推翻。**不要把這段拿掉改回直接用蘋果的繁體。**
+_opencc_t2s = None
+_opencc_t2s_tried = False
+
+
+def _get_opencc_t2s():
+    """Lazy 載 t2s 轉換器；回 None 代表載入失敗。只試一次，失敗就不再重試。"""
+    global _opencc_t2s, _opencc_t2s_tried
+    if not _opencc_t2s_tried:
+        _opencc_t2s_tried = True
+        try:
+            from opencc import OpenCC
+            _opencc_t2s = OpenCC("t2s")
+        except Exception:
+            log_error("opencc_t2s_init_failed")
+    return _opencc_t2s
+
+
+def _renormalize_apple_chinese(text: str, variant: str) -> str:
+    """蘋果中文輸出：繁→簡→（依使用者設定）繁，把簡轉繁錯字修掉。
+
+    任何一步失敗都回**蘋果的原文**，不回中間的簡體——拿到簡體比拿到有幾個錯字
+    的繁體更糟。所以這裡不直接呼叫 _apply_opencc（它失敗時回的是傳進去的簡體）。
+
+    variant == "off" 代表使用者不要任何簡繁轉換，蘋果給什麼就用什麼。
+    """
+    if not text or variant == "off" or not variant:
+        return text
+    t2s = _get_opencc_t2s()
+    s2t = _get_opencc_converter(variant)
+    if t2s is None or s2t is None:
+        return text
+    try:
+        converted = s2t.convert(t2s.convert(text))
+    except Exception:
+        log_error("apple_renormalize_failed", variant=variant)
+        return text
+    return _apply_tw_vocab_fix(converted)
+
+
 # ── 靜音偵測與幻覺防護 ────────────────────────────────────────────────────────
 
 # 最小 RMS 閾值：低於此值視為靜音，跳過推論。
@@ -2488,16 +2547,19 @@ class Transcriber:
             # 日後統計成功率與 RTF 時會把失敗算成成功。
             raise AppleSTTError(code, msg)
 
-        # 刻意不套 opencc：zh-TW 模型輸出本來就是繁體，再轉一次只會多一層
-        # 可能改動用詞的風險（s2twp 會動詞彙，不只字體）。chinese_variant
-        # 參數保留在簽名裡是為了與其他後端一致，這裡有意忽略它。
-        #
+        text = _tidy_apple_spacing((payload.get("text") or "").strip())
+        # v2.31.1：中文輸出要重整簡轉繁（蘋果自己轉的繁體錯字率是 Qwen3 的 40 倍，
+        # 實測數字與修法見 _renormalize_apple_chinese）。只對中文 locale 做——
+        # 英文等其他語言沒有簡繁問題，不需要多繞一圈。
+        if locale.lower().startswith("zh"):
+            text = _renormalize_apple_chinese(text, chinese_variant)
+
         # language 要回 Whisper 風格的語言代碼（zh / en），不是 locale（zh_TW）——
         # 結果卡片與歷史資料庫的這個欄位由四個後端共寫，格式混用會讓之後
         # 依語言篩選的查詢漏掉一半資料。
         raw_locale = payload.get("locale") or locale
         return TranscriptionResult(
-            text=_tidy_apple_spacing((payload.get("text") or "").strip()),
+            text=text,
             language=raw_locale.replace("-", "_").split("_")[0].lower(),
             duration_seconds=0.0,   # 由呼叫端 transcribe() 填入
             elapsed_seconds=0.0,

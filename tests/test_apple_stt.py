@@ -267,3 +267,109 @@ def test_轉錄結果有套用排版清理(monkeypatch):
                             "ok": True, "text": "哈嘍 ，你這個北七。", "locale": "zh_TW"})
     result = Transcriber()._transcribe_apple(_audio(), "apple-speech", None, None)
     assert result.text == "哈嘍，你這個北七。"
+
+
+# ── (g) 簡轉繁重整（v2.31.1）──────────────────────────────────────────────
+#
+# 蘋果 zh-TW 引擎自己轉的繁體錯字率是 Qwen3 的 40 倍（2026-09-21～24 真實使用：
+# 每千字 8.1 vs 0～0.2）。修法是 繁→簡→依設定繁，與 Qwen3 走同一條 opencc。
+
+try:
+    import opencc  # noqa: F401
+    _HAS_OPENCC = True
+except Exception:
+    _HAS_OPENCC = False
+
+needs_opencc = pytest.mark.skipif(not _HAS_OPENCC, reason="沒裝 opencc")
+
+
+@needs_opencc
+@pytest.mark.parametrize("蘋果寫的,應該是", [
+    # 全部取自使用者三天真實輸出裡出現過的錯字
+    ("我隻有三個",       "我只有三個"),
+    ("最多隻能喝兩杯",   "最多只能喝兩杯"),
+    ("前麵很復雜",       "前面很複雜"),
+    ("係統都安裝好了",   "系統都安裝好了"),
+    ("紫微鬥數跟八字",   "紫微斗數跟八字"),
+    ("按照錶定時間",     "按照表定時間"),
+    ("調不迴來",         "調不回來"),
+    ("重市場關註",       "重市場關注"),
+])
+def test_簡轉繁錯字會被修掉(蘋果寫的, 應該是):
+    assert tr._renormalize_apple_chinese(蘋果寫的, "traditional_tw") == 應該是
+
+
+@needs_opencc
+@pytest.mark.parametrize("正確的", [
+    # 量詞「隻」是對的，不能被改成「只」——transcriber.py 的 _FANJIAN_FIXES 有一條
+    # 「禁單字」鐵律，就是因為使用者說過「一隻美股」、單字替換把它改壞過
+    "一隻美股",
+    "養了一隻貓",
+    "兩隻手",
+    # 「優化」不能被轉成「最佳化」（v2.21.0 使用者明確要求保留）
+    "我們要優化這個流程",
+    # 本來就對的句子、英數混排，一個字都不能動
+    "今天天氣很好。",
+    "還不如 Qwen3 的那個",
+])
+def test_本來就對的不能被改壞(正確的):
+    assert tr._renormalize_apple_chinese(正確的, "traditional_tw") == 正確的
+
+
+def test_使用者關掉簡繁轉換就原樣不動():
+    assert tr._renormalize_apple_chinese("我隻有三個", "off") == "我隻有三個"
+
+
+def test_轉換器載不起來時回蘋果原文_不是回簡體(monkeypatch):
+    """拿到簡體比拿到有幾個錯字的繁體更糟——任何失敗都要退回原文。"""
+    monkeypatch.setattr(tr, "_get_opencc_t2s", lambda: None)
+    assert tr._renormalize_apple_chinese("我隻有三個", "traditional_tw") == "我隻有三個"
+
+
+@needs_opencc
+def test_轉到一半炸掉也回蘋果原文(monkeypatch):
+    class Boom:
+        def convert(self, text):
+            raise RuntimeError("opencc 炸了")
+    monkeypatch.setattr(tr, "_get_opencc_converter", lambda variant: Boom())
+    # t2s 那一步會成功、s2t 那一步炸——此時手上是簡體，絕對不能回傳它
+    assert tr._renormalize_apple_chinese("我隻有三個", "traditional_tw") == "我隻有三個"
+
+
+@needs_opencc
+def test_實際轉錄路徑有套用重整(monkeypatch):
+    """不是只有函式對——走 _transcribe_apple 出來的也要是修好的。"""
+    monkeypatch.setattr(Transcriber, "_run_apple_helper",
+                        lambda self, args, timeout: {
+                            "ok": True, "text": "我隻有三個係統 ，前麵很復雜。", "locale": "zh_TW"})
+    result = Transcriber()._transcribe_apple(_audio(), "apple-speech", None, None,
+                                             chinese_variant="traditional_tw")
+    # 空格清理與簡轉繁重整兩件事都要發生
+    assert result.text == "我只有三個系統，前面很複雜。"
+
+
+@needs_opencc
+def test_英文語言不做簡繁轉換(monkeypatch):
+    called = {"n": 0}
+    real = tr._renormalize_apple_chinese
+
+    def spy(text, variant):
+        called["n"] += 1
+        return real(text, variant)
+
+    monkeypatch.setattr(tr, "_renormalize_apple_chinese", spy)
+    monkeypatch.setattr(Transcriber, "_run_apple_helper",
+                        lambda self, args, timeout: {"ok": True, "text": "hello", "locale": "en_US"})
+    Transcriber()._transcribe_apple(_audio(), "apple-speech", "en", None,
+                                    chinese_variant="traditional_tw")
+    assert called["n"] == 0
+
+
+@needs_opencc
+@pytest.mark.xfail(strict=True, reason=(
+    "已知限制：t2s 把「裏」退成「里」後，s2twp 在「電話會里」這個上下文沒能還原成「裡」。"
+    "三天真實資料 44 處改動中唯一改壞的一處。strict=True：哪天 opencc 修好了這個測試會"
+    "變成 XPASS 而失敗，提醒下一個人把這條 xfail 拿掉、並更新交接紀錄。"
+))
+def test_已知限制_電話會裏會被改成里():
+    assert tr._renormalize_apple_chinese("電話會裏的情形", "traditional_tw") == "電話會裡的情形"
