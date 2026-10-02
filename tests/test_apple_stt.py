@@ -373,3 +373,160 @@ def test_英文語言不做簡繁轉換(monkeypatch):
 ))
 def test_已知限制_電話會裏會被改成里():
     assert tr._renormalize_apple_chinese("電話會裏的情形", "traditional_tw") == "電話會裡的情形"
+
+
+# ── (h) 連續唸數字要用逗號隔開（v2.31.3）─────────────────────────────────
+#
+# 2026-10-02 使用者回報。三種狀況：①蘋果用空格隔開 ②我們接段落時黏住
+# ③蘋果在同一段裡就黏住（要照停頓切開重問）。合成語音實驗見交接紀錄。
+
+@pytest.mark.parametrize("段落,期望", [
+    # 狀況 ②：蘋果在長停頓處切成四段，v2.31.0 直接相接會變「56160 390450」
+    (["561", "60", " 390", "450"],  "561，60 390，450"),   # 空格那處留給下一步換成逗號
+    (["Opus", "5.5"],               "Opus 5.5"),           # 英數接英數補空格，不能黏成 Opus5.5
+    (["我們", "今天"],               "我們今天"),           # 中文直接相接（字典比對與去重要求）
+    (["價格", "100"],               "價格100"),            # 中文接數字：維持原行為
+    (["100", "元"],                 "100元"),
+    (["", "83", ""],                "83"),                 # 空段落略過
+    ([],                            ""),
+])
+def test_段落接縫規則(段落, 期望):
+    assert tr._join_apple_parts(段落) == 期望
+
+
+@pytest.mark.parametrize("原文,期望", [
+    ("83 122 26 55",        "83，122，26，55"),         # 狀況 ①
+    ("561，60 390，450",     "561，60，390，450"),
+    ("我的電話是 091-234-5678", "我的電話是 091-234-5678"),   # 蘋果的電話格式不能動
+    ("2026 年 10 月",        "2026 年 10 月"),             # 數字接中文的空格不動
+])
+def test_數字之間的空格換成逗號(原文, 期望):
+    assert tr._SPACE_BETWEEN_NUMBERS.sub(tr._DIGIT_LIST_SEP, 原文) == 期望
+
+
+def test_已知取捨_英數詞後面接數字也會被換成逗號():
+    """「Qwen3 0.6B」的 3 和 0 之間是空格 → 會變「Qwen3，0.6B」。
+
+    刻意接受：影子驗證全部歷史 4,822 段，「數字 空格 數字」只出現 8 處、全是唸數字清單；
+    這種英數詞後接數字的寫法在使用者的資料裡一次都沒出現過。寫成測試是為了讓這個取捨
+    被看見——哪天真的出現了，回來改規則時這條測試會提醒你當初為什麼這樣寫。
+    """
+    assert tr._SPACE_BETWEEN_NUMBERS.sub(tr._DIGIT_LIST_SEP, "Qwen3 0.6B") == "Qwen3，0.6B"
+
+
+@pytest.mark.parametrize("text,有黏住", [
+    ("56160390450", True),
+    ("83，12226，55", True),       # 5 位
+    ("2026年", False),            # 4 位：多半是年份，不懷疑
+    ("091-234-5678", False),
+    ("沒有數字", False),
+])
+def test_黏住的判斷門檻(text, 有黏住):
+    assert tr._has_glued_digits(text) is 有黏住
+
+
+# ── 安全鎖：只補逗號、不改數字 ──
+
+def test_重問結果對得上就補逗號():
+    out, n = tr._insert_digit_separators("56160390450", ["561", "60", "390", "450"])
+    assert (out, n) == ("561，60，390，450", 1)
+
+
+def test_只拆黏住的那串_其他照原樣():
+    out, n = tr._insert_digit_separators("83，12226，55。", ["83", "122", "26", "55"])
+    assert (out, n) == ("83，122，26，55。", 1)
+
+
+def test_數字對不上就整串不動():
+    """重問聽到的數字跟第一次不一樣 = 沒把握，寧可不動。這是這組修正的核心保證。"""
+    out, n = tr._insert_digit_separators("56160390450", ["561", "60", "391", "450"])
+    assert (out, n) == ("56160390450", 0)
+
+
+def test_前面對上後面對不上_只修前面():
+    out, n = tr._insert_digit_separators("12226 然後 56160", ["122", "26", "999"])
+    assert out == "122，26 然後 56160"
+    assert n == 1
+
+
+def test_短數字就算被切開也不拆():
+    """年份「2026」唸的時候頓了一下，重問變成「20」「26」——那不是兩個數字，不能拆。"""
+    out, n = tr._insert_digit_separators("2026年", ["20", "26"])
+    assert (out, n) == ("2026年", 0)
+
+
+def test_一口氣唸的長數字切不開就不動():
+    out, n = tr._insert_digit_separators("預算是 12000300元", ["12000300"])
+    assert (out, n) == ("預算是 12000300元", 0)
+
+
+def test_重問多聽到一個數字_不動():
+    out, n = tr._insert_digit_separators("56160", ["5", "561", "60"])
+    assert (out, n) == ("56160", 0)
+
+
+# ── 切開重問的流程 ──
+
+def _fake_batch(texts):
+    return {"ok": True, "batch": [{"ok": True, "parts": [t]} for t in texts]}
+
+
+def test_切開重問_成功(monkeypatch):
+    monkeypatch.setattr(tr, "_silero_speech_segments", lambda a: [(0, 100), (200, 300), (400, 500), (600, 700)])
+    seen = {}
+
+    def fake_helper(self, args, timeout):
+        seen["files"] = [args[i + 1] for i, a in enumerate(args) if a == "--audio"]
+        seen["exist"] = all(os.path.exists(f) for f in seen["files"])
+        return _fake_batch(["561", "60", "390", "450"])
+
+    monkeypatch.setattr(Transcriber, "_run_apple_helper", fake_helper)
+    out = Transcriber()._repair_glued_digits(_audio(1.0), "56160390450", "speech", "zh-TW")
+    assert out == "561，60，390，450"
+    assert len(seen["files"]) == 4 and seen["exist"], "四小段都要真的寫成檔案送進去"
+    assert not any(os.path.exists(f) for f in seen["files"]), "切出來的小段也是使用者的語音，要刪掉"
+
+
+@pytest.mark.parametrize("情境,segments,helper回傳", [
+    ("人聲偵測不可用",   None,                      None),
+    ("只切出一段",       [(0, 100)],                None),
+    ("helper 出錯",      [(0, 100), (200, 300)],    {"ok": False, "error": "helper_timeout"}),
+    ("其中一段失敗",     [(0, 100), (200, 300)],    {"ok": True, "batch": [{"ok": True, "parts": ["561"]}, {"ok": False}]}),
+    ("回來的筆數不對",   [(0, 100), (200, 300)],    _fake_batch(["561"])),
+])
+def test_切開重問_任何一步失敗都回原文(monkeypatch, 情境, segments, helper回傳):
+    monkeypatch.setattr(tr, "_silero_speech_segments", lambda a: segments)
+    monkeypatch.setattr(Transcriber, "_run_apple_helper", lambda self, args, timeout: helper回傳)
+    assert Transcriber()._repair_glued_digits(_audio(1.0), "56160", "speech", "zh-TW") == "56160"
+
+
+def test_超長錄音不做切開重問(monkeypatch):
+    called = {"vad": 0}
+    monkeypatch.setattr(tr, "_silero_speech_segments",
+                        lambda a: called.__setitem__("vad", called["vad"] + 1) or [(0, 1), (2, 3)])
+    long_audio = _audio(tr._DIGIT_REPAIR_MAX_AUDIO_S + 1)
+    assert Transcriber()._repair_glued_digits(long_audio, "56160", "speech", "zh-TW") == "56160"
+    assert called["vad"] == 0, "超過上限連人聲偵測都不該跑"
+
+
+def test_實際轉錄路徑_三種狀況一起修(monkeypatch):
+    """走 _transcribe_apple：段落接縫、空格換逗號、黏住重問，三件事都要發生。"""
+    monkeypatch.setattr(tr, "_silero_speech_segments", lambda a: [(0, 1), (2, 3), (4, 5)])
+    calls = {"n": 0}
+
+    def fake_helper(self, args, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:   # 第一次：整段辨識。四段、其中一段黏住
+            return {"ok": True, "text": "x", "locale": "zh_TW", "parts": ["83 12226", "55"]}
+        return _fake_batch(["83", "122", "26 55"])   # 第二次：切開重問
+
+    monkeypatch.setattr(Transcriber, "_run_apple_helper", fake_helper)
+    r = Transcriber()._transcribe_apple(_audio(), "apple-speech", None, None, chinese_variant="off")
+    assert r.text == "83，122，26，55"
+
+
+def test_舊版_helper_沒有_parts_就用它的_text(monkeypatch):
+    monkeypatch.setattr(Transcriber, "_run_apple_helper",
+                        lambda self, args, timeout: {"ok": True, "text": "83 122", "locale": "zh_TW"})
+    r = Transcriber()._transcribe_apple(_audio(), "apple-speech", None, None)
+    assert r.text == "83，122"

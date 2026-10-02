@@ -299,6 +299,100 @@ def _tidy_apple_spacing(text: str) -> str:
     return _SPACE_BEFORE_FULLWIDTH_PUNCT.sub("", text)
 
 
+# ── v2.31.3：連續唸數字時要用逗號隔開 ─────────────────────────────────────────
+#
+# 使用者回報（2026-10-02）：連續唸數字時，蘋果輸出不會用逗號隔開。實測有三種狀況：
+#   ① 蘋果自己用空格隔開：「83 122 26 55」
+#   ② 我們接段落時黏住：蘋果在長停頓處切成「561｜60｜390｜450」，v2.31.0 的
+#      helper 直接相接 →「56160 390450」（這是我們自己的錯）
+#   ③ 蘋果在同一段裡就黏住：停頓 0.3～1.5 秒時整串寫成「56160390450」，
+#      而且它回報的時間資訊也把整串當成一塊（0.00–8.16 秒）——內部根本沒記停頓。
+#   對照組 Qwen3 會用「，」分開（但寫成國字「八十三，一百二十二」）。
+#
+# 分隔符用全形「，」：使用者原話是「用逗號隔開」；半形「,」會跟千分位（1,200）混淆。
+_DIGIT_LIST_SEP = "，"
+_ASCII_DIGITS = "0123456789"
+
+
+def _is_ascii_alnum(ch: str) -> bool:
+    return ch.isascii() and ch.isalnum()
+
+
+def _join_apple_parts(parts: list) -> str:
+    """把蘋果切好的段落接回去（修狀況 ②）。
+
+    接縫兩側都是數字 → 補「，」；都是英數 → 補空格（「Opus」｜「5.5」不能黏成 Opus5.5）；
+    其他（含中文）→ 直接相接，中文之間插空白會破壞後面的字典比對與 n-gram 去重。
+    接縫任一側已經有空白，代表蘋果自己隔開了，不再多補。
+    """
+    out = ""
+    for part in parts:
+        if not part:
+            continue
+        if out and not out[-1].isspace() and not part[0].isspace():
+            a, b = out[-1], part[0]
+            if a in _ASCII_DIGITS and b in _ASCII_DIGITS:
+                out += _DIGIT_LIST_SEP
+            elif _is_ascii_alnum(a) and _is_ascii_alnum(b):
+                out += " "
+        out += part
+    return out
+
+
+# 狀況 ①：數字之間的空格換成逗號。影子驗證：全部歷史 4,822 段有效輸出中
+# 「數字 空格 數字」只出現 8 處，全是使用者 2026-10-02 唸數字清單的測試，0 誤傷。
+# 「091-234-5678」（蘋果對電話號碼的格式）、「0.6B」「2026 年」都不受影響。
+_SPACE_BETWEEN_NUMBERS = re.compile(r"(?<=[0-9])[ \t]+(?=[0-9])")
+
+# 狀況 ③：一串數字有幾位以上才懷疑是黏住的。實測黏住的例子最短 5 位（12226）；
+# 4 位以下多半是年份（2026），不去動。門檻只決定「要不要試著切開重問」，
+# 真正插不插逗號由 _insert_digit_separators 的逐字比對決定，所以門檻寬一點不會改錯字，
+# 只會讓少數本來就是長數字的句子多花一次重問的時間（約 0.4 秒）。
+_GLUED_DIGITS_MIN_LEN = 5
+# 超過這個長度就不做：切開重問的時間跟錄音長度成正比。串流模式下每段約 8～12 秒，
+# 正常不會碰到這個上限；碰到的是不走串流的超長錄音，寧可不修也不要讓使用者多等。
+_DIGIT_REPAIR_MAX_AUDIO_S = 60.0
+_DIGIT_RUN = re.compile(r"[0-9]+")
+
+
+def _has_glued_digits(text: str) -> bool:
+    return any(len(m.group()) >= _GLUED_DIGITS_MIN_LEN for m in _DIGIT_RUN.finditer(text))
+
+
+def _insert_digit_separators(text: str, groups: list) -> tuple:
+    """依照「切開重問」得到的數字分組，在原文黏住的數字中間補逗號。
+
+    安全鎖：**只補逗號、不改數字**。原文每一串數字都必須剛好等於重問結果裡
+    連續幾組數字接起來，才准拆；任何一處對不上，從那裡之後全部保留原樣
+    （重問聽到的跟第一次不一樣，代表沒把握，寧可不動）。
+
+    只拆 _GLUED_DIGITS_MIN_LEN 位以上的串：短的（例如年份 2026）就算重問時被切成
+    「20」「26」也照原樣保留——那多半是唸的時候頓了一下，不是兩個數字。
+
+    回傳 (新文字, 拆開了幾串)。
+    """
+    out, last, gi, split_count = [], 0, 0, 0
+    for m in _DIGIT_RUN.finditer(text):
+        run = m.group()
+        acc, used = "", []
+        while gi + len(used) < len(groups) and len(acc) < len(run):
+            g = groups[gi + len(used)]
+            acc += g
+            used.append(g)
+        if acc != run:
+            break   # 對不上：後面全部不動
+        gi += len(used)
+        out.append(text[last:m.start()])
+        if len(used) > 1 and len(run) >= _GLUED_DIGITS_MIN_LEN:
+            out.append(_DIGIT_LIST_SEP.join(used))
+            split_count += 1
+        else:
+            out.append(run)
+        last = m.end()
+    out.append(text[last:])
+    return "".join(out), split_count
+
+
 def _is_apple_model(model_size: str) -> bool:
     """判斷 model_size 是不是蘋果原生辨識（走 Swift helper、不載任何本地權重）。"""
     return model_size.lower() in _APPLE_STT_MODELS
@@ -588,6 +682,49 @@ def _silero_no_voice(audio, threshold: float = 0.35) -> bool:
     except Exception as e:
         log_error("silero_vad_inference_failed", error=str(e))
         return False   # 故障時不擋
+
+
+def _silero_speech_segments(audio, threshold: float = 0.35) -> Optional[list]:
+    """v2.31.3：找出音檔裡每一段人聲的起訖（樣本編號），給「照停頓切開數字」用。
+
+    參數刻意跟 _silero_no_voice() 的靜音閘不同，數字來自 2026-10-02 參數掃描
+    （合成語音、乾淨與加雜音 RMS 0.005 兩種，每組都同時跑三個不該被切的對照：
+    電話號碼、「一千二百萬零三百」、逐字唸的帳號「一二三四五六七八九」）：
+      • min_silence_duration_ms=120、speech_pad_ms=40：唸數字的停頓常只有 0.25 秒左右
+        （say 指令的 300ms 停頓實測空檔只有 0.24～0.27 秒）。原本試的 200／80 在 0.3 秒
+        停頓時只分出一半、加雜音就完全分不開；120／40 在 0.3／0.5 秒、有無雜音全對，
+        三個對照都沒被切。另試過 100／門檻 0.5／30：乾淨音檔反而分不開，不採用。
+      • min_speech_duration_ms=100（閘是 200）：單一個數字「二」講得快只有 0.15 秒左右，
+        用 200 會被當成雜音丟掉，切出來就少一個數字。
+    切得太細不會改錯字：_insert_digit_separators 的安全鎖要求數字逐字相同才補逗號，
+    切錯（例如把「一千二百萬」切成兩半）數字會對不上、那串就保持原樣。代價只是多花時間。
+    回傳 None：VAD 不可用或出錯（呼叫端就不修，保留原文）。
+    """
+    import numpy as np
+    model = _ensure_silero_vad()
+    if model is None:
+        return None
+    try:
+        from silero_vad import get_speech_timestamps
+        import torch
+        audio_tensor = torch.from_numpy(audio.astype(np.float32))
+        # 同一把 _silero_vad_lock：共用模型同時被兩個執行緒呼叫會讓整個行程當掉
+        # （理由見 _silero_no_voice()）。
+        with _silero_vad_lock:
+            segments = get_speech_timestamps(
+                audio_tensor,
+                model,
+                threshold=threshold,
+                sampling_rate=16_000,
+                min_speech_duration_ms=100,
+                min_silence_duration_ms=120,
+                speech_pad_ms=40,
+                return_seconds=False,
+            )
+        return [(int(s["start"]), int(s["end"])) for s in segments]
+    except Exception as e:
+        log_error("silero_vad_segments_failed", error=str(e))
+        return None
 
 
 def _silero_speech_stats(audio, threshold: float = 0.35) -> Optional[dict]:
@@ -2547,7 +2684,14 @@ class Transcriber:
             # 日後統計成功率與 RTF 時會把失敗算成成功。
             raise AppleSTTError(code, msg)
 
-        text = _tidy_apple_spacing((payload.get("text") or "").strip())
+        # v2.31.3：用 helper 交出來的原始段落重新接（數字接數字補逗號）。
+        # 舊版 helper 沒有 parts 欄位，就退回用它自己直接相接的 text。
+        parts = payload.get("parts")
+        text = _join_apple_parts(parts) if isinstance(parts, list) else (payload.get("text") or "")
+        text = _SPACE_BETWEEN_NUMBERS.sub(_DIGIT_LIST_SEP, text.strip())
+        if _has_glued_digits(text):
+            text = self._repair_glued_digits(audio, text, engine, locale)
+        text = _tidy_apple_spacing(text)
         # v2.31.1：中文輸出要重整簡轉繁（蘋果自己轉的繁體錯字率是 Qwen3 的 40 倍，
         # 實測數字與修法見 _renormalize_apple_chinese）。只對中文 locale 做——
         # 英文等其他語言沒有簡繁問題，不需要多繞一圈。
@@ -2565,6 +2709,76 @@ class Transcriber:
             elapsed_seconds=0.0,
             segments=[],
         )
+
+    def _repair_glued_digits(self, audio, text: str, engine: str, locale: str) -> str:
+        """一長串數字被蘋果黏在一起時，照停頓切開、分段重問，補回逗號（修狀況 ③）。
+
+        為什麼要繞這一圈：蘋果把「561、60、390、450」（中間停 1.5 秒）寫成
+        「56160390450」，它回報的時間資訊也把整串當成同一塊，文字層面已經分不回來。
+        但把錄音照停頓切開、一段一段問，它每段都寫對（2026-10-02 合成語音三組全對）。
+
+        只拿重問結果來「決定逗號插哪裡」，原文的字一律保留——不拿重問的整句取代原文：
+        切開之後每段的上下文變少，非數字的部分可能反而聽得比較差。
+
+        任何一步失敗（VAD 不可用、只切出一段、helper 出錯、數字對不上）都回原文。
+        """
+        import numpy as np
+        import soundfile as sf
+
+        if len(audio) / 16_000 > _DIGIT_REPAIR_MAX_AUDIO_S:
+            log.info("WHISPER: apple digit repair skipped (audio too long)")
+            return text
+        segments = _silero_speech_segments(audio)
+        if not segments or len(segments) < 2:
+            return text   # 沒有停頓可切，蘋果的寫法就是它聽到的
+
+        t0 = time.perf_counter()
+        tmp_dir = tempfile.mkdtemp(prefix="whisperpro_apple_digits_")
+        paths = []
+        try:
+            for i, (start, end) in enumerate(segments):
+                path = os.path.join(tmp_dir, f"seg{i:03d}.wav")
+                sf.write(path, np.asarray(audio[start:end], dtype="float32"), 16_000,
+                         subtype="FLOAT", format="WAV")
+                paths.append(path)
+            args = []
+            for path in paths:
+                args += ["--audio", path]
+            args += ["--locale", locale, "--engine", engine]
+            payload = self._run_apple_helper(args, timeout=max(20.0, 3.0 * len(paths)))
+        finally:
+            # 切出來的小段也是使用者的真實語音，一律清掉
+            for path in paths:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+            try:
+                os.rmdir(tmp_dir)
+            except Exception:
+                pass
+
+        batch = payload.get("batch")
+        if not payload.get("ok") or not isinstance(batch, list) or len(batch) != len(paths):
+            log.info(f"WHISPER: apple digit repair skipped (helper: {payload.get('error')})")
+            return text
+        if not all(item.get("ok") for item in batch):
+            log.info("WHISPER: apple digit repair skipped (a segment failed)")
+            return text
+
+        pieces = []
+        for item in batch:
+            p = item.get("parts")
+            pieces.append(_join_apple_parts(p) if isinstance(p, list) else (item.get("text") or ""))
+        rebuilt = _SPACE_BETWEEN_NUMBERS.sub(_DIGIT_LIST_SEP, _join_apple_parts(pieces))
+        groups = _DIGIT_RUN.findall(rebuilt)
+        repaired, split_count = _insert_digit_separators(text, groups)
+        # 只記數量、不記內容：數字可能是帳號、電話、金額
+        log.info(
+            f"WHISPER: apple digit repair segments={len(paths)} runs_split={split_count} "
+            f"ms={(time.perf_counter() - t0) * 1000:.0f}"
+        )
+        return repaired
 
     def _warmup_apple(self, model_size: str, language: Optional[str] = None) -> None:
         """探測引擎狀態；模型沒裝就趁現在裝。

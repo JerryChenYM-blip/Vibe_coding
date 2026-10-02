@@ -39,6 +39,17 @@ struct Payload: Encodable {
     var contextual_terms: Int?
     var error: String?
     var detail: String?
+    // 蘋果切好的原始段落（未接合）。Python 端用它重新接：段落接縫的規則
+    // （例如數字接數字要補逗號）寫在 Python 才測得到，見 transcriber._join_apple_parts。
+    var parts: [String]? = nil
+}
+
+/// 一次處理多個音檔時的輸出（--audio 給兩次以上）。
+/// 用途：Python 把一段黏住的數字照停頓切成好幾小段後，一次送進來；
+/// 不必每一小段都重新啟動一次程式（每次啟動約 0.3 秒）。
+struct BatchPayload: Encodable {
+    var ok: Bool
+    var batch: [Payload]
 }
 
 /// --probe 的輸出。用途是「還沒錄音之前就先知道這台機器能不能跑」，
@@ -87,7 +98,7 @@ private func bail(_ code: String, _ detail: String? = nil) -> Never {
 
 struct Args {
     var probe = false
-    var audioPath: String?
+    var audioPaths: [String] = []
     var localeID = "zh-TW"
     var termsFile: String?
     var engine = "speech"          // speech | dictation
@@ -102,13 +113,13 @@ func parseArgs() -> Args {
         switch flag {
         case "--probe":          args.probe = true
         case "--allow-download": args.allowDownload = true
-        case "--audio":          args.audioPath = it.next()
+        case "--audio":          if let p = it.next() { args.audioPaths.append(p) }
         case "--locale":         args.localeID = it.next() ?? args.localeID
         case "--terms-file":     args.termsFile = it.next()
         case "--engine":         args.engine = it.next() ?? args.engine
         case "--max-terms":      args.maxTerms = Int(it.next() ?? "") ?? args.maxTerms
         case "--help", "-h":
-            note("usage: whisperpro-apple-stt --audio <file.wav> [--locale zh-TW] "
+            note("usage: whisperpro-apple-stt --audio <file.wav> [--audio <more.wav> …] [--locale zh-TW] "
                  + "[--engine speech|dictation] [--terms-file terms.txt] [--allow-download]")
             note("       whisperpro-apple-stt --probe [--locale zh-TW]")
             exit(0)
@@ -187,25 +198,46 @@ struct AppleSTT {
             exit(0)
         }
 
-        guard let audioPath = args.audioPath else { bail("missing_audio") }
-        let url = URL(fileURLWithPath: audioPath)
-        guard FileManager.default.fileExists(atPath: audioPath) else {
-            bail("audio_not_found", audioPath)
+        guard !args.audioPaths.isEmpty else { bail("missing_audio") }
+        for path in args.audioPaths where !FileManager.default.fileExists(atPath: path) {
+            bail("audio_not_found", path)
         }
 
         let terms = loadTerms(args.termsFile, limit: args.maxTerms)
 
-        do {
-            let payload = try await transcribe(url: url,
-                                               locale: locale,
-                                               engine: args.engine,
-                                               terms: terms,
-                                               allowDownload: args.allowDownload)
-            emit(payload)
-            exit(payload.ok ? 0 : 2)
-        } catch {
-            bail("transcribe_failed", String(describing: error))
+        if args.audioPaths.count == 1 {
+            do {
+                let payload = try await transcribe(url: URL(fileURLWithPath: args.audioPaths[0]),
+                                                   locale: locale,
+                                                   engine: args.engine,
+                                                   terms: terms,
+                                                   allowDownload: args.allowDownload)
+                emit(payload)
+                exit(payload.ok ? 0 : 2)
+            } catch {
+                bail("transcribe_failed", String(describing: error))
+            }
         }
+
+        // 多個檔：逐一處理。單一檔失敗只記在它自己那一筆、不中斷整批——
+        // 呼叫端會檢查每一筆的 ok，任何一筆失敗就整批不採用。
+        var results: [Payload] = []
+        for path in args.audioPaths {
+            do {
+                results.append(try await transcribe(url: URL(fileURLWithPath: path),
+                                                    locale: locale,
+                                                    engine: args.engine,
+                                                    terms: terms,
+                                                    allowDownload: args.allowDownload))
+            } catch {
+                results.append(Payload(ok: false, engine: args.engine, locale: locale.identifier,
+                                       text: nil, segments: nil, audio_seconds: nil, elapsed_ms: nil,
+                                       asset_status: nil, downloaded: nil, contextual_terms: terms.count,
+                                       error: "transcribe_failed", detail: String(describing: error)))
+            }
+        }
+        emit(BatchPayload(ok: true, batch: results))
+        exit(0)
     }
 
     // MARK: 探測
@@ -371,12 +403,16 @@ struct AppleSTT {
     static func finish(engine: String, locale: String, parts: [String],
                        audioSeconds: Double, started: Date,
                        status: String, downloaded: Bool, terms: Int) -> Payload {
-        // 直接相接、不補空白：中文之間插空白會破壞後面的字典比對與 n-gram 去重。
+        // text 是「直接相接」的原始串接，只給人肉除錯看；正式文字由 Python 端
+        // 用下面的 parts 重新接（transcriber._join_apple_parts）。
+        // 為什麼不在這裡接好：v2.31.0 這裡寫的就是「直接相接」，結果停頓夠久時
+        // 蘋果把「561｜60｜390｜450」切成四段，接起來變成「56160 390450」
+        // （2026-10-02 實測）。接縫規則要能寫測試，所以搬到 Python。
         let text = parts.joined()
         return Payload(ok: true, engine: engine, locale: locale, text: text,
                        segments: parts.count, audio_seconds: audioSeconds,
                        elapsed_ms: Date().timeIntervalSince(started) * 1000,
                        asset_status: status, downloaded: downloaded,
-                       contextual_terms: terms, error: nil, detail: nil)
+                       contextual_terms: terms, error: nil, detail: nil, parts: parts)
     }
 }
