@@ -1247,6 +1247,10 @@ def test_recorder_falls_back_to_default_device(monkeypatch):
         return _FakeStream()                          # 系統預設成功
 
     monkeypatch.setattr(_rec.sd, "InputStream", _fake_input_stream)
+    # v2.31.4：補救流程會重整 PortAudio 清單、查內建麥克風——隔開真的系統音訊，
+    #   讓這個測試只驗它原本要驗的「最後退到系統預設」這條路
+    monkeypatch.setattr(_rec.AudioRecorder, "refresh_portaudio", lambda self: [])
+    monkeypatch.setattr(_rec, "builtin_input_device_name", lambda: None)
     ok = rec.start()
     assert ok is True
     assert rec._started_with_fallback is True

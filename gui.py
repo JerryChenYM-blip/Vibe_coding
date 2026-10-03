@@ -2399,11 +2399,12 @@ class AppWindow(ctk.CTkFrame):
                     pass
             return
 
-        # v2.21.4：若 recorder 因指定裝置（AirPods）未就緒而退回系統預設、提示使用者
-        #   為何不是用 AirPods 收音（避免困惑）。
+        # v2.21.4：若 recorder 因原本的麥克風打不開而改用別支、提示使用者為何收音
+        #   裝置變了（避免困惑）。v2.31.4：改用的可能是內建或系統預設，照實講。
         if getattr(self.recorder, "_started_with_fallback", False):
             try:
-                self._show_toast("指定麥克風未就緒，已改用系統預設裝置錄音")
+                label = getattr(self.recorder, "_fallback_label", "") or "系統預設麥克風"
+                self._show_toast(f"原本的麥克風打不開，已改用{label}錄音")
             except Exception:
                 pass
 

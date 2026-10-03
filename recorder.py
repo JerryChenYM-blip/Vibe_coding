@@ -88,6 +88,84 @@ DTYPE       = "float32"  # 振幅範圍 [-1.0, 1.0]
 BLOCK_MS    = 100      # sounddevice callback 每次呼叫的時間塊大小（毫秒）
 
 
+# 第一次開麥克風花超過這個秒數才失敗，就判定是「硬體本身起不來」而不是「清單過期」。
+# 2026-10-03 EarPods 實測：coreaudiod 回「Failed calling start_io on remote driver」，
+# 每次都要等 5～8.5 秒才失敗；同一支再試一次只會讓使用者再白等一輪。
+# 反過來，清單過期（拔掉耳機後問預設麥克風拿到 -1）是 4 毫秒內就失敗。
+_SLOW_OPEN_FAIL_S = 1.0
+
+
+def builtin_input_device_name() -> Optional[str]:
+    """向 macOS 查「內建、而且能收音」的麥克風叫什麼名字；查不到回 None。
+
+    為什麼不用名字比對（例如找含「MacBook」的裝置）：名字會隨系統語言變
+    （「MacBook Pro的麥克風」／「MacBook Pro Microphone」），而且這台機器上就有
+    一個叫「MacBook Pro的揚聲器」、卻帶 1 個輸入聲道的虛擬裝置——光看名字會認錯。
+    改問 CoreAudio 每個裝置的「連接方式」，只認 built-in。
+
+    沿用 start_device_monitor 已經在用的 ctypes 直呼 CoreAudio 寫法（專案沒裝
+    pyobjc 的 CoreAudio 綁定）。任何一步出錯都回 None，呼叫端就跳過這個退路。
+    """
+    if not IS_MAC:
+        return None
+    try:
+        import ctypes.util
+
+        ca = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
+        cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+        cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+        cf.CFStringGetCString.restype = ctypes.c_bool
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+        class _Addr(ctypes.Structure):
+            _fields_ = [("mSelector", ctypes.c_uint32),
+                        ("mScope", ctypes.c_uint32),
+                        ("mElement", ctypes.c_uint32)]
+
+        def _cc(code: bytes) -> int:      # CoreAudio 四字碼 → uint32
+            return int.from_bytes(code, "big")
+
+        glob, inpt = _cc(b"glob"), _cc(b"inpt")
+        system_object = ctypes.c_uint32(1)
+
+        # 所有音訊裝置的 ID
+        addr = _Addr(_cc(b"dev#"), glob, 0)
+        size = ctypes.c_uint32(0)
+        if ca.AudioObjectGetPropertyDataSize(system_object, ctypes.byref(addr), 0, None, ctypes.byref(size)) != 0:
+            return None
+        ids = (ctypes.c_uint32 * (size.value // 4))()
+        if ca.AudioObjectGetPropertyData(system_object, ctypes.byref(addr), 0, None, ctypes.byref(size), ids) != 0:
+            return None
+
+        for dev in ids:
+            dev_id = ctypes.c_uint32(dev)
+            # 連接方式：只要內建（'bltn'）
+            transport, sz = ctypes.c_uint32(0), ctypes.c_uint32(4)
+            addr = _Addr(_cc(b"tran"), glob, 0)
+            if ca.AudioObjectGetPropertyData(dev_id, ctypes.byref(addr), 0, None, ctypes.byref(sz), ctypes.byref(transport)) != 0:
+                continue
+            if transport.value != _cc(b"bltn"):
+                continue
+            # 要有輸入串流（內建喇叭也是 built-in，但不能收音）
+            addr, sz = _Addr(_cc(b"stm#"), inpt, 0), ctypes.c_uint32(0)
+            if ca.AudioObjectGetPropertyDataSize(dev_id, ctypes.byref(addr), 0, None, ctypes.byref(sz)) != 0 or sz.value == 0:
+                continue
+            # 名字（CFString，用完要 CFRelease）
+            ref, sz = ctypes.c_void_p(), ctypes.c_uint32(ctypes.sizeof(ctypes.c_void_p))
+            addr = _Addr(_cc(b"lnam"), glob, 0)
+            if ca.AudioObjectGetPropertyData(dev_id, ctypes.byref(addr), 0, None, ctypes.byref(sz), ctypes.byref(ref)) != 0 or not ref.value:
+                continue
+            buf = ctypes.create_string_buffer(512)
+            ok = cf.CFStringGetCString(ref, buf, 512, 0x08000100)   # kCFStringEncodingUTF8
+            cf.CFRelease(ref)
+            if ok:
+                return buf.value.decode("utf-8")
+        return None
+    except Exception:
+        log_error("builtin_mic_lookup_failed")
+        return None
+
+
 class AudioRecorder:
     """執行緒安全的麥克風錄音器，輸出 float32 numpy 陣列。
 
@@ -190,18 +268,31 @@ class AudioRecorder:
                     device=device,
                     callback=_cb,                    # PortAudio 執行緒呼叫此函式
                 )
-                stream.start()
+                try:
+                    stream.start()
+                except Exception:
+                    # v2.31.4：建好但啟動失敗的串流要關掉——失敗之後會重整 PortAudio
+                    # 清單、換一支麥克風再試，留著半開的串流會佔住裝置。
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                    raise
                 return stream
 
-            # v2.21.4：標記本次是否退回系統預設裝置（gui 端據此提示使用者）
+            # v2.21.4：標記本次是否改用別支麥克風（gui 端據此提示使用者）；
+            # v2.31.4：再記下改用的是哪一種，提示文字才講得清楚
             self._started_with_fallback = False
+            self._fallback_label = ""
+            target = self._device_index
+            t_first = time.perf_counter()
             try:
                 log.info(
                     f"RECORD: Attempting to start microphone. "
-                    f"Device={self._device_index}, Samplerate={SAMPLE_RATE}, "
+                    f"Device={target}, Samplerate={SAMPLE_RATE}, "
                     f"Blocksize={blocksize}, gen={my_gen}"
                 )
-                self._stream = _open_stream(self._device_index)
+                self._stream = _open_stream(target)
                 self._is_recording = True
                 log.info(
                     f"RECORD: Stream active. Latency={self._stream.latency:.4f}s, "
@@ -209,30 +300,74 @@ class AudioRecorder:
                 )
                 return True
             except Exception:
-                log_error("recorder_init_failed", device=self._device_index)
+                log_error("recorder_init_failed", device=target)
                 self._stream = None
                 self._is_recording = False
-                # v2.21.4：指定裝置開串流失敗（AirPods/藍牙耳機剛喚醒或沒連時、
-                #   _device_index 指到的裝置還沒 ready、sd.InputStream 直接 throw）
-                #   → 退回系統預設麥克風重試一次，避免使用者按了快捷鍵整段錄音作廢。
-                #   注意這跟 v2.21 的「錄音中拔線」熱插拔不同——這是錄音開始那一刻
-                #   裝置就還沒 ready。fallback 成功時設旗標、gui 端 toast 告知改用內建。
-                if self._device_index is not None:
-                    try:
-                        log.warning(
-                            "RECORD: 指定裝置開串流失敗、改用系統預設麥克風重試"
-                        )
-                        self._stream = _open_stream(None)
-                        self._is_recording = True
-                        self._started_with_fallback = True
-                        log.info("RECORD: Stream active（已退回系統預設麥克風）。")
-                        return True
-                    except Exception:
-                        log_error("recorder_init_failed_fallback")
-                        self._stream = None
-                        self._is_recording = False
-                        return False
-                return False
+            first_slow = (time.perf_counter() - t_first) > _SLOW_OPEN_FAIL_S
+            return self._open_with_fallbacks(_open_stream, target, first_slow)
+
+    def _index_for_name(self, name: Optional[str]) -> Optional[int]:
+        """依裝置名字找目前清單裡的編號；找不到回 None。"""
+        if not name:
+            return None
+        for dev in self.list_devices():
+            if dev["name"] == name:
+                return dev["id"]
+        return None
+
+    def _open_with_fallbacks(self, open_fn, target: Optional[int], first_slow: bool) -> bool:
+        """第一次開麥克風失敗之後的補救。呼叫端（start）已持有 self._lock。
+
+        v2.21.4 的舊邏輯只有一條退路：「指定裝置失敗 → 改系統預設」。2026-10-03／04
+        使用者遇到兩種它救不了的狀況：
+          • 系統預設本身就是壞掉的那支（EarPods 硬體起不來）——舊邏輯只在「有指定裝置」
+            時才退，預設失敗就直接放棄
+          • 拔掉耳機後 PortAudio 還記著舊清單，問預設麥克風拿到 -1（瞬間失敗）
+            ——其實重整清單再試就好，舊邏輯從來不重整
+        順序：①重整清單 ②同一支再試（只在瞬間失敗時）③內建麥克風 ④系統預設。
+        內建排在系統預設前面：實際出事時，系統預設往往就是那支壞掉的外接裝置。
+        """
+        # ① 重整清單（refresh_portaudio 自己會拿 self._lock，RLock 可重入）
+        self.refresh_portaudio()
+
+        candidates: list[tuple[Optional[int], str]] = []
+        # ② 同一支再試一次：只在第一次是瞬間失敗時（慢慢失敗 = 硬體卡住，再試只是白等）
+        if not first_slow:
+            if self._device_name is None:
+                candidates.append((target, ""))
+            else:
+                idx = self._index_for_name(self._device_name)
+                if idx is not None:
+                    self._device_index = idx   # 重整後編號會變，順手更新給下次用
+                    candidates.append((idx, ""))
+        # ③ 內建麥克風（第一次慢慢失敗的就是內建本身時，不再試它）
+        builtin = builtin_input_device_name()
+        if builtin and not (first_slow and builtin == self._device_name):
+            idx = self._index_for_name(builtin)
+            if idx is not None:
+                candidates.append((idx, "內建麥克風"))
+        # ④ 系統預設：v2.21.4 原本的退路，留作最後一道
+        if target is not None:
+            candidates.append((None, "系統預設麥克風"))
+
+        tried: set = set()
+        for dev, label in candidates:
+            if dev in tried:
+                continue
+            tried.add(dev)
+            try:
+                log.warning(f"RECORD: retry device={dev} ({label or 'same device after refresh'})")
+                self._stream = open_fn(dev)
+                self._is_recording = True
+                self._started_with_fallback = bool(label)
+                self._fallback_label = label
+                log.info(f"RECORD: Stream active（{label or '重整清單後同一支'}）")
+                return True
+            except Exception:
+                log_error("recorder_init_failed_fallback", device=dev, step=label or "retry_same")
+                self._stream = None
+                self._is_recording = False
+        return False
 
     def stop(self) -> np.ndarray:
         """停止錄音，回傳完整錄音資料。
