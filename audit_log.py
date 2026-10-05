@@ -164,6 +164,15 @@ def _append_jsonl(record: dict) -> bool:
 # Public API — transcribe / event / suspicious
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _app_version() -> str:
+    # 函式內 import：_version 沒有依賴，但放在這裡讓 audit_log 在任何載入順序下都不會因它失敗
+    try:
+        from _version import __version__  # noqa: PLC0415
+        return __version__
+    except Exception:
+        return ""
+
+
 def write_transcribe(entry: dict) -> None:
     """Append 一行 transcribe 紀錄 + 通知 session_summary。
 
@@ -183,6 +192,8 @@ def write_transcribe(entry: dict) -> None:
     rec.setdefault("ts", _now_iso())
     # v2.20.3 N8：自動帶 config_hash（呼叫端沒帶才補；呼叫端有蓋值就尊重）
     rec.setdefault("config_hash", get_config_hash())
+    # v2.32.0：帶版本號。之前只能靠日期猜是哪一版錄的，改版前後的數字比不出來
+    rec.setdefault("app_version", _app_version())
 
     _append_jsonl(rec)
 
@@ -207,6 +218,7 @@ def write_event(event_type: str, pipeline_id: Optional[str], **fields: Any) -> N
         "ts":   _now_iso(),
         "pipeline_id": pipeline_id,
         "config_hash": get_config_hash(),  # v2.20.3 N8：自動帶 config snapshot 標記
+        "app_version": _app_version(),
     }
     # 把 fields 平鋪進 record（不嵌套，方便 jq 撈）
     # 注意：若 fields 含 config_hash、會蓋掉上面預設值（呼叫端有意覆寫就尊重）

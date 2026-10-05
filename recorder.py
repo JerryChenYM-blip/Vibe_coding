@@ -210,6 +210,11 @@ class AudioRecorder:
         # 已重置的 self._frames）。bump 不需要 lock 保護（int 賦值原子）。
         self._capture_gen: int = 0
 
+        # v2.32.0：錄音當下把每一塊聲音也交給蘋果常駐引擎（邊錄邊辨識）。
+        # None = 沒有人要聽。listener 在 PortAudio 即時執行緒裡被呼叫，必須極快、
+        # 不能阻塞——目前唯一的使用者是 AppleStreamSession.push，只做 queue.put_nowait。
+        self._block_listener = None
+
     # ── 公開介面 ──────────────────────────────────────────────────────────────
 
     def set_device_by_name(self, name: str) -> bool:
@@ -369,6 +374,10 @@ class AudioRecorder:
                 self._is_recording = False
         return False
 
+    def set_block_listener(self, fn) -> None:
+        """設定（或用 None 清除）「每收到一塊聲音就呼叫」的掛勾。fn 收到一維 float32 陣列。"""
+        self._block_listener = fn
+
     def stop(self) -> np.ndarray:
         """停止錄音，回傳完整錄音資料。
 
@@ -426,6 +435,28 @@ class AudioRecorder:
             if not self._frames:
                 return np.zeros(0, dtype=np.float32)
             return np.concatenate(self._frames, axis=0).flatten()
+
+    def sample_count(self) -> int:
+        """目前已錄到幾個樣本（不複製任何資料）。"""
+        with self._lock:
+            return sum(len(f) for f in self._frames)
+
+    def get_tail(self, n_samples: int) -> np.ndarray:
+        """v2.32.0：只取最後 n_samples 個樣本。
+
+        不用 get_buffer_snapshot()／get_recent_buffer() 的原因：它們每次都把整段錄音串起來，
+        23 分鐘的錄音每秒要搬約 88 MB。這裡從尾巴往前只串夠用的那幾塊。
+        """
+        with self._lock:
+            if not self._frames or n_samples <= 0:
+                return np.zeros(0, dtype=np.float32)
+            picked, total = [], 0
+            for frame in reversed(self._frames):
+                picked.append(frame)
+                total += len(frame)
+                if total >= n_samples:
+                    break
+            return np.concatenate(picked[::-1], axis=0).flatten()[-n_samples:]
 
     def get_recent_buffer(self, start_samples: int) -> np.ndarray:
         """非破壞性地取得從 start_samples 開始的音訊片段。
@@ -728,6 +759,14 @@ class AudioRecorder:
                 self._frames.append(chunk)   # 加入幀列表
             # 計算 RMS 振幅（不在鎖內，因為 float 賦值是原子操作）
             self._rms_level = float(np.sqrt(np.mean(chunk ** 2)))
+            # v2.32.0：交給邊錄邊辨識。先取一份本地參照，避免另一條執行緒剛好清成 None。
+            # 錄音是單聲道（CHANNELS=1），攤平成一維；掛勾出錯絕不能影響錄音本身。
+            listener = self._block_listener
+            if listener is not None:
+                try:
+                    listener(chunk.reshape(-1))
+                except Exception:
+                    pass
         except Exception:
             # callback 中任何例外都不能往上拋（會讓 PortAudio 崩潰），只能記錄
             log_error("audio_callback_failed")

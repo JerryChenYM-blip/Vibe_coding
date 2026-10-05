@@ -98,6 +98,7 @@ private func bail(_ code: String, _ detail: String? = nil) -> Never {
 
 struct Args {
     var probe = false
+    var serve = false
     var audioPaths: [String] = []
     var localeID = "zh-TW"
     var termsFile: String?
@@ -112,6 +113,7 @@ func parseArgs() -> Args {
     while let flag = it.next() {
         switch flag {
         case "--probe":          args.probe = true
+        case "--serve":          args.serve = true
         case "--allow-download": args.allowDownload = true
         case "--audio":          if let p = it.next() { args.audioPaths.append(p) }
         case "--locale":         args.localeID = it.next() ?? args.localeID
@@ -184,6 +186,189 @@ func loadTerms(_ path: String?, limit: Int) -> [String] {
     return terms
 }
 
+
+// MARK: - 常駐串流模式（--serve，v2.32.0）
+//
+// 為什麼要有：舊做法是錄音每 10～12 秒切一段、每段開一次這支程式、放開熱鍵後才轉最後一段。
+// 2026-10-05 審查：38 場錄音開了 337 次程式；放開後辨識等待中位數 468 ms；9.4% 的切點找不到
+// 停頓、硬切在句子中間。蘋果引擎原生支援「邊錄邊餵」（SpeechAnalyzer.start(inputSequence:)），
+// 審查原型實測放開後只剩引擎收尾約 120 ms，而且跟錄音長度無關。
+//
+// 協定：stdin 一行一個 JSON 指令，stdout 一行一個 JSON 事件（診斷訊息一律走 stderr）。
+//   {"cmd":"begin","locale":"zh-TW"}  → {"event":"ready",...} 或 {"event":"error",...}
+//   {"cmd":"audio","pcm":"<base64 float32 LE 16 kHz 單聲道>"}  → 不回應（錄音期間每 0.1 秒一塊）
+//   {"cmd":"end"}     → {"event":"result","ok":true,"parts":[...],"tail_ms":...}
+//   {"cmd":"cancel"}  → {"event":"cancelled"}
+//   {"cmd":"ping"}    → {"event":"pong"}
+//   stdin 關閉 → 程式結束
+//
+// 刻意只掛一般引擎：曾試過同一個分析器多掛「聽寫引擎」當對照組，2026-10-05 實測放開後等待
+// 從 0.20～0.28 秒變 0.33～0.38 秒（17 秒長句各 3 次）。對照組改由 Python 在貼上之後、
+// 背景用單次模式補跑（--engine dictation），使用者不必替它多等。
+//
+// 準確度：6 段 13～17 秒合成語音、已知正確答案，錯字率（不計標點）邊錄邊餵 1.4%、
+// 整檔一次送 1.7%（5 段一樣、1 段較好）。已知差異：標點位置偶爾不同（1/6 段在句中多一個句號）。
+
+private func writeEvent(_ dict: [String: Any]) {
+    // 不能用 print：stdout 接到管線時是整塊緩衝，Python 端會收不到事件。直接寫 FileHandle。
+    guard var data = try? JSONSerialization.data(withJSONObject: dict) else { return }
+    data.append(0x0A)
+    FileHandle.standardOutput.write(data)
+}
+
+final class StreamSession {
+    let analyzer: SpeechAnalyzer
+    let builder: AsyncStream<AnalyzerInput>.Continuation
+    let mainTask: Task<[String], Error>
+    let inputFormat: AVAudioFormat
+    let converter: AVAudioConverter?
+    let analyzerFormat: AVAudioFormat
+    var framesIn = 0
+    var badChunks = 0
+
+    init(analyzer: SpeechAnalyzer, builder: AsyncStream<AnalyzerInput>.Continuation,
+         mainTask: Task<[String], Error>, analyzerFormat: AVAudioFormat) {
+        self.analyzer = analyzer
+        self.builder = builder
+        self.mainTask = mainTask
+        self.analyzerFormat = analyzerFormat
+        self.inputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000,
+                                         channels: 1, interleaved: false)!
+        // 格式一樣就不轉；不一樣（例如引擎要 Int16）才建轉換器，整個 session 共用一個——
+        // 轉換器內部有狀態，換取樣率時每塊各建一個會在接縫處掉樣本。
+        self.converter = (inputFormat == analyzerFormat) ? nil
+            : AVAudioConverter(from: inputFormat, to: analyzerFormat)
+    }
+
+    func feed(_ b64: String) {
+        guard let data = Data(base64Encoded: b64), data.count >= 4,
+              let buf = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: AVAudioFrameCount(data.count / 4))
+        else { badChunks += 1; return }
+        let n = data.count / 4
+        buf.frameLength = AVAudioFrameCount(n)
+        data.withUnsafeBytes { raw in
+            memcpy(buf.floatChannelData![0], raw.baseAddress!, n * 4)
+        }
+        framesIn += n
+        guard let conv = converter else {
+            builder.yield(AnalyzerInput(buffer: buf))
+            return
+        }
+        let cap = AVAudioFrameCount(Double(n) * analyzerFormat.sampleRate / 16_000) + 64
+        guard let out = AVAudioPCMBuffer(pcmFormat: analyzerFormat, frameCapacity: cap) else { badChunks += 1; return }
+        var consumed = false
+        var err: NSError?
+        // .noDataNow（不是 .endOfStream）：告訴轉換器「這塊給完了、等下一塊」，保留內部狀態
+        _ = conv.convert(to: out, error: &err) { _, status in
+            if consumed { status.pointee = .noDataNow; return nil }
+            consumed = true
+            status.pointee = .haveData
+            return buf
+        }
+        if err != nil || out.frameLength == 0 { badChunks += 1; return }
+        builder.yield(AnalyzerInput(buffer: out))
+    }
+
+    func cancel() async {
+        builder.finish()
+        await analyzer.cancelAndFinishNow()
+        mainTask.cancel()
+    }
+}
+
+func serveBegin(_ cmd: [String: Any]) async -> StreamSession? {
+    let localeID = (cmd["locale"] as? String) ?? "zh-TW"
+    let t0 = Date()
+    guard let loc = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: localeID)) else {
+        writeEvent(["event": "error", "error": "locale_unsupported", "detail": localeID]); return nil
+    }
+    let main = SpeechTranscriber(locale: loc, preset: .transcription)
+    // 熱路徑不下載模型：要等好幾分鐘的事放在 App 暖機時做（見 transcriber._warmup_apple）
+    if await AssetInventory.status(forModules: [main]) != .installed {
+        writeEvent(["event": "error", "error": "asset_not_installed"]); return nil
+    }
+    let modules: [any SpeechModule] = [main]
+    guard let fmt = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: modules) else {
+        writeEvent(["event": "error", "error": "no_audio_format"]); return nil
+    }
+    do {
+        let analyzer = SpeechAnalyzer(modules: modules)
+        // 錄音一開始就把引擎準備好：閒置後第一次會比較慢（審查量到 +150～280 ms），
+        // 在這裡付掉，使用者正在講話、感覺不到
+        try await analyzer.prepareToAnalyze(in: fmt)
+        let (seq, builder) = AsyncStream<AnalyzerInput>.makeStream()
+        let mainTask = Task { () -> [String] in
+            var parts: [String] = []
+            for try await r in main.results { parts.append(String(r.text.characters)) }
+            return parts
+        }
+        try await analyzer.start(inputSequence: seq)
+        let session = StreamSession(analyzer: analyzer, builder: builder, mainTask: mainTask,
+                                    analyzerFormat: fmt)
+        writeEvent(["event": "ready", "locale": loc.identifier,
+                    "prepare_ms": Date().timeIntervalSince(t0) * 1000])
+        return session
+    } catch {
+        writeEvent(["event": "error", "error": "begin_failed", "detail": String(describing: error)])
+        return nil
+    }
+}
+
+func serveEnd(_ s: StreamSession) async {
+    let t0 = Date()
+    // 一個聲音都沒收到就收尾，結果串流會永遠等不到結束訊號（跟 0 影格 wav 同一個坑）
+    if s.framesIn == 0 {
+        await s.cancel()
+        writeEvent(["event": "result", "ok": false, "error": "empty_audio"]); return
+    }
+    s.builder.finish()
+    do {
+        try await s.analyzer.finalizeAndFinishThroughEndOfInput()
+        let parts = try await s.mainTask.value
+        writeEvent([
+            "event": "result", "ok": true, "parts": parts,
+            "tail_ms": Date().timeIntervalSince(t0) * 1000,
+            "audio_seconds": Double(s.framesIn) / 16_000,
+            "bad_chunks": s.badChunks,
+        ])
+    } catch {
+        writeEvent(["event": "result", "ok": false, "error": "finalize_failed", "detail": String(describing: error)])
+    }
+}
+
+func runServe() async -> Never {
+    writeEvent(["event": "hello", "protocol": 1])
+    var session: StreamSession? = nil
+    do {
+        for try await line in FileHandle.standardInput.bytes.lines {
+            guard let data = line.data(using: .utf8),
+                  let cmd = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let name = cmd["cmd"] as? String else { continue }
+            switch name {
+            case "begin":
+                // 上一個 session 沒收尾（例如 App 那邊錄音被取消）就直接丟掉，不讓它卡住新的
+                if let old = session { await old.cancel() }
+                session = await serveBegin(cmd)
+            case "audio":
+                if let s = session, let pcm = cmd["pcm"] as? String { s.feed(pcm) }
+            case "end":
+                if let s = session { await serveEnd(s); session = nil }
+                else { writeEvent(["event": "result", "ok": false, "error": "no_session"]) }
+            case "cancel":
+                if let s = session { await s.cancel(); session = nil }
+                writeEvent(["event": "cancelled"])
+            case "ping":
+                writeEvent(["event": "pong"])
+            default:
+                break
+            }
+        }
+    } catch {
+        note("serve: stdin 讀取失敗 \(error)")
+    }
+    exit(0)
+}
+
 // MARK: - 主流程
 
 @main
@@ -192,6 +377,10 @@ struct AppleSTT {
     static func main() async {
         let args = parseArgs()
         let locale = Locale(identifier: args.localeID)
+
+        if args.serve {
+            await runServe()      // 常駐模式：讀 stdin 指令直到 EOF，自己 exit
+        }
 
         if args.probe {
             await runProbe(locale: locale, requested: args.localeID)
@@ -320,11 +509,13 @@ struct AppleSTT {
                                contextual_terms: terms.count,
                                error: "locale_unsupported", detail: locale.identifier)
             }
-            // 30 秒是 Apple 對 short/long 兩個 preset 的分野依據（短句 vs 長篇口述）。
-            // 這裡照音檔實際長度自動挑，避免短錄音被當長篇處理而多付啟動成本。
-            let preset: DictationTranscriber.Preset =
-                audioSeconds <= 30 ? .shortDictation : .longDictation
-            let module = DictationTranscriber(locale: loc, preset: preset)
+            // v2.32.0：改用明確參數並打開 .punctuation。v2.31.0 用 shortDictation／longDictation
+            // preset，輸出沒有標點，當時誤以為聽寫引擎不支援標點而沒採用它；其實它有
+            // .punctuation 選項（2026-10-05 查 SDK 介面發現）。這條路現在給背景對照組用
+            // （transcriber 的 apple shadow），參數要跟日後可能採用時一致。
+            let module = DictationTranscriber(locale: loc, contentHints: [],
+                                              transcriptionOptions: [.punctuation],
+                                              reportingOptions: [], attributeOptions: [])
             let (status, downloaded) = try await ensureAssets(for: module, allowDownload: allowDownload)
             if status != "installed" {
                 return Payload(ok: false, engine: engine, locale: loc.identifier, text: nil,

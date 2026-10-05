@@ -49,7 +49,7 @@ import dictionary as _dictionary
 from history import HistoryStore
 from prompt_reloader import PromptReloader
 from recorder import AudioRecorder
-from transcriber import Transcriber, TranscriptionResult, is_system_message, _is_apple_model
+from transcriber import Transcriber, TranscriptionResult, is_system_message, _is_apple_model, _MIN_RMS
 from icons import get_icon, get_canvas_icon
 from animation import blend, breathe, ease_in_out_cubic, Ripple
 from waveform import WaveformEngine
@@ -64,6 +64,25 @@ log = get_logger("gui")
 # ── v2.19.0 pipeline 觀測性 helper ───────────────────────────────────────────
 # pipeline_id / session_summary 由 Agent N 同步在建。可能還沒 ready 或 import
 # 失敗。所有呼叫一律包 try/except，觀測性 bug 絕不能影響主流程。
+
+def _with_pid(pid, fn):
+    """把錄音編號帶進背景執行緒。
+
+    v2.32.0：pipeline_id 存在 threading.local()——錄音開始時在主執行緒設定，但轉錄、
+    潤飾都在背景執行緒跑，那邊讀到的永遠是空的。2026-10-05 審查：9/21 之後 641 筆轉錄
+    紀錄 0 筆有編號（更早 7,326 筆也只有 15 筆），2026-09-05 優化策略 §4-4 記為
+    「原因不明的量測缺口」，就是這裡。沒有編號，同一次錄音的各筆紀錄（轉錄、貼上、
+    尾音、蘋果對照組）就串不起來。
+    """
+    def run(*args, **kwargs):
+        try:
+            from pipeline_id import set_current  # type: ignore
+            set_current(pid)
+        except Exception:
+            pass
+        return fn(*args, **kwargs)
+    return run
+
 
 def _pipe_new_id():
     """新增一個 pipeline_id 並設為 thread-local current。失敗回 None。"""
@@ -819,6 +838,8 @@ class AppWindow(ctk.CTkFrame):
     WATCHDOG_STOP_NO_VOICE_S = 15 * 60   # 連續 15 分鐘無語音 → 自動停止（內容保留）
 
     _last_voice_at = None        # v2.24.0：最近一次偵測到語音的 perf_counter 時間
+    _apple_session = None        # v2.32.0：蘋果邊錄邊辨識的 session（只在錄音中存在）
+    _recording_pid = None        # v2.32.0：這次錄音的 pipeline_id，背景執行緒要帶過去
     _watchdog_warned = False     # v2.24.0：本輪錄音是否已發過 8 分鐘提醒
     _la_buffer = None
     _pipeline_summary_emitted = False
@@ -2377,8 +2398,25 @@ class AppWindow(ctk.CTkFrame):
             log.debug(f"_transition_to_recording ignored (state={self._state})")
             return
 
+        # v2.32.0：蘋果邊錄邊辨識——session 與掛勾要在開麥克風「之前」準備好：
+        # 麥克風一開聲音就開始進來，晚一步掛上會漏掉開頭第一個字。
+        # 建不起來（不是蘋果模型、程式壞了）就是 None，整次錄音照舊做法。
+        # 這一步出任何錯都不能讓使用者錄不了音：吞掉、當作沒有，照舊做法錄。
+        self._apple_session = None
+        if self._apple_streaming_wanted():
+            try:
+                self._apple_session = self.transcriber.start_apple_stream(
+                    self._model_var.get(), self.cfg.get_whisper_language()
+                )
+            except Exception:
+                log_error("apple_stream_session_create_failed")
+                self._apple_session = None
+            if self._apple_session is not None:
+                self.recorder.set_block_listener(self._apple_session.push)
+
         # Cluster C：先 start recorder（會 lazy-init device）、失敗就回退 idle
         if not self.recorder.start():
+            self._abort_apple_session()
             log.warning("RECORD: start() failed; staying idle")
             log_action("recording_start_failed_no_device")
             try:
@@ -2410,7 +2448,8 @@ class AppWindow(ctk.CTkFrame):
 
         # v2.19.0：錄音真正開始 → 生成新 pipeline_id，貫穿整條 pipeline。
         # （錄音啟動失敗時就不生 pid、避免 dead pid 污染 log）
-        _pipe_new_id()
+        # v2.32.0：記下來，開背景執行緒時要帶過去（見 _with_pid）
+        self._recording_pid = _pipe_new_id()
         _pipe_event("hotkey_pressed", hotkey=str(self.cfg.hotkey))
 
         log_state(
@@ -2582,6 +2621,25 @@ class AppWindow(ctk.CTkFrame):
             self._stream_tick_id = None
 
         full_audio = self.recorder.stop()
+        # v2.32.0：recorder.stop() 回來時所有聲音都已經交給掛勾了，這時才拿下
+        self.recorder.set_block_listener(None)
+        # v2.32.0：記下這次尾音等了多久、放開之後那段錄到多大聲。縮短等待後如果 post_rms
+        # 常常明顯有聲音，就代表放開後使用者還在講、縮短會切到字——要回頭調 TAIL_SILENT_RMS。
+        try:
+            import numpy as np
+            if self._tail_release_samples is not None and self._tail_padding_used_ms is not None:
+                post = full_audio[self._tail_release_samples:]
+                _pipe_event(
+                    "tail_padding",
+                    padding_ms=int(self._tail_padding_used_ms),
+                    post_release_s=round(len(post) / 16_000, 3),
+                    post_release_rms=round(float(np.sqrt(np.mean(post * post))), 5) if len(post) else 0.0,
+                )
+        except Exception:
+            pass
+        self._tail_release_samples = None
+        self._tail_padding_used_ms = None
+        apple_session, self._apple_session = self._apple_session, None
 
         # 動態 timeout：取呼叫端傳入值 / 實際錄音長度 / recording 階段 elapsed
         # 三者最大；至少 BASE 60s 為下限，避免 CPU backend + 長音檔誤殺。
@@ -2609,45 +2667,16 @@ class AppWindow(ctk.CTkFrame):
             dynamic_timeout_ms, self._processing_timeout_check
         )
 
-        # UI：Chamber 渲染迴圈下一 tick 會自動切換到 WARN 配色 + 粒子旋轉環
-        self._timer_label.configure(text="")
-        self._hotkey_hint.configure(text="轉錄中…")
-        self._target_label.configure(text="")
-        if self._skeleton_mode:
-            # v2.28.0 骨架重寫：狀態點語意收窄——PROC(=INDIGO) 專職「處理中」，
-            # WARN 讓給「暖機中」（見 _warmup_model）。
-            self._set_status("處理中", INDIGO)
-            # v2.28.0：錄音一停就在轉錄流頂端插一張「轉錄中」骨架卡（固定
-            # 高度 88，避免真正內容填入時版面跳動）；_display_result_skeleton
-            # 完成後會就地把它填成 ready／failed，不會有「骨架卡消失、新卡片
-            # 彈出」的閃爍。狀態機不允許 processing 中再開始新錄音，同一時間
-            # 只會有一個 pending block，不用擔心覆蓋舊的。
-            self._clear_placeholder()
-            self._pending_block = UtteranceBlockV2(
-                self._blocks_container,
-                on_copy=self._on_block_copy, on_save=self._on_block_save,
-            )
-            prev_top = self._utterance_blocks[0] if self._utterance_blocks else None
-            if prev_top is not None:
-                prev_top.highlight_as_latest(False)
-                self._pending_block.pack(fill="x", pady=(0, 8), before=prev_top)
-            else:
-                self._pending_block.pack(fill="x", pady=(0, 8))
-            try:
-                self._blocks_container.update_idletasks()
-                self._blocks_container._parent_canvas.yview_moveto(0.0)
-            except Exception:
-                pass
-        else:
-            self._status_dot.configure(text_color=WARN)
-            self._status_label.configure(text="  轉錄中，請稍候…")
-
         # 真實總長＝整段錄音，不是尾段（見 _full_audio_s 宣告處的註解）
         self._full_audio_s = len(full_audio) / 16_000.0
         tail  = full_audio[self._stream_samples:]
         model = self._model_var.get()
         lang  = self.cfg.get_whisper_language()
-        audio = tail if len(tail) > 800 else full_audio
+        # 沒切過段時 tail 就是整段；切過段時一定只轉尾段——就算尾段很短也一樣。
+        # 原本「尾段 ≤ 800 樣本就改轉整段」，放開時剛好切完一段的話，整段錄音會再轉一次、
+        # 接在各段文字後面，全文重複兩遍（第三輪審查：模擬 1,500 次切段錄音約 0.2% 會遇到；
+        # 蘋果串流中途失敗改回切段時更容易碰到）。很短的尾段會被長度閘擋下、回系統訊息，合併時丟掉。
+        audio = tail if (len(tail) > 800 or self._stream_samples > 0) else full_audio
 
         # v2.19.x LocalAgreement-2 path：把剩餘 audio 餵給 buffer + 起 finalize。
         # _run_transcription 內部會偵測 _la_buffer 非 None 改走 LA 合併路徑、
@@ -2691,10 +2720,49 @@ class AppWindow(ctk.CTkFrame):
             pass
 
         threading.Thread(
-            target=self._run_transcription,
-            args=(audio, model, lang),
+            target=_with_pid(self._recording_pid, self._run_transcription),
+            args=(audio, model, lang, apple_session),
             daemon=True,
         ).start()
+
+        # v2.32.0：「轉錄中」的畫面（含骨架卡＋強制排版）挪到辨識執行緒啟動之後。
+        # 原本先畫卡片、update_idletasks 排完版才起辨識，2026-10-05 審查量到放開熱鍵到
+        # 辨識開跑中位數 219 ms，其中約 90 ms 花在這裡。現在辨識先在背景跑、畫面同時畫。
+        # 安全性：辨識結果是透過 self.after(0, ...) 送回主執行緒，本函式跑完之前不可能
+        # 被執行，所以 _display_result_skeleton 要填的 _pending_block 一定已經建好。
+        # UI：Chamber 渲染迴圈下一 tick 會自動切換到 WARN 配色 + 粒子旋轉環
+        self._timer_label.configure(text="")
+        self._hotkey_hint.configure(text="轉錄中…")
+        self._target_label.configure(text="")
+        if self._skeleton_mode:
+            # v2.28.0 骨架重寫：狀態點語意收窄——PROC(=INDIGO) 專職「處理中」，
+            # WARN 讓給「暖機中」（見 _warmup_model）。
+            self._set_status("處理中", INDIGO)
+            # v2.28.0：錄音一停就在轉錄流頂端插一張「轉錄中」骨架卡（固定
+            # 高度 88，避免真正內容填入時版面跳動）；_display_result_skeleton
+            # 完成後會就地把它填成 ready／failed，不會有「骨架卡消失、新卡片
+            # 彈出」的閃爍。狀態機不允許 processing 中再開始新錄音，同一時間
+            # 只會有一個 pending block，不用擔心覆蓋舊的。
+            self._clear_placeholder()
+            self._pending_block = UtteranceBlockV2(
+                self._blocks_container,
+                on_copy=self._on_block_copy, on_save=self._on_block_save,
+            )
+            prev_top = self._utterance_blocks[0] if self._utterance_blocks else None
+            if prev_top is not None:
+                prev_top.highlight_as_latest(False)
+                self._pending_block.pack(fill="x", pady=(0, 8), before=prev_top)
+            else:
+                self._pending_block.pack(fill="x", pady=(0, 8))
+            try:
+                self._blocks_container.update_idletasks()
+                self._blocks_container._parent_canvas.yview_moveto(0.0)
+            except Exception:
+                pass
+        else:
+            self._status_dot.configure(text_color=WARN)
+            self._status_label.configure(text="  轉錄中，請稍候…")
+
 
         # Phase 4.3 mini 視窗：切到處理中色（琥珀）
         if self._mini_window is not None:
@@ -2793,6 +2861,36 @@ class AppWindow(ctk.CTkFrame):
 
         # v2.19.x LocalAgreement-2 path：route 到 _stream_tick_la()。
         # _la_buffer 非 None 表示這輪錄音用 LA 演算法、fixed-chunk 邏輯整段跳過。
+        # v2.32.0：蘋果邊錄邊辨識時不切段——整段錄音已經即時餵給常駐引擎了，再切段等於
+        # 同一段聲音辨識兩次。
+        # 但錄音看門狗（_recording_watchdog_check）原本靠「切段辨識出文字」刷新
+        # _last_voice_at；不切段的話，使用者連續講 15 分鐘也會被當成沒講話而自動停止
+        # （他有過 23、34 分鐘的長錄音）。所以這裡改看最近 1 秒的音量。
+        # 門檻沿用轉錄端判斷靜音的 _MIN_RMS（0.004）：真實錄音中有文字的片段整段音量最低一成
+        # 是 0.0095，錄音結尾的安靜時段 2/3 低於 0.001。誤判只會偏向「以為有在講」（背景很吵
+        # 時不自動停），不會把正在講話的錄音停掉。
+        # 錄音途中常駐程式出錯：馬上恢復切段，從頭補切。不然放開後整段錄音要一次送，
+        # 30 分鐘的錄音要多等約 1 分鐘（2026-10-05 審查）。字不會掉：錄音本身一直都在 recorder 裡。
+        session = self._apple_session
+        if session is not None and not session.check_alive():
+            log.warning(f"APPLE_STREAM: session died while recording ({session.failure}), resuming chunking")
+            log_action("apple_stream_fallback", reason=session.failure, when="recording")
+            try:
+                self.recorder.set_block_listener(None)
+            except Exception:
+                pass
+            self._apple_session = None
+        if self._apple_session is not None:
+            try:
+                import numpy as np
+                tail = self.recorder.get_tail(16_000)
+                if tail.size and float(np.sqrt(np.mean(tail * tail))) >= _MIN_RMS:
+                    self._last_voice_at = time.perf_counter()
+            except Exception:
+                pass
+            self._stream_tick_id = self.after(self.STREAM_TICK_MS, self._stream_tick)
+            return
+
         if self._la_buffer is not None:
             self._stream_tick_la()
             return
@@ -2814,8 +2912,15 @@ class AppWindow(ctk.CTkFrame):
             return
 
         # 累積 ≥ 10s 新 audio？ → 決定切點（VAD 對齊 or 舊 fixed 行為）
+        # v2.32.0：一次最多看 12 秒（hard cap）。平常每秒檢查一次，累積量本來就不會超過；
+        # 但蘋果串流在錄音途中掛掉、從頭補切時，累積量是整段錄音——不限的話會在「整段的
+        # 最後幾秒」找停頓，切出一個 25 分鐘的大段。蘋果整段送一次沒有排隊鎖，放開後最多只等
+        # 30 秒，大段還沒轉完就被丟掉，貼上的只剩尾巴（2026-10-05 審查重現）。
+        # 限住之後每秒補切一段 ≤ 12 秒（約 0.3 秒轉完）；放開時還沒補完的部分算在尾段裡整段轉，不會丟。
         if available >= self.STREAM_CHUNK_SAMPLES:
-            cut_len = self._decide_stream_cut_length(snap, available)
+            cut_len = self._decide_stream_cut_length(
+                snap, min(available, self.STREAM_HARD_CAP_SAMPLES)
+            )
             if cut_len is not None:
                 chunk_end = self._stream_samples + cut_len
                 chunk = snap[self._stream_samples:chunk_end]
@@ -2828,6 +2933,82 @@ class AppWindow(ctk.CTkFrame):
             self._stream_tick_id = self.after(
                 self.STREAM_TICK_MS, self._stream_tick
             )
+
+    def _apple_streaming_wanted(self) -> bool:
+        """v2.32.0：這次錄音要不要用蘋果邊錄邊辨識。
+
+        開了 AI 潤飾就不用：舊的切段做法會在使用者還在講的時候，一段一段先潤飾好，放開後
+        只剩最後一段要潤飾；邊錄邊辨識不切段，放開後要整篇一次潤飾，長錄音反而更慢
+        （2026-10-05 審查）。辨識省下的約 0.3 秒，抵不過整篇潤飾多花的好幾秒。
+        LocalAgreement（實驗中的另一種切段法）有自己的流程，不會收尾 session，也不用。
+        """
+        if not getattr(self.cfg, "apple_streaming", True):
+            return False
+        if getattr(self.cfg, "ollama_enabled", False):
+            return False
+        return getattr(self.cfg, "streaming_algo", "fixed_chunk") != "local_agreement"
+
+    def _apple_shadow_active(self) -> bool:
+        """v2.32.0：對照組是否還在收資料期（今天 ≤ cfg.apple_shadow_until）。"""
+        until = (getattr(self.cfg, "apple_shadow_until", "") or "").strip()
+        if not until:
+            return False
+        try:
+            import datetime
+            return datetime.date.today() <= datetime.date.fromisoformat(until)
+        except Exception:
+            return False   # 日期寫錯就當作不跑，不讓對照組拖累主流程
+
+    @staticmethod
+    def _resource_snapshot() -> dict:
+        """v2.32.0：記憶體與 CPU 累計用量，併進每 5 分鐘一筆的 hotkey_health。
+
+        之前只有 keepalive_ping 記 RSS，但它只在本機模型（Whisper／Qwen3）時才跑——
+        切到蘋果之後完全沒有資源數字，「閒置變省電」「放掉權重省幾 GB」都驗不了。
+        cpu_s 是開機以來累計秒數：兩筆相減 ÷ 300 秒 = 這 5 分鐘平均吃幾 % 的一顆核心。
+        子程序（蘋果常駐辨識程式）的記憶體不算在 App 本身，另外加總。"""
+        try:
+            import psutil  # noqa: PLC0415
+            proc = psutil.Process()
+            t = proc.cpu_times()
+            children_mb = 0.0
+            for c in proc.children():
+                try:
+                    children_mb += c.memory_info().rss / 1024 / 1024
+                except Exception:
+                    pass   # 子程序剛好結束——少算一個不影響趨勢
+            return {
+                "rss_mb": round(proc.memory_info().rss / 1024 / 1024, 1),
+                "cpu_s": round(t.user + t.system, 1),
+                "children_rss_mb": round(children_mb, 1),
+            }
+        except Exception:
+            return {}
+
+    def _start_pending_shadow(self, result, valid: bool) -> None:
+        """v2.32.0：貼上之後才開跑對照組。被擋下的結果（太短、沒聲音）不跑——沒東西可比。
+        不管跑不跑都把工作從結果上拿掉：結果之後會留在畫面與歷史裡，錄音不能跟著留在記憶體。"""
+        job = getattr(result, "shadow_job", None)
+        result.shadow_job = None
+        if job is None or not valid:
+            return
+        try:
+            threading.Thread(
+                target=self.transcriber.run_apple_shadow, args=job, daemon=True,
+            ).start()
+        except Exception:
+            log_error("apple_shadow_dispatch_failed")
+
+    def _abort_apple_session(self) -> None:
+        """v2.32.0：錄音沒走到轉錄（麥克風打不開、App 關閉）時收掉邊錄邊辨識的 session。
+        常駐程式收到下一次 begin 也會自己丟掉沒收尾的 session，這裡是讓它早點放手。"""
+        try:
+            self.recorder.set_block_listener(None)
+        except Exception:
+            pass
+        session, self._apple_session = self._apple_session, None
+        if session is not None:
+            session.abort()
 
     def _recording_watchdog_check(self) -> None:
         """v2.24.0 錄音看門狗：連續無語音太久 → 提醒 → 自動停止（防忘記關錄音）。
@@ -3002,7 +3183,7 @@ class AppWindow(ctk.CTkFrame):
                 if self._stream_generation == gen:
                     self._stream_completed += 1
 
-        threading.Thread(target=_process, daemon=True).start()
+        threading.Thread(target=_with_pid(self._recording_pid, _process), daemon=True).start()
 
     def _dispatch_stream_polish(self, idx: int, text: str, gen: int) -> None:
         """v2.17.0：把單一 ASR chunk 立即 dispatch 給 Ollama polish。
@@ -3054,7 +3235,7 @@ class AppWindow(ctk.CTkFrame):
                 if self._stream_generation == gen:
                     self._stream_polish_completed += 1
 
-        threading.Thread(target=_polish_thread, daemon=True).start()
+        threading.Thread(target=_with_pid(self._recording_pid, _polish_thread), daemon=True).start()
 
     # ═══════════════════════════════════════════════════════════════════════
     #  v2.19.x LocalAgreement-2 STREAMING（experimental）
@@ -3193,13 +3374,13 @@ class AppWindow(ctk.CTkFrame):
                 if self._la_buffer is la_buf:
                     self._la_finalize_done = True
 
-        threading.Thread(target=_finalize, daemon=True).start()
+        threading.Thread(target=_with_pid(self._recording_pid, _finalize), daemon=True).start()
 
     # ═══════════════════════════════════════════════════════════════════════
     #  TRANSCRIPTION
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _run_transcription(self, audio, model: str, lang) -> None:
+    def _run_transcription(self, audio, model: str, lang, apple_session=None) -> None:
         """背景執行緒：呼叫 Whisper 做最終轉錄，完成後 marshal 到主執行緒。
 
         若有中段串流結果，將其與最終文字合併後一起回傳。
@@ -3253,12 +3434,47 @@ class AppWindow(ctk.CTkFrame):
             # v2.14.0：傳 chinese_variant 給 Qwen3-ASR 用（Whisper backend ignore）
             # tail audio：_transition_to_processing 已把 _stream_samples 後的尾段
             # 取出來；若無 streaming 就是整段 full_audio
+            # v2.32.0：蘋果邊錄邊辨識——錄音期間已經辨識完了，這裡只等引擎收尾（約 0.2 秒）。
+            # 拿不到結果（逾時、程式出錯）就是 None，transcribe() 會自動改走「整段送一次」。
+            # 等待上限：收尾實測 0.13～0.42 秒，給 8 秒起跳的寬裕；長錄音再按長度加——
+            # 逾時的代價只是退回舊做法多等一次，不會丟內容。
+            # 長度係數 0.03（= 33 倍速）只是給最壞情況的保險：照真實速度送時，收尾實測
+            # 0.15～0.63 秒、跟長度無關；只有錄音期間引擎完全沒跟上、全部堆到收尾才會慢——
+            # 那時處理積壓的速度實測 51～66 倍速（真人語速的合成語音，第三輪審查），留約 1.5～2 倍餘裕。
+            # 原本 0.1 在程式卡住時，34 分鐘的錄音要白等 204 秒；「卡住」現在由 finish() 自己
+            # 3 秒內發現，這個上限只剩「收完聲音卻不回結果」會等滿。
+            apple_stream_result = None
+            if apple_session is not None:
+                apple_stream_result = apple_session.finish(
+                    timeout=max(8.0, len(audio) / 16_000 * 0.03)
+                )
+                if apple_stream_result is None:
+                    log.warning(
+                        f"APPLE_STREAM: falling back to one-shot (reason={apple_session.failure})"
+                    )
+                    log_action("apple_stream_fallback", reason=apple_session.failure or "unknown")
+
             result = self.transcriber.transcribe(
                 audio,
                 model_size=model,
                 language=lang,
                 chinese_variant=getattr(self.cfg, "chinese_variant", "off"),
+                apple_stream_result=apple_stream_result,
             )
+
+            # v2.32.0：第三階段對照組——用聽寫引擎把同一段錄音再辨識一次，只寫紀錄。
+            # 只在「這次真的是邊錄邊辨識出來的」時跑：此時沒有切段，audio 就是整段錄音，
+            # 兩份文字才能直接比；退回舊做法時 audio 可能只是最後一段尾巴，比對工具也只看串流的。
+            # 這裡只是記下來，等貼上之後才在 _on_transcription_done 開跑（使用者不替對照組多等）。
+            # 到期自動停（cfg.apple_shadow_until），不靠人記得關。
+            # 工作掛在結果物件上、不放共用欄位：結果被丟掉（逾時後才回來、轉錄失敗）時錄音跟著
+            # 一起釋放，也不會被下一次錄音拿去用（第二輪審查）。
+            if (getattr(result, "apple_meta", None) or {}).get("streamed") and self._apple_shadow_active():
+                try:
+                    from transcriber import _safe_pipeline_id
+                    result.shadow_job = (audio, lang, _safe_pipeline_id())
+                except Exception:
+                    log_error("apple_shadow_dispatch_failed")
 
             # v2.16.0：等所有背景 streaming chunks 完成寫入 _stream_chunks
             # 才合併。transcribe() 已序列化（_transcription_lock）、tail 完成
@@ -3281,7 +3497,12 @@ class AppWindow(ctk.CTkFrame):
 
             prior = list(self._stream_chunks)
             if prior:
-                tail = result.text if result.text != "（未偵測到語音內容）" else ""
+                # 尾段回系統訊息（太短、沒聲音、辨識失敗）就不接：接上去之後整串不再是「（…）」，
+                # is_system_message() 認不出來，訊息會被當成逐字稿貼出去（第三輪審查）。
+                # 原本只擋「未偵測到語音內容」這一句。
+                tail = "" if is_system_message(result.text) else result.text
+                if tail == "" and result.text:
+                    log.warning(f"STREAMING: tail dropped from merge ({result.text})")
                 # v2.21.3 接縫縫合：移除 10 秒切窗在接縫補的假句號（實測 14/14 接縫
                 #   的句號都是假的、甚至把「三千六」切成「月三。千六」）。tail 原樣保留。
                 try:
@@ -3432,14 +3653,83 @@ class AppWindow(ctk.CTkFrame):
             elapsed_s=float(result.elapsed_seconds or 0.0),
         )
 
-        self._transition_to_idle(result)
-        self._show_toast(f"轉錄完成 · {result.elapsed_seconds:.1f}s")
-
         text  = result.text
         # v2.31.0：改用 is_system_message() 取代原本硬編碼的兩句白名單。
         # 原本的寫法擋不住新增的失敗訊息——漏掉一句，那句就會被當成逐字稿
         # 自動 ⌘V 貼進使用者當下的輸入框、寫進歷史、還送去 Ollama 潤飾。
         valid = bool(text) and not is_system_message(text)
+
+        # 決定路徑：能潤飾就走潤飾流程，失敗自動降級回原文。
+        # 規劃書 6.4「策略 B」：等潤飾完再貼，因此 auto-paste 也延到潤飾後。
+        # v2.13.0 / 2026-05-24：修「Ollama 啟用但 health_ok=None 跳過 polish」。
+        # 根因：D5-S7 TTL 30s 過期會回 None；剛 enable Ollama health check 還沒
+        # 回來也是 None；舊邏輯 `is True` 排除 None → user 雖然開了 Ollama
+        # 但每次 cache 過期或剛啟用都不會 polish、直接貼 Whisper 原文（含「措置率」
+        # 這種同音錯字）。改用 `is not False` 放寬：None / True 都試一下；
+        # 真的 False（確定沒跑）才略過。process() 內部 ConnectionError fallback
+        # 自然會降級回原文，使用者不會卡住。
+        # v2.21.0 Phase B4：把 polish_backend="off" 納入判斷。
+        #   舊邏輯只看 ollama_enabled、沒看 polish_backend → off + ollama_enabled=True
+        #   時仍走 polish path、下游 `self.polish or self.ollama` 又 fallback 回
+        #   ollama → off 名存實亡。加 polish_backend != "off" 讓 off 真的不跑 LLM。
+        # （v2.32.0：這段判斷從下方挪上來，因為「不潤飾就先貼上」要先知道走哪條路。
+        #   它只看設定與 Ollama 健康狀態，跟畫面、歷史紀錄無關，挪動不改變結果。）
+        take_polish_path = (
+            valid
+            and self.cfg.ollama_enabled
+            and getattr(self.cfg, "polish_backend", "local") != "off"
+            and self.ollama.health_ok is not False
+        )
+
+        # v2.32.0：不走潤飾時，先貼上，再畫結果卡、寫歷史。
+        # 原本的順序是「畫結果卡 → 寫歷史資料庫 → 貼上」，使用者要的是文字出現在他正在
+        # 打字的地方，畫面與資料庫晚一點完全沒差。2026-10-05 審查：轉完到開始貼上中位數
+        # 120 ms、p90 334 ms，都花在貼上之前的畫面與資料庫工作。
+        # _do_auto_paste 只用到文字與 pipeline 計時，不依賴結果卡或歷史 id（已確認）。
+        # 「轉錄完成」提示要在貼上之前跳：貼上失敗時會跳失敗提示，後跳的會把它蓋掉。
+        # 整段包 try：這段搬到「畫結果卡」之前之後，萬一這裡出錯，後面的回到閒置、畫卡片、
+        # 寫歷史都不會跑，畫面會卡在「處理中」60 秒（2026-10-05 審查）。舊順序沒有這個風險。
+        if not take_polish_path:
+            try:
+                # 提示出錯不能連累貼上（提示只是畫一個小框，貼上才是使用者要的）
+                try:
+                    self._show_toast(f"轉錄完成 · {result.elapsed_seconds:.1f}s")
+                except Exception:
+                    pass
+                # 錄音小窗原本在回到閒置時收起，也就是貼上「之前」。改成先貼上之後，這裡先收，
+                # 維持原本的先後：Windows 上小窗是一般的最上層視窗，留著可能影響貼到哪個視窗
+                #（第二輪審查；Mac 上它不搶焦點，提早收起只是早一點消失）。
+                mini = getattr(self, "_mini_window", None)
+                if mini is not None:
+                    mini.hide()
+                if self.cfg.auto_copy and valid:
+                    try:
+                        import pyperclip
+                        pyperclip.copy(text)
+                    except Exception:
+                        pass
+                if self.cfg.auto_paste and valid and self._paste_target:
+                    target = self._paste_target
+                    self._paste_target = None
+                    # macOS 26.4+ TSM 強制主執行緒：pynput keyboard.Controller 模擬 ⌘V
+                    # 必須在主 thread 呼叫，否則 TSMGetInputSourceProperty 會觸發
+                    # dispatch_assert_queue_fail 直接閃退。詳見 CLAUDE.md §9.6。
+                    self._do_auto_paste(text, target)
+                else:
+                    # 沒走 auto-paste（auto_paste 關 / 無 target / 無效文字）也要 emit
+                    # pipeline summary — 此時 paste_s 是 0、total_s ≈ transcribe_s
+                    self._emit_pipeline_timing(
+                        paste_outcome="skipped",
+                        paste_target=None,
+                        text_len=len(text) if valid else 0,
+                    )
+            except Exception:
+                log_error("early_paste_failed")
+
+        self._start_pending_shadow(result, valid)
+        self._transition_to_idle(result)
+        if take_polish_path:
+            self._show_toast(f"轉錄完成 · {result.elapsed_seconds:.1f}s")
 
         # 每次新轉錄都 +1，遲到的潤飾結果可據此丟棄。
         self._polish_generation += 1
@@ -3477,26 +3767,6 @@ class AppWindow(ctk.CTkFrame):
         if self._skeleton_mode and self._current_history_id is not None and self._utterance_blocks:
             self._utterance_blocks[0].history_id = self._current_history_id
 
-        # 決定路徑：能潤飾就走潤飾流程，失敗自動降級回原文。
-        # 規劃書 6.4「策略 B」：等潤飾完再貼，因此 auto-paste 也延到潤飾後。
-        # v2.13.0 / 2026-05-24：修「Ollama 啟用但 health_ok=None 跳過 polish」。
-        # 根因：D5-S7 TTL 30s 過期會回 None；剛 enable Ollama health check 還沒
-        # 回來也是 None；舊邏輯 `is True` 排除 None → user 雖然開了 Ollama
-        # 但每次 cache 過期或剛啟用都不會 polish、直接貼 Whisper 原文（含「措置率」
-        # 這種同音錯字）。改用 `is not False` 放寬：None / True 都試一下；
-        # 真的 False（確定沒跑）才略過。process() 內部 ConnectionError fallback
-        # 自然會降級回原文，使用者不會卡住。
-        # v2.21.0 Phase B4：把 polish_backend="off" 納入判斷。
-        #   舊邏輯只看 ollama_enabled、沒看 polish_backend → off + ollama_enabled=True
-        #   時仍走 polish path、下游 `self.polish or self.ollama` 又 fallback 回
-        #   ollama → off 名存實亡。加 polish_backend != "off" 讓 off 真的不跑 LLM。
-        take_polish_path = (
-            valid
-            and self.cfg.ollama_enabled
-            and getattr(self.cfg, "polish_backend", "local") != "off"
-            and self.ollama.health_ok is not False
-        )
-
         if take_polish_path:
             # 複製原文到剪貼簿的行為保留（使用者可能立即想 ⌘V 原文）；
             # 潤飾完成後會再覆蓋一次成為潤飾版。
@@ -3524,33 +3794,12 @@ class AppWindow(ctk.CTkFrame):
             self._start_polish(gen, text, target)
             return
 
-        # 不走潤飾：沿用原有「auto-copy + auto-paste 原文」流程。
-        if self.cfg.auto_copy and valid:
-            try:
-                import pyperclip
-                pyperclip.copy(text)
-            except Exception:
-                pass
-
-        if self.cfg.auto_paste and valid and self._paste_target:
-            target = self._paste_target
-            self._paste_target = None
-            # macOS 26.4+ TSM 強制主執行緒：pynput keyboard.Controller 模擬 ⌘V
-            # 必須在主 thread 呼叫，否則 TSMGetInputSourceProperty 會觸發
-            # dispatch_assert_queue_fail 直接閃退。詳見 CLAUDE.md §9.6。
-            self._do_auto_paste(text, target)
-        else:
-            # 沒走 auto-paste（auto_paste 關 / 無 target / 無效文字）也要 emit
-            # pipeline summary — 此時 paste_s 是 0、total_s ≈ transcribe_s
-            self._emit_pipeline_timing(
-                paste_outcome="skipped",
-                paste_target=None,
-                text_len=len(text) if valid else 0,
-            )
+        # 不走潤飾：複製與貼上已經在函式開頭做完（v2.32.0 改成先貼上）。
 
     # ── 潤飾管線 ────────────────────────────────────────────────────────────
 
-    def _start_polish(self, gen: int, raw_text: str, target: Optional[str]) -> None:
+    def _start_polish(self, gen: int, raw_text: str, target: Optional[str],
+                      from_history: bool = False) -> None:
         """啟動背景潤飾；完成時將於主執行緒回呼 _finish_polish。
 
         Fix Cluster B / 2026-05-23：抓 target_block ref 一起傳進 _finish_polish，
@@ -3696,7 +3945,9 @@ class AppWindow(ctk.CTkFrame):
             # 把 raw_text（= Whisper 原文）+ target_block 交給 _finish_polish
             self.after(0, self._finish_polish, gen, raw_text, target, resp, target_block)
 
-        threading.Thread(target=_run, daemon=True).start()
+        # 從歷史重新潤飾跟「最新一次錄音」無關，不掛它的編號，免得紀錄被算到那次錄音頭上
+        pid = None if from_history else self._recording_pid
+        threading.Thread(target=_with_pid(pid, _run), daemon=True).start()
 
     def _finish_polish(
         self,
@@ -4269,6 +4520,13 @@ class AppWindow(ctk.CTkFrame):
                 window_visible = True   # 取不到視窗狀態安全假設可見
             if not window_visible:
                 tick = 1000   # 看不到、1 FPS 撐著就好
+            elif not getattr(self, "_last_nsapp_active", True):
+                # v2.32.0：使用者在別的 App 裡（多數時候都是——口述完就切回去打字），
+                # 這個視窗開著但沒人在看。2026-10-05 實測閒置仍吃 20～25% CPU：每次重畫
+                # 都會連帶重畫整張玻璃底圖；審查用隔離視窗量到 200 ms 一畫 23.5%、
+                # 1000 ms 一畫 5.5%。_last_nsapp_active 由 _poll_window_visibility 每
+                # 500 ms 更新；Windows 沒有這個屬性，預設 True＝維持原行為。
+                tick = 1000
             elif self._reduce_motion:
                 tick = 500    # reduce-motion 偏好 → 大幅降頻
             else:
@@ -4683,6 +4941,31 @@ class AppWindow(ctk.CTkFrame):
     # Tail padding：停錄音前多等 N 毫秒，抓住使用者說完尾字前放開熱鍵/點按鈕
     # 的短暫餘音，避免最後一兩個字被切掉。
     TAIL_PADDING_MS = 300
+    # v2.32.0：放開時已經安靜很久了，就只多等一點點。
+    # 2026-10-05 審查：95 次錄音的最後 0.5 秒（放開前 0.2 秒＋放開後 0.3 秒）有 67% 音量低於
+    # 0.001——這些人早就講完了，0.3 秒是白等，佔蘋果辨識總等待的 26%。
+    # 刻意不降到 0：聲音從麥克風進到 App 有延遲，放開那一刻最後的聲音可能還在半路上；
+    # 留 100 ms 接住它。判斷用「放開前 0.5 秒都低於 0.001」這個嚴格標準（跟審查的統計同一條線），
+    # 寧可少省一點，也不要切到字。每次的實際情況都寫進紀錄（tail_padding 事件）以便事後驗證。
+    TAIL_PADDING_SHORT_MS = 100
+    TAIL_SILENT_RMS = 0.001
+    _tail_release_samples = None
+    _tail_padding_used_ms = None
+
+    def _tail_padding_ms(self) -> int:
+        """放開熱鍵時決定還要多錄多久。"""
+        if not IS_MAC:
+            # Windows 的麥克風延遲常比 Mac 內建大很多（MME 驅動），放開那一刻最後的字可能還在
+            # 半路上；沒有實機資料前維持原本的等待（第二輪審查）。
+            return self.TAIL_PADDING_MS
+        try:
+            import numpy as np
+            tail = self.recorder.get_tail(8_000)   # 放開前 0.5 秒
+            if tail.size >= 8_000 and float(np.sqrt(np.mean(tail * tail))) < self.TAIL_SILENT_RMS:
+                return self.TAIL_PADDING_SHORT_MS
+        except Exception:
+            pass
+        return self.TAIL_PADDING_MS
 
     def _on_record_btn(self) -> None:
         """Chamber 點擊 → 依目前狀態切換錄音（idle↔recording）。"""
@@ -4690,8 +4973,13 @@ class AppWindow(ctk.CTkFrame):
         if   self._state == "idle":
             self._transition_to_recording()
         elif self._state == "recording":
-            # Tail padding — 多錄 300ms 再停，抓尾音避免漏字
-            self.after(self.TAIL_PADDING_MS, self._try_stop)
+            # Tail padding — 多錄一段再停，抓尾音避免漏字（v2.32.0：安靜時縮短，見上方常數）
+            try:
+                self._tail_release_samples = self.recorder.sample_count()
+            except Exception:
+                self._tail_release_samples = None
+            self._tail_padding_used_ms = self._tail_padding_ms()
+            self.after(self._tail_padding_used_ms, self._try_stop)
 
     def _hotkey_tap(self) -> None:
         """HotkeyManager callback：tap 觸發（完整按下→放開算 1 次）。
@@ -5491,7 +5779,7 @@ class AppWindow(ctk.CTkFrame):
         self._frontmost_app = entry.target_app   # 讓 preset 路由走原本的 app
 
         log_action("history_repolish", id=entry.id)
-        self._start_polish(gen, entry.raw_text, target=None)
+        self._start_polish(gen, entry.raw_text, target=None, from_history=True)
 
     # ── Phase 4.3 mini 錄音窗 ──────────────────────────────────────────────
 
@@ -5756,6 +6044,7 @@ class AppWindow(ctk.CTkFrame):
                         combo_active=bool(getattr(mgr, "_combo_active", False)),
                         last_event_s_ago=last_event_s_ago,
                         watchdog_state=watchdog_state,
+                        **self._resource_snapshot(),
                     )
                 except Exception:
                     log_error("hotkey_health_snapshot_failed")
@@ -5789,11 +6078,31 @@ class AppWindow(ctk.CTkFrame):
                     pressed_count = len(getattr(mgr, "_pressed", ()))
                     combo_active  = getattr(mgr, "_combo_active", False)
                     if pressed_count > 0 or combo_active:
-                        log.info(
-                            f"HOTKEY: watchdog deferring force-restart "
-                            f"(in-flight: pressed={pressed_count}, combo_active={combo_active})"
-                        )
+                        # v2.32.0：只記「開始延後」與之後每 10 分鐘一行，不再每 5 秒一行。
+                        # 2026-10-05 審查：_pressed 常殘留已放開的鍵，延後狀態可以連續好幾
+                        # 小時（最長 20.8 小時）——這行占 App 日誌 87%（147,321 行），
+                        # 5 MB×5 的輪替只剩約 14 天可查，真正的事件被擠掉。行為本身不變。
+                        defer_since = getattr(self, "_hk_defer_since", None)
+                        if defer_since is None:
+                            self._hk_defer_since = now
+                            self._hk_defer_logged = now
+                            log.info(
+                                f"HOTKEY: watchdog deferring force-restart "
+                                f"(in-flight: pressed={pressed_count}, combo_active={combo_active})"
+                            )
+                        elif now - getattr(self, "_hk_defer_logged", now) >= 600:
+                            self._hk_defer_logged = now
+                            log.info(
+                                f"HOTKEY: watchdog still deferring force-restart "
+                                f"(for {now - defer_since:.0f}s, pressed={pressed_count})"
+                            )
                     else:
+                        defer_since = getattr(self, "_hk_defer_since", None)
+                        if defer_since is not None:
+                            log.info(
+                                f"HOTKEY: watchdog deferral ended after {now - defer_since:.0f}s"
+                            )
+                            self._hk_defer_since = None
                         log.info(
                             f"HOTKEY: watchdog force-restart (reason=periodic, "
                             f"since_last={since_restart:.0f}s)"
@@ -6135,6 +6444,7 @@ class AppWindow(ctk.CTkFrame):
                 # 暖機時若不知道使用者選了哪個語言，就只會裝繁中那份——
                 # 選 English 的人每次轉錄都會拿到「模型尚未安裝、請重開 App」，
                 # 重開之後裝的還是繁中，變成永遠修不好的死循環。
+                self.transcriber.apple_prespawn = self._apple_streaming_wanted()
                 self.transcriber.warmup(model, language=self.cfg.get_whisper_language())
                 backend = self.transcriber.active_backend()
                 label   = "⚡ Metal" if backend == "mlx" else "CPU"
@@ -6592,6 +6902,7 @@ class AppWindow(ctk.CTkFrame):
                 self.recorder.stop_device_monitor()
             except Exception:
                 log_error("stop_device_monitor_on_close_failed")
+        self._abort_apple_session()
         if self.recorder.is_recording():
             log.info("GUI: recorder still active on close — stopping")
             try:

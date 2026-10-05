@@ -398,6 +398,77 @@ def _is_apple_model(model_size: str) -> bool:
     return model_size.lower() in _APPLE_STT_MODELS
 
 
+# v2.32.0：蘋果「邊錄邊辨識」的常駐引擎，整個 App 共用一支（見 apple_stream.py）。
+# 延後建立：只用 Qwen3 的使用者完全不會開這支程式。
+_apple_stream_engine = None
+_apple_stream_engine_lock = threading.Lock()
+
+
+def _sweep_stale_apple_tmp(max_age_s: float = 3600.0) -> int:
+    """刪掉超過一小時、還留在暫存資料夾的辨識暫存檔。
+
+    蘋果整段送一次的做法要先把錄音寫成 wav，用完在 finally 刪掉；但 App 在辨識途中被關掉時
+    finally 跑不到，使用者的錄音就留在系統暫存資料夾（2026-10-05 審查用小程式重現）。
+    v2.32.0 的背景對照組在畫面閒置時跑、正好是使用者最可能關 App 的時候，所以暖機時清一次。
+    只刪自己的前綴、只刪一小時以前的：正在跑的辨識最多幾十秒，不會刪到。
+    """
+    import glob
+    import shutil
+    removed = 0
+    now = time.time()
+    for path in glob.glob(os.path.join(tempfile.gettempdir(), "whisperpro_apple_*")):
+        try:
+            if os.path.isdir(path) and now - os.path.getmtime(path) > max_age_s:
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+        except Exception:
+            pass
+    if removed:
+        log.info(f"WHISPER: removed {removed} stale apple temp dir(s)")
+    return removed
+
+
+def _get_apple_stream_engine():
+    global _apple_stream_engine
+    with _apple_stream_engine_lock:
+        if _apple_stream_engine is None:
+            from apple_stream import AppleStreamEngine
+            _apple_stream_engine = AppleStreamEngine(_APPLE_HELPER_PATH)
+        return _apple_stream_engine
+
+
+def _stream_payload_complete(payload: dict, n_samples: int) -> bool:
+    """邊錄邊辨識的結果是否涵蓋整段錄音。
+
+    只有失敗的結果不檢查（後面會照樣報錯）；欄位缺了（舊版程式）就當作完整，不擋。
+    容許 0.25 秒（約一個字）的誤差：正常情況兩邊樣本數完全一樣，留一點餘裕只是保險。
+    """
+    if not payload.get("ok"):
+        return True
+    if (payload.get("bad_chunks") or 0) > 0:
+        return False
+    got = payload.get("audio_seconds")
+    if got is None:
+        return True
+    return float(got) >= n_samples / 16_000 - 0.25
+
+
+def _backend_for(model_size: str) -> str:
+    """這個模型實際會走哪個引擎（寫進紀錄用）。
+
+    v2.32.0：transcribe() 在分派之前就有 5 個地方寫紀錄（長度閘、靜音閘、開始事件…），
+    原本都寫模組常數 BACKEND——蘋果的紀錄因此全被標成 "mlx"（2026-10-05 審查：
+    404 筆蘋果紀錄全錯），依 backend 分組的統計會把蘋果算進 MLX。
+    注意：Whisper 走 MLX 失敗會臨時降級到 CPU，那是分派後才知道的事，
+    分派區仍會覆寫 actual_backend；這裡回的是「預定」走的引擎。
+    """
+    if _is_apple_model(model_size):
+        return "apple-speech"
+    if _is_qwen3_model(model_size):
+        return "qwen3-asr"
+    return BACKEND
+
+
 def _apple_locale_for(language: Optional[str]) -> str:
     """Whisper 語言代碼 → 蘋果 locale 字串。"""
     if not language:
@@ -727,66 +798,6 @@ def _silero_speech_segments(audio, threshold: float = 0.35) -> Optional[list]:
         return None
 
 
-def _silero_speech_stats(audio, threshold: float = 0.35) -> Optional[dict]:
-    """T01-A（2026-09-05）：量測用途，算出整段音檔的 Silero VAD 語音統計。
-
-    跟 _silero_no_voice() 用同一組門檻參數（threshold / min_speech_duration_ms /
-    min_silence_duration_ms），確保這裡的 no_voice 判斷跟既有 gate 邏輯一致。
-    純觀測用途：回傳值只會被寫進 audit log，不影響任何送不送 ASR 的判斷
-    ——呼叫端不可以用這裡的回傳值做 gate 決策。
-
-    回傳 None：VAD 不可用或推論失敗（呼叫端記 silero_ran=False）。
-    回傳 dict：
-      speech_ratio  — speech segment 總長 ÷ 音檔總長（0~1）
-      segment_count — speech segment 數量
-      max_gap_s     — 最長的無語音間隔（含音檔開頭到第一段、最後一段到結尾）
-      no_voice      — len(segments) == 0
-    """
-    import numpy as np
-    model = _ensure_silero_vad()
-    if model is None:
-        return None
-    try:
-        from silero_vad import get_speech_timestamps
-        import torch
-        audio_tensor = torch.from_numpy(audio.astype(np.float32))
-        duration_s = len(audio) / 16_000
-        # T01-A（2026-09-05）：同一把 _silero_vad_lock，理由見 _silero_no_voice()。
-        with _silero_vad_lock:
-            segments = get_speech_timestamps(
-                audio_tensor,
-                model,
-                threshold=threshold,
-                sampling_rate=16_000,
-                min_speech_duration_ms=200,
-                min_silence_duration_ms=300,
-                return_seconds=True,
-            )
-        if not segments:
-            return {
-                "speech_ratio": 0.0,
-                "segment_count": 0,
-                "max_gap_s": duration_s,
-                "no_voice": True,
-            }
-        speech_total = sum(seg["end"] - seg["start"] for seg in segments)
-        gaps = [segments[0]["start"]]
-        gaps.extend(
-            segments[i + 1]["start"] - segments[i]["end"]
-            for i in range(len(segments) - 1)
-        )
-        gaps.append(duration_s - segments[-1]["end"])
-        return {
-            "speech_ratio": speech_total / duration_s if duration_s > 0 else 0.0,
-            "segment_count": len(segments),
-            "max_gap_s": max(gaps),
-            "no_voice": False,
-        }
-    except Exception as e:
-        log_error("silero_vad_stats_failed", error=str(e))
-        return None
-
-
 def _is_dict_terms_hallucination(text: str, dict_terms: Optional[list[str]] = None) -> bool:
     """v2.16.3：偵測 Qwen3-ASR 把 context= 字典詞表整段「轉錄」回來的幻覺。
 
@@ -925,6 +936,37 @@ def stitch_streaming_seams(chunks: list[str], tail: str = "") -> str:
     return "".join(parts) + (tail or "")
 
 
+# v2.32.0：純數字的重複單元不去重。
+# 這支函式原本是清「自行、自行、自行」這種辨識卡住的重複，但數字本來就常重複——
+# 2026-10-05 審查實測：「驗證碼是000000」→「驗證碼是00」、「0912121212」→「0912」、
+# 「888888元」→「88元」。驗證碼、電話、金額會被悄悄改壞，使用者不會收到任何提示。
+# 國字數字一起算：Qwen3 會把數字寫成國字（「零九一二一二一二」），一樣會中招。
+_NUMERIC_UNIT = _re_for_dedupe.compile(r"[0-9０-９零〇一二三四五六七八九十百千萬億兩點.]+")
+
+
+# 「-」也算分隔：帳號、卡號常寫成「888-888-888-888」，不算的話會被當成不是數字而砍成「888-888」
+_NUMBER_SEPARATORS = _re_for_dedupe.compile(r"[\s,，、\-－]")
+_DIGIT_CHAR = _re_for_dedupe.compile(r"[0-9０-９零〇一二三四五六七八九兩]")
+# 保留的上限：重複段落裡超過 16 個數字就不當成真的數字，照樣去重。
+# 16 = 信用卡號，日常會口述的最長數字（電話 10、身分證 10、銀行帳號多為 12～16）。
+# 為什麼要上限：辨識卡住時也會吐「1 1 1 1 1 1 1……」這種數字迴圈，全部保留的話
+# 這類垃圾就清不掉了（2026-10-05 審查）。兩種錯的代價不對稱——留下迴圈使用者看得到、
+# 會自己刪；砍掉真的號碼是悄悄改壞——所以上限取在「真號碼不會超過」的地方。
+_MAX_KEPT_NUMBER_DIGITS = 16
+
+
+def _dedupe_keep_numbers(m) -> str:
+    # 先拿掉空白與分隔符再判斷：重複單元常是「1212 」這種數字＋空格的組合，
+    # 不拿掉的話空格會讓它被當成「不是數字」而砍掉（「帳號 1212 1212 1212」→「帳號 1212」）
+    core = _NUMBER_SEPARATORS.sub("", m.group(1))
+    if core and _NUMERIC_UNIT.fullmatch(core):
+        # 至少要有一個真的數字：「點點點點點點」「....」只有小數點，不是號碼
+        digits = len(_DIGIT_CHAR.findall(m.group(0)))
+        if 0 < digits <= _MAX_KEPT_NUMBER_DIGITS:
+            return m.group(0)   # 數字：原樣保留，不砍
+    return m.group(1)
+
+
 def _dedupe_repetitive_ngrams(text: str) -> str:
     """砍掉「2-5 字 unit 連續重複 ≥ 3 次」的退化輸出，保留首次出現。
 
@@ -933,12 +975,13 @@ def _dedupe_repetitive_ngrams(text: str) -> str:
       「測試 測試 測試 OK」→「測試 OK」
       「我我我」→ 不動（unit_len=1 不檢查）
       「我會、我會」→ 不動（只重複 2 次、未達 3 次）
+      「000000」「0912121212」→ 不動（v2.32.0：數字不去重）
     """
     if not text or len(text) < 6:
         return text
     out = text
     for pattern in _DEDUPE_PATTERNS:
-        out = pattern.sub(r'\1', out)
+        out = pattern.sub(_dedupe_keep_numbers, out)
     return out
 
 
@@ -1146,8 +1189,13 @@ class Transcriber:
         model_size: str = "base",
         language: Optional[str] = None,
         chinese_variant: str = "off",   # v2.14.0：Qwen3-ASR 配套（Whisper 不受影響）
+        apple_stream_result: Optional[dict] = None,   # v2.32.0：邊錄邊辨識已經算好的結果
     ) -> TranscriptionResult:
         """執行完整轉錄（阻塞呼叫，應在背景執行緒執行）。
+
+        apple_stream_result（v2.32.0）：蘋果常駐引擎在錄音當下就辨識完的結果。給了就不再
+        呼叫 Swift 小程式，但前面的靜音閘、後面的換字／去重／紀錄照樣全部走——所以
+        「邊錄邊辨識」跟「整段送一次」出來的文字經過完全相同的處理。
 
         Args:
             audio:      float32 numpy 陣列，振幅 [-1.0, 1.0]，16 kHz 單聲道。
@@ -1201,7 +1249,7 @@ class Transcriber:
                 quality={"peak": 0.0, "rms": 0.0, "rms_first_500ms": 0.0,
                          "rms_last_500ms": 0.0, "clipping_ratio": 0.0,
                          "samples": 0, "duration_s": 0.0},
-                duration=0.0, backend=BACKEND, result=None,
+                duration=0.0, backend=_backend_for(model_size), result=None,
                 dict_terms_snapshot=[], gate_short=False, gate_silent=False,
                 error="empty_audio",
                 breakdown=self._make_breakdown(
@@ -1235,11 +1283,11 @@ class Transcriber:
         duration = len(audio) / 16_000
         t0 = time.perf_counter()
         log.info(
-            f"WHISPER: Starting transcription. Backend={BACKEND}, Model={model_size}, "
+            f"WHISPER: Starting transcription. Backend={_backend_for(model_size)}, Model={model_size}, "
             f"Lang={language}, AudioDuration={duration:.2f}s"
         )
         _safe_pipeline_event(
-            "transcribe_start", backend=BACKEND, model=model_size,
+            "transcribe_start", backend=_backend_for(model_size), model=model_size,
             duration_s=duration, language=language or "",
         )
 
@@ -1256,7 +1304,7 @@ class Transcriber:
             t_prep_end = time.perf_counter()
             self._emit_audit(
                 pid=pid, model_size=model_size, language=language,
-                quality=quality, duration=duration, backend=BACKEND,
+                quality=quality, duration=duration, backend=_backend_for(model_size),
                 result=None, dict_terms_snapshot=[],
                 gate_short=True, gate_silent=False,
                 elapsed=time.perf_counter() - t0,
@@ -1282,7 +1330,7 @@ class Transcriber:
             t_prep_end = time.perf_counter()
             self._emit_audit(
                 pid=pid, model_size=model_size, language=language,
-                quality=quality, duration=duration, backend=BACKEND,
+                quality=quality, duration=duration, backend=_backend_for(model_size),
                 result=None, dict_terms_snapshot=[],
                 gate_short=False, gate_silent=True,
                 elapsed=time.perf_counter() - t0,
@@ -1297,19 +1345,10 @@ class Transcriber:
                 elapsed_seconds=time.perf_counter() - t0,
             )
 
-        # T01-A（2026-09-05）：量測用，不影響任何 gate 行為——照樣送 ASR，只是多記
-        # 幾個數字。刻意跑在下面 941 行那道閘的「duration <= 4.0」限制之外、不分
-        # 秒數都算一次，才能回答「10-12 秒的串流 chunk 到底像不像人聲」
-        # （那道閘因為 duration<=4.0 的限制，串流 chunk 永遠不會走到 _silero_no_voice()）。
-        silero_stats = (
-            _silero_speech_stats(audio, self._silero_vad_threshold)
-            if self._silero_vad_enabled else None
-        )
-        quality["silero_speech_ratio"] = silero_stats["speech_ratio"] if silero_stats else None
-        quality["silero_segment_count"] = silero_stats["segment_count"] if silero_stats else None
-        quality["silero_max_gap_s"] = silero_stats["max_gap_s"] if silero_stats else None
-        quality["silero_ran"] = silero_stats is not None
-        quality["silero_no_voice"] = silero_stats["no_voice"] if silero_stats else None
+        # v2.32.0：拿掉 T01-A（2026-09-05）的量測。它每次轉錄都多跑一次 Silero，結果只寫進
+        # 紀錄、不影響任何判斷；T01 已用 12 天資料結論為不做（攔截率 2～6%、門檻拉高一半是誤殺），
+        # 量測就沒有理由繼續付成本（審查實測每次約 35 ms）。同一個 commit 補上的
+        # _silero_vad_lock（_silero_no_voice 裡）是真的 bug 修正，保留。
 
         # v2.19.x Silero VAD gate：抓「有能量但非人聲」的雜音。
         # 放在 RMS gate 之後——RMS 砍掉真靜音、Silero 砍掉鍵盤/紙張/冷氣/背景音樂。
@@ -1354,11 +1393,7 @@ class Transcriber:
 
         # v2.19.0：實際走的 backend（fallback 後會改、影響 audit 與可疑音檔 metadata）
         # v2.31.0：加入 apple-speech（第四種）
-        actual_backend = (
-            "apple-speech" if _is_apple_model(model_size)
-            else "qwen3-asr" if _is_qwen3_model(model_size)
-            else BACKEND
-        )
+        actual_backend = _backend_for(model_size)
 
         # v2.31.0：蘋果原生辨識走 Swift helper（模型在 OS 裡、本 process 不載權重）
         if _is_apple_model(model_size):
@@ -1383,7 +1418,8 @@ class Transcriber:
                 )
             try:
                 result = self._transcribe_apple(
-                    audio, model_size, language, dict_terms_snapshot, chinese_variant
+                    audio, model_size, language, dict_terms_snapshot, chinese_variant,
+                    precomputed=apple_stream_result,
                 )
             except Exception as exc:
                 # 與 Qwen3 一樣沒有 fallback：這是使用者明確選的後端，
@@ -1777,6 +1813,7 @@ class Transcriber:
             ),
             context=context,                          # v2.20.3 N2
             dict_effectiveness=dict_effectiveness,    # v2.20.3 N4
+            apple_meta=getattr(result, "apple_meta", None),   # v2.32.0
         )
 
         # v2.19.0：可疑音檔保留（在 audit 寫完後才做、避免兩者互相干擾）。
@@ -1834,6 +1871,7 @@ class Transcriber:
         breakdown: Optional[dict] = None,
         context: Optional[dict] = None,                  # v2.20.3 N2：cold/warm 推斷狀態
         dict_effectiveness: Optional[dict] = None,        # v2.20.3 N4：terms_in_text + corrections_hit
+        apple_meta: Optional[dict] = None,                # v2.32.0：蘋果是否邊錄邊辨識、引擎收尾耗時
     ) -> None:
         """組 audit entry + 寫 JSONL；任何錯誤都吞掉、絕不讓 transcribe() 失敗。
 
@@ -1886,11 +1924,6 @@ class Transcriber:
                     "rms_last_500ms": float(quality.get("rms_last_500ms", 0.0)),
                     "clipping_ratio": float(quality.get("clipping_ratio", 0.0)),
                     "samples": int(quality.get("samples", 0)),
-                    # T01-A（2026-09-05）：量測欄位，None = 沒算到（VAD 關閉／不可用／
-                    # 提早 return 於此量測點之前，例如 empty_audio、duration_short、rms_silent）。
-                    "silero_speech_ratio": quality.get("silero_speech_ratio"),
-                    "silero_segment_count": quality.get("silero_segment_count"),
-                    "silero_max_gap_s": quality.get("silero_max_gap_s"),
                 },
                 "backend": backend,
                 "model": model_size,
@@ -1899,19 +1932,19 @@ class Transcriber:
                 "rtf": float(rtf_val),
                 # v2.20.1 新增：細分時段（ms） + 真實推論 RTF
                 "breakdown": breakdown_dict,
+                # v2.32.0：蘋果才有；streamed=是否邊錄邊辨識，engine_ms=引擎本身耗時
+                # （串流時是放開後的收尾時間，單次時是 helper 內部計時、不含開程式）
+                "apple": apple_meta,
                 "inference_rtf": float(inference_rtf),
                 "gates": {
                     "duration_short": bool(gate_short),
                     "rms_silent": bool(gate_silent),
-                    # v2.19.x：Silero VAD 在 941 行那道閘觸發時 transcribe() 直接
-                    # return、不會走到 _emit_audit，所以「被那道閘擋下」這件事本來
-                    # 就不會出現在 transcribe entry 裡；真實 VAD block 統計請看
-                    # audit_log 的 silero_vad_block events。
-                    # T01-A（2026-09-05）：這裡原本寫死 False 當佔位，改記
-                    # _silero_speech_stats() 的真實結果——None = 沒算到（VAD 關閉／
-                    # 不可用／提早 return 於量測點之前）。
-                    "silero_no_voice": quality.get("silero_no_voice"),
-                    "silero_ran": bool(quality.get("silero_ran", False)),
+                    # v2.19.x：Silero VAD 觸發時 transcribe() 直接 return、不會走到
+                    # _emit_audit，所以這個欄位在 transcribe entry 裡永遠是 False；
+                    # 真實 VAD block 統計請看 audit_log 的 silero_vad_block events。
+                    # 留欄位讓未來 schema 完整（避免 jq filter 寫 .gates.silero_no_voice 找不到）。
+                    # （v2.32.0 拿掉 T01-A 量測後恢復成這個佔位寫法；silero_ran 一併移除。）
+                    "silero_no_voice": False,
                     "is_warmup": False,   # 標記給未來 warmup 路徑；此 emit 點固定 False
                 },
                 "raw_text": raw_text or final_text or "",
@@ -2105,6 +2138,17 @@ class Transcriber:
         """
         # v2.31.0：蘋果原生辨識——這裡是唯一會觸發模型下載的地方（見 _warmup_apple）
         if _is_apple_model(model_size):
+            # v2.32.0：切到蘋果就把本機模型（Qwen3／Whisper）的權重放掉。
+            # 2026-10-05 審查：unload() 全專案沒有呼叫端，從 Qwen3 切到蘋果後權重一直留著
+            # （0.6B 約 3.6 GB、1.7B 約 6.3 GB），日誌最長佔了 68 小時。蘋果的模型在作業系統裡，
+            # 這些權重切過去之後完全用不到。
+            # 先拿 _transcription_lock：_transcribe_qwen3／_mlx／_ctranslate 推論時都拿著它，
+            # 拿到鎖 = 沒有轉錄在用這些權重，此時刪掉才不會讓正在跑的推論當掉。
+            # 鎖的順序跟推論路徑一樣（_transcription_lock → unload 內的 _lock），不會互卡。
+            if self._model is not None or self._qwen3_session is not None:
+                with self._transcription_lock:
+                    log.info("WHISPER: switched to apple-speech, unloading local model weights")
+                    self.unload()
             self._warmup_apple(model_size, language)
         # v2.14.0：Qwen3-ASR 走獨立 backend
         elif _is_qwen3_model(model_size):
@@ -2610,8 +2654,12 @@ class Transcriber:
         language: Optional[str],
         dict_terms: Optional[list[str]] = None,
         chinese_variant: str = "off",
+        precomputed: Optional[dict] = None,
     ) -> TranscriptionResult:
         """用 macOS 26 內建引擎轉錄（模型在系統裡、這個 process 不載任何權重）。
+
+        precomputed（v2.32.0）：邊錄邊辨識已經拿到的 helper 結果，跳過寫檔與呼叫程式，
+        直接進入後面同一套整理流程。
 
         與其他三個後端的差異：
           • 沒有 lazy load、沒有 RAM 佔用——模型歸 OS 管，unload() 不需要處理它
@@ -2620,9 +2668,6 @@ class Transcriber:
 
         暫存 wav 一定要刪：那是使用者的真實語音，不能留在 /tmp。
         """
-        import numpy as np
-        import soundfile as sf
-
         # 0 影格的 wav 會讓 helper 的 results 串流永遠等不到結束訊號、整支掛住，
         # 只能靠 subprocess timeout 殺掉——使用者白等 20 秒才看到失敗。
         # 上游的空音訊／時長／RMS 三道閘理論上擋得住，這裡是最後一道保險。
@@ -2632,6 +2677,28 @@ class Transcriber:
         engine = _APPLE_STT_MODELS.get(model_size.lower(), "speech")
         locale = _apple_locale_for(language)
         terms = [t for t in (dict_terms or []) if t][:_APPLE_MAX_TERMS]
+
+        if precomputed is not None and not _stream_payload_complete(precomputed, len(audio)):
+            # 常駐程式收到的聲音比整段錄音短——直接用會少字、而且不會有任何提示。
+            # 「程式自己漏收」已經在 AppleStreamSession 擋掉了；這裡擋的是這一端沒交出去的
+            # （例如掛勾晚掛上），只有拿整段錄音來比才看得出來。整段重送一次只多花約 0.5 秒。
+            log.warning(
+                f"APPLE_STREAM: incomplete result (got {precomputed.get('audio_seconds')}s of "
+                f"{len(audio) / 16_000:.2f}s, bad_chunks={precomputed.get('bad_chunks')}), "
+                f"falling back to one-shot"
+            )
+            precomputed = None
+        if precomputed is not None:
+            payload = precomputed
+        else:
+            payload = self._run_apple_oneshot(audio, engine, locale, terms)
+        return self._finish_apple_payload(payload, audio, model_size, engine, locale,
+                                          chinese_variant, streamed=precomputed is not None)
+
+    def _run_apple_oneshot(self, audio, engine: str, locale: str, terms: list) -> dict:
+        """舊做法：整段寫成暫存 wav、呼叫一次 Swift 小程式。邊錄邊辨識失敗時的備援。"""
+        import numpy as np
+        import soundfile as sf
 
         tmp_dir = tempfile.mkdtemp(prefix="whisperpro_apple_")
         wav_path = os.path.join(tmp_dir, "audio.wav")
@@ -2664,7 +2731,11 @@ class Transcriber:
                 os.rmdir(tmp_dir)
             except Exception:
                 pass
+        return payload
 
+    def _finish_apple_payload(self, payload: dict, audio, model_size: str, engine: str,
+                              locale: str, chinese_variant: str, *, streamed: bool) -> TranscriptionResult:
+        """helper 結果 → 整理好的 TranscriptionResult（兩種做法共用）。"""
         if not payload.get("ok"):
             code = payload.get("error", "unknown")
             log_error("apple_backend_failed", model=model_size)
@@ -2702,13 +2773,22 @@ class Transcriber:
         # 結果卡片與歷史資料庫的這個欄位由四個後端共寫，格式混用會讓之後
         # 依語言篩選的查詢漏掉一半資料。
         raw_locale = payload.get("locale") or locale
-        return TranscriptionResult(
+        result = TranscriptionResult(
             text=text,
             language=raw_locale.replace("-", "_").split("_")[0].lower(),
             duration_seconds=0.0,   # 由呼叫端 transcribe() 填入
             elapsed_seconds=0.0,
             segments=[],
         )
+        # v2.32.0：寫進紀錄用。原本的紀錄分不出「蘋果引擎本身花多久」與「開程式、寫檔」
+        # 各佔多少（審查只能用回歸線推算固定成本），也分不出這次是哪種做法。
+        # 掛在結果物件上而不是存在 self：串流切段時多個轉錄可能同時在跑。
+        result.apple_meta = {
+            "streamed": streamed,
+            "engine_ms": payload.get("tail_ms") if streamed else payload.get("elapsed_ms"),
+            "segments": len(parts) if isinstance(parts, list) else None,
+        }
+        return result
 
     def _repair_glued_digits(self, audio, text: str, engine: str, locale: str) -> str:
         """一長串數字被蘋果黏在一起時，照停頓切開、分段重問，補回逗號（修狀況 ③）。
@@ -2780,6 +2860,101 @@ class Transcriber:
         )
         return repaired
 
+    def _prepare_apple_extras(self, probe: dict, locale: str) -> None:
+        """v2.32.0 暖機附帶工作：①先把常駐程式開起來（約 0.2 秒，不放到第一次錄音才付）
+        ②清掉上次沒刪成的暫存錄音。
+
+        刻意不在這裡登記聽寫引擎（對照組用）：暖機每個蘋果使用者都會跑、對照組 10/19 就停，
+        在這裡登記等於每個人都可能被下載一個用不到的模型。改成對照組第一次真的遇到
+        「沒登記」時才登記（見 run_apple_shadow）。"""
+        # 使用者關掉串流（或開了潤飾）時不開：關掉的開關要真的把這支程式關掉，
+        # 懷疑它出問題時才有辦法排除（2026-10-05 審查）
+        if self.apple_prespawn:
+            try:
+                _get_apple_stream_engine().channel()
+            except Exception:
+                log_error("apple_stream_prespawn_failed")
+        _sweep_stale_apple_tmp()
+
+    def start_apple_stream(self, model_size: str, language: Optional[str]):
+        """錄音開始時呼叫：回一個 AppleStreamSession，錄音期間把聲音交給它。
+
+        不是蘋果模型、不在 macOS、或建不起來 → 回 None，呼叫端照舊做法（錄完整段送）。
+        """
+        if not IS_MAC or not _is_apple_model(model_size):
+            return None
+        try:
+            from apple_stream import AppleStreamSession
+            engine = _get_apple_stream_engine()
+            if not engine.available():
+                return None   # 連續失敗、冷卻中（見 AppleStreamEngine.FAIL_STREAK_LIMIT）
+            return AppleStreamSession(engine, _apple_locale_for(language))
+        except Exception:
+            log_error("apple_stream_start_failed")
+            return None
+
+    def run_apple_shadow(self, audio, language: Optional[str], pid: str) -> None:
+        """第三階段的對照組：用「聽寫引擎」把同一段錄音再辨識一次，只寫進紀錄、不給使用者。
+
+        為什麼要：2026-10-05 合成語音實驗，聽寫引擎中文較準（紫微斗數對、繁體原生正確），
+        但會把句中英文吃掉；合成語音的英文發音很差，不能下結論，要拿使用者真人錄音比。
+        App 為了隱私不存錄音，所以只能在錄音當下兩個都跑、把兩份文字記下來，事後比對。
+
+        為什麼在貼上之後才跑、而不是跟主引擎同時：同一個分析器多掛聽寫引擎，放開後等待從
+        0.20～0.28 秒變 0.33～0.38 秒（2026-10-05 實測），使用者不該替對照組多等。
+        由呼叫端在背景執行緒呼叫；失敗只寫紀錄，不影響任何東西。
+        """
+        if _audit_log is None:
+            return
+        try:
+            locale = _apple_locale_for(language)
+            payload = self._run_apple_oneshot(audio, "dictation", locale, [])
+            if payload.get("error") == "asset_not_installed":
+                self._register_dictation_asset(locale)
+            parts = payload.get("parts")
+            text = _join_apple_parts(parts) if isinstance(parts, list) else (payload.get("text") or "")
+            _audit_log.write_event(
+                "apple_shadow", pid,
+                engine="dictation",
+                ok=bool(payload.get("ok")),
+                error=payload.get("error"),
+                # 原樣記下（不做簡轉繁重整、不套換字規則）：要比的是兩個引擎本身的辨識結果
+                text=text.strip(),
+                engine_ms=payload.get("elapsed_ms"),
+            )
+        except Exception:
+            log_error("apple_shadow_failed")
+
+    _dictation_register_lock = threading.Lock()
+    _dictation_register_tried = False
+    # 暖機時要不要先把常駐程式開好；由 gui 依設定決定（見 AppWindow._apple_streaming_wanted）
+    apple_prespawn = True
+
+    def _register_dictation_asset(self, locale: str) -> None:
+        """聽寫引擎沒登記：登記一次（新編譯的程式第一次用都要，通常瞬間完成）。
+        這次的對照組照樣記成失敗，下一次錄音就有了。整個 App 只試一次，失敗不重試。"""
+        with Transcriber._dictation_register_lock:
+            if Transcriber._dictation_register_tried:
+                return
+            Transcriber._dictation_register_tried = True
+        import numpy as np
+        import soundfile as sf
+        tmp_dir = tempfile.mkdtemp(prefix="whisperpro_apple_warm_")
+        wav_path = os.path.join(tmp_dir, "warm.wav")
+        try:
+            sf.write(wav_path, np.zeros(8000, dtype="float32"), 16_000, subtype="FLOAT", format="WAV")
+            r = self._run_apple_helper(["--audio", wav_path, "--locale", locale,
+                                        "--engine", "dictation", "--allow-download"], timeout=600.0)
+            log.info(f"WHISPER: dictation asset register ok={r.get('ok')} error={r.get('error')}")
+        except Exception:
+            log_error("apple_dictation_register_failed")
+        finally:
+            try:
+                os.remove(wav_path)
+                os.rmdir(tmp_dir)
+            except Exception:
+                pass
+
     def _warmup_apple(self, model_size: str, language: Optional[str] = None) -> None:
         """探測引擎狀態；模型沒裝就趁現在裝。
 
@@ -2805,6 +2980,7 @@ class Transcriber:
             f"asset={status}"
         )
         if status == "installed":
+            self._prepare_apple_extras(probe, locale)
             return
 
         # 用一段極短的靜音觸發安裝，順便把引擎第一次啟動的成本付掉
@@ -2823,6 +2999,7 @@ class Transcriber:
             )
             if result.get("ok"):
                 log.info("WHISPER: 蘋果辨識模型就緒")
+                self._prepare_apple_extras(probe, locale)
             else:
                 log_error("apple_warmup_install_failed")
         except Exception:
