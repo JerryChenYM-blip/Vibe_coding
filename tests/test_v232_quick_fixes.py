@@ -114,7 +114,7 @@ def _fake_window(monkeypatch, *, polish: bool):
     win._do_auto_paste = lambda text, target: order.append("paste")
     win._apply_toggle_style = lambda: None
     win._emit_pipeline_timing = lambda **k: order.append("timing")
-    win._start_polish = lambda gen, text, target: order.append("polish")
+    win._start_polish = lambda gen, text, target, **k: order.append("polish")
     monkeypatch.setattr(gui, "_pipe_event", lambda *a, **k: None)
     return gui, win, order
 

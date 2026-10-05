@@ -3623,6 +3623,10 @@ class AppWindow(ctk.CTkFrame):
                 if failed:
                     result.failed_segments = failed
                     result.total_segments = len(prior) + 1
+                # v2.32.2：記下真正接上去的尾段原文，給邊錄邊潤飾用。潤飾端原本用「全文長度 − 各段
+                # 長度」推算尾段，但上面縫合會拿掉接縫的假句號、全文變短，切的位置往後偏，尾段開頭
+                # 的字就被吃掉（「然後回家吃飯。」只送出「家吃飯。」）。
+                result.stream_tail = tail
             self.after(0, self._on_transcription_done, result)
         except Exception as e:
             log_error("transcription_failed", model=model, error=str(e))
@@ -3889,7 +3893,8 @@ class AppWindow(ctk.CTkFrame):
                 self._do_auto_paste(text, target)
                 target = None   # 告訴 _start_polish/_finish_polish 不要再 paste 第二次
 
-            self._start_polish(gen, text, target)
+            self._start_polish(gen, text, target,
+                               stream_tail=getattr(result, "stream_tail", None))
             return
 
         # 不走潤飾：複製與貼上已經在函式開頭做完（v2.32.0 改成先貼上）。
@@ -3897,7 +3902,7 @@ class AppWindow(ctk.CTkFrame):
     # ── 潤飾管線 ────────────────────────────────────────────────────────────
 
     def _start_polish(self, gen: int, raw_text: str, target: Optional[str],
-                      from_history: bool = False) -> None:
+                      from_history: bool = False, stream_tail: Optional[str] = None) -> None:
         """啟動背景潤飾；完成時將於主執行緒回呼 _finish_polish。
 
         Fix Cluster B / 2026-05-23：抓 target_block ref 一起傳進 _finish_polish，
@@ -3961,8 +3966,12 @@ class AppWindow(ctk.CTkFrame):
 
         # v2.17.0：streaming polish 條件 — 只 default preset 用、action preset
         # (翻英文/條列/會議紀錄) 走原 full-text path（需看全文 context）
+        # v2.32.2：還要有這次錄音合併時的尾段（stream_tail）。沒有就整篇潤飾——
+        # 從歷史重新潤飾時，計數器還是上一次錄音的，原本會把上一次錄音的潤飾段落接到這一筆
+        # 前面、整筆換成別次錄音的內容；不知道尾段時也不再用長度去猜。
         use_streaming_polish = (
-            self._stream_polish_dispatched > 0
+            stream_tail is not None
+            and self._stream_polish_dispatched > 0
             and preset_name == "default"
         )
         # v2.18.2：標記 polish_mode 給 _emit_pipeline_timing 用（Agent 4 P2）
@@ -3970,24 +3979,46 @@ class AppWindow(ctk.CTkFrame):
         # blocking  = polish_s 反映完整 polish 工作量
         self._pipeline_polish_mode = "streaming" if use_streaming_polish else "blocking"
 
+        # v2.32.2：在這裡（主執行緒、這次錄音的資料還在）先抓住這次錄音的各段。背景執行緒原本
+        # 等的時候才讀 self._stream_*；使用者這時開始新的錄音，那些欄位會被換成新錄音的空資料，
+        # 這次的潤飾版就只剩最後一段（審查重現）。polished_slots 抓的是 list 本身：各段潤飾的執行緒
+        # 只在 generation 沒變時寫回，寫的就是這個 list。
+        stream_gen = chunks_raw = polished_slots = polish_dispatched = None
+        if use_streaming_polish:
+            stream_gen        = self._stream_generation
+            chunks_raw        = list(self._stream_chunks)
+            polished_slots    = self._stream_polished
+            polish_dispatched = self._stream_polish_dispatched
+
         def _run():
             if use_streaming_polish:
-                # 等所有背景 polish chunks 完成（30s deadline 保險）
+                # 等所有背景 polish chunks 完成（30s deadline 保險）；新的錄音開始了就不用等
+                # （generation 變了，舊的段落潤飾完也不會寫回來）
                 deadline = time.time() + self.STREAM_CHUNK_JOIN_TIMEOUT_S
-                while self._stream_polish_completed < self._stream_polish_dispatched:
+                while (self._stream_generation == stream_gen
+                       and self._stream_polish_completed < polish_dispatched):
                     if time.time() > deadline:
                         log.warning(
                             f"STREAM_POLISH: timeout waiting "
-                            f"(done={self._stream_polish_completed}/{self._stream_polish_dispatched})"
+                            f"(done={self._stream_polish_completed}/{polish_dispatched})"
                         )
                         break
                     time.sleep(0.05)
 
-                streamed_polished = "".join(p for p in self._stream_polished if p)
-                streamed_raw      = "".join(c for c in self._stream_chunks   if c)
-                # 推算 tail = llm_input 比 streamed_raw 多出來的尾段
-                # （length-based、簡單但可能因 corrections / opencc 微差）
-                tail_raw = llm_input[len(streamed_raw):] if len(llm_input) > len(streamed_raw) else ""
+                # v2.32.2：每一段都要在：沒潤飾到的（等太久、潤飾服務沒設定好、被新錄音打斷）就用
+                # 那段原文。原本只接「有潤飾結果的」，沒潤飾到的段落整段從潤飾版消失，貼出去的
+                # 文字少一大段、沒有任何提示（審查重現：服務沒設定好時只剩最後一句）。
+                parts, unpolished = [], 0
+                for i, raw in enumerate(chunks_raw):
+                    polished = polished_slots[i] if i < len(polished_slots) else ""
+                    if raw and not polished:
+                        unpolished += 1
+                    parts.append(polished or raw)
+                if unpolished:
+                    log.warning(f"STREAM_POLISH: {unpolished} chunk(s) not polished, using raw text")
+                streamed_polished = "".join(parts)
+                # v2.32.2：用合併時真正接上去的尾段，不再用長度推算（見 _run_transcription）
+                tail_raw = stream_tail
 
                 if tail_raw.strip() and self.polish is not None:
                     # v2.21.0 Phase B4：off 模式 self.polish=None、不再 fallback 回
@@ -4010,7 +4041,7 @@ class AppWindow(ctk.CTkFrame):
 
                 combined_polished = streamed_polished + tail_polished
                 log.info(
-                    f"STREAM_POLISH: merged {self._stream_polish_dispatched} chunks "
+                    f"STREAM_POLISH: merged {len(chunks_raw)} chunks "
                     f"+ tail (final {len(combined_polished)} chars)"
                 )
                 # 合成 OllamaResponse（沿用 _finish_polish 既有 contract）
