@@ -343,6 +343,7 @@ def _run_win(monkeypatch, *, streamed, shadow_on=True):
     win._la_buffer = None
     win._stream_dispatched = 0
     win._stream_chunks = []
+    win._stream_failed = []
     win._full_audio_s = 1.0
     win.cfg = types.SimpleNamespace(chinese_variant="off")
     win._apple_shadow_active = lambda: shadow_on

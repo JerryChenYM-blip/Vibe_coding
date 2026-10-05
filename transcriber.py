@@ -285,6 +285,23 @@ def is_system_message(text: str) -> bool:
     return "\n" not in t and t.startswith("（") and t.endswith("）")
 
 
+# 「這段本來就沒聲音／沒講話」的系統訊息——不是失敗。長錄音中間停頓十幾秒很正常，
+# 那一段回這句不能跳「有段落沒辨識出來」的警告。
+_NO_SPEECH_MESSAGES = frozenset({
+    "（未偵測到語音內容）",
+    "（沒有偵測到音訊，請確認麥克風是否正常運作）",
+})
+
+
+def is_failure_message(text: str) -> bool:
+    """系統訊息裡，代表「辨識失敗」的那些（v2.32.1，長錄音部分失敗提示用）。
+
+    刻意反過來列「不算失敗」的，其他「（…）」一律當失敗：以後新增一種失敗訊息、忘了登記，
+    最壞是多跳一次警告；反過來列失敗訊息的話，忘了登記就會把失敗藏起來——正是這次要修的事。
+    """
+    return is_system_message(text) and text.strip() not in _NO_SPEECH_MESSAGES
+
+
 # 全形標點前面的空白。蘋果引擎會在中文與全形標點之間插一個空格
 # （「語音辨識引擎 ，看看」），2026-09-17 實測 16 筆有效輸出中 13 筆有這個問題（81%），
 # 同時段 Qwen3 的 51 筆是 0%。這是排版瑕疵不是辨識錯誤，但每一句都會出現。

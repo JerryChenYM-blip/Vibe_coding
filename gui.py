@@ -49,7 +49,8 @@ import dictionary as _dictionary
 from history import HistoryStore
 from prompt_reloader import PromptReloader
 from recorder import AudioRecorder
-from transcriber import Transcriber, TranscriptionResult, is_system_message, _is_apple_model, _MIN_RMS
+from transcriber import (Transcriber, TranscriptionResult, is_system_message, is_failure_message,
+                         _is_apple_model, _MIN_RMS)
 from icons import get_icon, get_canvas_icon
 from animation import blend, breathe, ease_in_out_cubic, Ripple
 from waveform import WaveformEngine
@@ -989,6 +990,7 @@ class AppWindow(ctk.CTkFrame):
         #   功能（統計、UI 顯示、錄音長度判斷）全部說謊，所以在拿得到
         #   full_audio 的當下就把真實長度記起來。
         self._stream_chunks:  list[str] = []   # 按 chunk index 排序、placeholder "" 占位
+        self._stream_failed:  list[int] = []   # v2.32.1：辨識失敗的 chunk index（給「部分失敗」提示）
         self._stream_tick_id            = None
         # v2.16.0 streaming：dispatch / complete 計數、_run_transcription 用來等
         # 所有背景 chunk 推論完成才合併。Index-based 寫進 _stream_chunks 確保順序。
@@ -2513,6 +2515,11 @@ class AppWindow(ctk.CTkFrame):
         self._model_menu.configure(state="disabled")
         self._lang_menu.configure(state="disabled")
         self._set_status("錄音中", DANGER)
+        # v2.32.1：狀態列上一次留下的提示（轉錄失敗、有段落沒辨識出來、麥克風打不開）講的是
+        # 上一次的事，新的錄音成功開始就收掉、換回音量條。原本只有模型重新暖機才會收，提示會
+        # 一直掛著，之後每次正常的錄音看起來都像出了問題。暖機中的進度條不動。
+        if self._skeleton_mode and getattr(self, "_status_slot_active", None) == "banner":
+            self._status_slot_show_meter()
 
         self._update_timer()
         # v2.16.0：streaming 轉錄啟用（邊講邊轉、長段語音放開後幾乎立即出結果）
@@ -2525,6 +2532,9 @@ class AppWindow(ctk.CTkFrame):
         self._stream_polish_dispatched = 0
         self._stream_polish_completed  = 0
         self._stream_generation += 1
+        # v2.32.1：在 generation 往前推之後才清——上一次錄音還沒結束的段落，檢查 generation 時
+        # 就會發現不對、不會寫進這次的失敗清單
+        self._stream_failed = []
 
         # v2.19.x LocalAgreement-2 path（experimental、躲在 config flag 後、預設關）。
         # 預設值 cfg.streaming_algo == "fixed_chunk" → _la_buffer 維持 None、
@@ -2985,6 +2995,43 @@ class AppWindow(ctk.CTkFrame):
         except Exception:
             return {}
 
+    @staticmethod
+    def _done_toast_text(result, valid: bool) -> str:
+        """「轉錄完成」提示。有段落沒辨識出來就寫在同一則裡——另外跳一則會跟貼上失敗的提示
+        疊在同一個位置互相蓋掉。"""
+        msg = f"轉錄完成 · {result.elapsed_seconds:.1f}s"
+        n = getattr(result, "failed_segments", 0)
+        if n and valid:
+            msg += f"（有 {n} 段沒辨識出來）"
+        return msg
+
+    def _notify_partial_failure(self, result, valid: bool) -> None:
+        """v2.32.1：長錄音有段落沒辨識出來時，錄音小窗閃一下提醒，狀態列留一條提示。
+
+        要在回到閒置之後才放：回到閒置會收起小窗、換掉狀態列。結果卡上另有「N 段沒辨識出來」
+        標籤（_display_result_skeleton），之後打開視窗也查得到。紀錄在函式開頭就寫了。"""
+        n = getattr(result, "failed_segments", 0)
+        if not n:
+            return
+        # 錄音小窗：使用者這時多半在別的 App 打字，主視窗被蓋在後面，提示與狀態列都看不到；
+        # 只有這個浮動小窗跨 App 看得到（審查指出）。顯示幾秒後自己收起。
+        mini = getattr(self, "_mini_window", None)
+        if mini is not None:
+            try:
+                mini.show_warning(f"{n} 段沒辨識出來" if valid else "辨識失敗")
+            except Exception:
+                log_error("partial_failure_hud_failed")
+        if not self._skeleton_mode:
+            return
+        msg = f"有 {n} 段沒辨識出來，結果可能不完整" if valid else "辨識失敗，請查看日誌"
+        try:
+            self._status_slot_show_banner(
+                msg, action_label="開啟日誌",
+                action_cb=lambda: _open_path_in_os_default(os.path.expanduser("~/.whisper_app/logs")),
+            )
+        except Exception:
+            log_error("partial_failure_banner_failed")
+
     def _start_pending_shadow(self, result, valid: bool) -> None:
         """v2.32.0：貼上之後才開跑對照組。被擋下的結果（太短、沒聲音）不跑——沒東西可比。
         不管跑不跑都把工作從結果上拿掉：結果之後會留在畫面與歷史裡，錄音不能跟著留在記憶體。"""
@@ -3161,6 +3208,10 @@ class AppWindow(ctk.CTkFrame):
                 # Generation guard：若 user 已開新 recording、上輪 chunk 結果丟棄
                 # 否則寫進 index（單一 writer per slot、不需鎖）
                 if self._stream_generation == gen:
+                    # v2.32.1：失敗的段落記下來。原本只把它變成空白，合併後少了一段、使用者看不出來。
+                    # 「沒講話」不算（停頓十幾秒很正常），見 is_failure_message。list.append 是原子操作。
+                    if is_failure_message(r.text):
+                        self._stream_failed.append(idx)
                     self._stream_chunks[idx] = text
                     # v2.24.0 看門狗：這個 chunk 有真實語音 → 刷新「最後聽到語音」
                     #   時間戳（float 賦值原子、背景執行緒直接寫安全）。
@@ -3178,6 +3229,8 @@ class AppWindow(ctk.CTkFrame):
                     log.info(f"STREAMING: chunk[{idx}] dropped (generation mismatch)")
             except Exception:
                 log_error("stream_chunk_failed", idx=idx)
+                if self._stream_generation == gen:
+                    self._stream_failed.append(idx)
             finally:
                 # Generation guard 同樣套用 counter
                 if self._stream_generation == gen:
@@ -3454,13 +3507,28 @@ class AppWindow(ctk.CTkFrame):
                     )
                     log_action("apple_stream_fallback", reason=apple_session.failure or "unknown")
 
-            result = self.transcriber.transcribe(
-                audio,
-                model_size=model,
-                language=lang,
-                chinese_variant=getattr(self.cfg, "chinese_variant", "off"),
-                apple_stream_result=apple_stream_result,
-            )
+            tail_failed = False
+            tail_exc = None
+            try:
+                result = self.transcriber.transcribe(
+                    audio,
+                    model_size=model,
+                    language=lang,
+                    chinese_variant=getattr(self.cfg, "chinese_variant", "off"),
+                    apple_stream_result=apple_stream_result,
+                )
+            except Exception as e:
+                # v2.32.1：切過段時，尾段當掉不能連累前面已經轉好的段落——原本整次算失敗、
+                # 前面幾分鐘的文字全部不見。沒切過段（整段就是這一次）照舊交給外層算失敗。
+                if self._stream_dispatched == 0:
+                    raise
+                log_error("stream_tail_failed", model=model, error=str(e))
+                tail_failed = True
+                tail_exc = e
+                result = TranscriptionResult(
+                    text="", language=lang or "",
+                    duration_seconds=len(audio) / 16_000, elapsed_seconds=0.0,
+                )
 
             # v2.32.0：第三階段對照組——用聽寫引擎把同一段錄音再辨識一次，只寫紀錄。
             # 只在「這次真的是邊錄邊辨識出來的」時跑：此時沒有切段，audio 就是整段錄音，
@@ -3495,6 +3563,10 @@ class AppWindow(ctk.CTkFrame):
                     f"+ tail (tail len={len(result.text)})"
                 )
 
+            # 先數「沒轉完」再拍快照：反過來的話，剛好在兩者之間轉完的段落，快照裡沒有它的文字、
+            # 卻也不算沒轉完，少了一段卻不提醒（審查重現）。這個順序最壞只是多算一段。
+            unfinished = (max(0, self._stream_dispatched - self._stream_completed)
+                          if self._stream_dispatched else 0)
             prior = list(self._stream_chunks)
             if prior:
                 # 尾段回系統訊息（太短、沒聲音、辨識失敗）就不接：接上去之後整串不再是「（…）」，
@@ -3503,6 +3575,11 @@ class AppWindow(ctk.CTkFrame):
                 tail = "" if is_system_message(result.text) else result.text
                 if tail == "" and result.text:
                     log.warning(f"STREAMING: tail dropped from merge ({result.text})")
+                # v2.32.1：數有幾段沒辨識出來——失敗的、尾段失敗的、等太久被放棄的（還沒轉完的段落
+                # 合併時是空白，一樣少了一段）。只是給提示用的數字：段落剛好在截止那一刻結束時可能
+                # 差一，所以上限夾在段數內。
+                tail_failed = tail_failed or is_failure_message(result.text)
+                failed = min(len(set(self._stream_failed)) + unfinished, len(prior)) + int(tail_failed)
                 # v2.21.3 接縫縫合：移除 10 秒切窗在接縫補的假句號（實測 14/14 接縫
                 #   的句號都是假的、甚至把「三千六」切成「月三。千六」）。tail 原樣保留。
                 try:
@@ -3518,8 +3595,20 @@ class AppWindow(ctk.CTkFrame):
                     combined = _dedupe_repetitive_ngrams(combined)
                 except Exception:
                     log_error("stream_merge_dedupe_failed")
+                text = combined.strip()
+                if not text and tail_exc is not None:
+                    # 尾段當掉、前面也沒有任何文字：沒有東西好保住，照舊算整次失敗
+                    raise tail_exc
+                if not text:
+                    # 全部沒文字時，有段落失敗就說失敗：說「沒偵測到語音」會讓人以為麥克風壞了
+                    if not failed:
+                        text = "（未偵測到語音內容）"
+                    elif is_failure_message(result.text):
+                        text = result.text
+                    else:
+                        text = "（辨識失敗、請重試或於設定切回其他模型）"
                 result = result.__class__(
-                    text=combined.strip() or "（未偵測到語音內容）",
+                    text=text,
                     language=result.language,
                     # 不能用 result.duration_seconds——這裡的 result 是**尾段**的
                     #   結果，只有最後幾秒；但 text 已經是全部段落合併後的完整
@@ -3531,6 +3620,9 @@ class AppWindow(ctk.CTkFrame):
                     elapsed_seconds=result.elapsed_seconds,
                     segments=result.segments,
                 )
+                if failed:
+                    result.failed_segments = failed
+                    result.total_segments = len(prior) + 1
             self.after(0, self._on_transcription_done, result)
         except Exception as e:
             log_error("transcription_failed", model=model, error=str(e))
@@ -3652,6 +3744,11 @@ class AppWindow(ctk.CTkFrame):
             text_len=len(result.text or ""),
             elapsed_s=float(result.elapsed_seconds or 0.0),
         )
+        # v2.32.1：有段落沒辨識出來就記一筆（只記段數）。要在貼上之前寫：貼上完會收尾這次錄音、
+        # 清掉錄音編號，之後寫的紀錄就對不回是哪一次錄音（審查實測）。
+        if getattr(result, "failed_segments", 0):
+            _pipe_event("partial_transcription", failed_segments=result.failed_segments,
+                        total_segments=getattr(result, "total_segments", None))
 
         text  = result.text
         # v2.31.0：改用 is_system_message() 取代原本硬編碼的兩句白名單。
@@ -3693,7 +3790,7 @@ class AppWindow(ctk.CTkFrame):
             try:
                 # 提示出錯不能連累貼上（提示只是畫一個小框，貼上才是使用者要的）
                 try:
-                    self._show_toast(f"轉錄完成 · {result.elapsed_seconds:.1f}s")
+                    self._show_toast(self._done_toast_text(result, valid))
                 except Exception:
                     pass
                 # 錄音小窗原本在回到閒置時收起，也就是貼上「之前」。改成先貼上之後，這裡先收，
@@ -3728,8 +3825,9 @@ class AppWindow(ctk.CTkFrame):
 
         self._start_pending_shadow(result, valid)
         self._transition_to_idle(result)
+        self._notify_partial_failure(result, valid)
         if take_polish_path:
-            self._show_toast(f"轉錄完成 · {result.elapsed_seconds:.1f}s")
+            self._show_toast(self._done_toast_text(result, valid))
 
         # 每次新轉錄都 +1，遲到的潤飾結果可據此丟棄。
         self._polish_generation += 1
@@ -4421,6 +4519,7 @@ class AppWindow(ctk.CTkFrame):
             block.set_result(
                 raw_text=result.text, timestamp_iso=timestamp_iso,
                 duration_s=dur, language=lang, model=model, corrections=corrections,
+                failed_segments=getattr(result, "failed_segments", 0),
             )
 
         self._stream_insert_latest_block(block, epoch)
@@ -10554,6 +10653,7 @@ class UtteranceBlockV2(ctk.CTkFrame):
         self._card_state: str    = "loading"   # loading / ready / failed
         self._polish_state: str  = "none"      # none / pending / ready / failed
         self._corrections: list[str] = []
+        self._failed_segments: int = 0     # v2.32.1：長錄音有幾段沒辨識出來
         self._is_latest  = True
         self._hovering   = False
         self._expanded   = False
@@ -10572,8 +10672,12 @@ class UtteranceBlockV2(ctk.CTkFrame):
     def set_result(
         self, *, raw_text: str, timestamp_iso: str, duration_s: float,
         language: str, model: str, corrections: Optional[list[str]] = None,
+        failed_segments: int = 0,
     ) -> None:
-        """loading → ready：填入真正的轉錄內容。"""
+        """loading → ready：填入真正的轉錄內容。
+
+        failed_segments（v2.32.1）：長錄音有幾段沒辨識出來；> 0 時 meta 行多一個紅色標籤，
+        讓這張卡片之後再看也知道內容不完整。"""
         self.raw_text          = raw_text
         self.polished_text     = None
         self.showing_polished  = False
@@ -10582,6 +10686,7 @@ class UtteranceBlockV2(ctk.CTkFrame):
         self.language          = language
         self.model              = model
         self._corrections      = list(corrections or [])
+        self._failed_segments  = failed_segments
         self._polish_state     = "none"
         self._card_state       = "ready"
         self._expanded          = False
@@ -10787,6 +10892,17 @@ class UtteranceBlockV2(ctk.CTkFrame):
             chip_text = f"校正 {len(self._corrections)}"
             ctk.CTkLabel(
                 row, text=chip_text, fg_color=CHIP_BG, text_color=CYAN_TEXT,
+                corner_radius=5, height=20,
+                width=chip_font.measure(chip_text) + 7 * 2,
+                font=chip_font,
+            ).pack(side="left", padx=(0, 9))
+
+        if self._failed_segments:
+            failed = self._failed_segments
+            chip_font = ctk.CTkFont(FONT_FAMILY_TEXT, 10, "bold")
+            chip_text = f"{failed} 段沒辨識出來"
+            ctk.CTkLabel(
+                row, text=chip_text, fg_color=RED_BG, text_color=RED_TEXT,
                 corner_radius=5, height=20,
                 width=chip_font.measure(chip_text) + 7 * 2,
                 font=chip_font,
@@ -11383,6 +11499,7 @@ class MiniRecordingWindow(tk.Toplevel):
         if self._closed:
             log.warning("MINI_HUD: show_recording on closed window, skip")
             return
+        self._cancel_warning_hide()   # v2.32.1：上一則提醒還沒收，不能把這次錄音的小窗收掉
         self._position_at_cursor_screen_bottom()
         self._canvas.itemconfig(self._dot_id, fill=DANGER)
         self._canvas.itemconfig(self._label_id, text="錄音中")
@@ -11410,6 +11527,41 @@ class MiniRecordingWindow(tk.Toplevel):
         except Exception:
             pass
 
+    # 提醒顯示多久。夠讀完一句短話、又不會擋著使用者太久
+    WARN_SHOW_MS = 4000
+
+    def show_warning(self, text: str) -> None:
+        """v2.32.1：貼上之後短暫提醒（例如「1 段沒辨識出來」），幾秒後自己收起。
+
+        使用者這時多半在別的 App 打字，主視窗被蓋在後面；這個浮動小窗是唯一跨 App 看得到的地方。
+        期間開始新的錄音，show_recording 會取消收起的排程，不會把新錄音的小窗收掉。"""
+        if self._closed:
+            return
+        self._position_at_cursor_screen_bottom()
+        self._canvas.itemconfig(self._dot_id, fill=WARN)
+        self._canvas.itemconfig(self._label_id, text=text, state="normal")
+        self._canvas.itemconfig(self._timer_id, text="")
+        if self._wave_canvas is not None:
+            self._wave_tick_active = False
+            self._wave_canvas.place_forget()
+            self._wave_canvas.delete("all")
+        self.deiconify()
+        self._reapply_panel_level()
+        self._cancel_warning_hide()
+        self._warn_hide_id = self.after(self.WARN_SHOW_MS, self._hide_after_warning)
+
+    def _cancel_warning_hide(self) -> None:
+        if getattr(self, "_warn_hide_id", None) is not None:
+            try:
+                self.after_cancel(self._warn_hide_id)
+            except Exception:
+                pass
+            self._warn_hide_id = None
+
+    def _hide_after_warning(self) -> None:
+        self._warn_hide_id = None
+        self.hide()
+
     def show_processing(self) -> None:
         """進入處理中狀態 → 琥珀色 + 「轉錄中」。
 
@@ -11421,6 +11573,7 @@ class MiniRecordingWindow(tk.Toplevel):
         """
         if self._closed:
             return
+        self._cancel_warning_hide()
         self._position_at_cursor_screen_bottom()   # D3-S6：multi-monitor 跟手
         self._canvas.itemconfig(self._dot_id, fill=WARN)
         self._canvas.itemconfig(self._label_id, text="轉錄中", state="normal")
