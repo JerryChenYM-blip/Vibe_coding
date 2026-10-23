@@ -655,6 +655,281 @@ def _renormalize_apple_chinese(text: str, variant: str) -> str:
     return _apply_tw_vocab_fix(converted)
 
 
+# ── v2.35.0：蘋果結果的自動修正——英文詞比對字典 ──────────────────────────────────
+#
+# 依據 docs/工作紀錄/2026-10-23_蘋果語音辨識原理與提升準確度研究.md §2、§7，
+# 以及總監定案的修正。只在蘋果引擎跑，放在字典 corrections 之後（transcribe() 裡）。
+# 為什麼不改蘋果的模型：模型是系統簽章的檔案，沒有官方方法能改（研究報告 §1）；
+# 能做的只有在它輸出之後補救。
+#
+# 刻意「沒有」的另一道修正（原本叫 A「重新轉繁體」）：蘋果的簡轉繁錯字（錶格、係統、合並）
+#   在 App 實際路徑上已經被上面 v2.31.1 的 _renormalize_apple_chinese 修掉了。
+#   總監按 App 實際路徑重量：加了 A 之後錯誤數 74 → 74，沒有任何增益，所以整段拿掉。
+#   不要因為「蘋果文字裡還看到錶格」就補回來——先確認是不是繞過了 _finish_apple_payload。
+#   （研究報告 §7 寫的「重新轉繁體修好 13 處」是漏算了這道既有重整。）
+#
+# B. 蘋果把 Claude Code 拼成 clardcode、GitHub 拼成 gitub：英文專有名詞不在它的小字表裡。
+#    拿使用者字典的英文詞比拼字距離，夠近又明顯勝過第二名才換。只修「已經在字典裡」的詞。
+#    這段直接貼到使用者游標處，改錯比不改糟，所以第一優先是「不改錯」。
+#    現版（第一版）在 33 句正常英文裡改錯 19 句：fine/online/inline/lines→LINE、code→Codex、
+#    motion→Notion、clause→Claude、planter→Palantir、Llama→Ollama、GitLab→GitHub、
+#    網址裡 cloud→Cloud、Cloud Code→Cloud Codex。下面每一條規則就是擋其中一類：
+#      1. 比對單位：一個英文詞，或剛好一個空格隔開的兩個英文詞。
+#      2. 單位前後緊貼 . _ - / @ : 就跳過（網址、檔名、識別字：cloud.google.com、cloud_run、line_number）。
+#         代價：句尾緊貼 ASCII 句號的拼錯（use clardcode.）也不會修；蘋果的中文句用全形標點，影響小。
+#      3. 單位裡每個詞都是正常英文字就什麼都不做，連大小寫都不改（line、notion、cloud 維持原樣）。
+#         正常字表見 _get_english_words()。
+#      4. 大小寫修正：正規化後跟字典詞完全相同、而且不是正常字（gpt4o→GPT4o）。
+#      5. 模糊比對只用「純 ASCII、正規化後 ≥ 5 字元」的字典詞當目標（LINE、Opus、Rust、Zoom 太短，會吞掉常見字）。
+#      6. 門檻：編輯距離 ÷ 較長長度 ≤ 0.30（原 0.34；GitLab↔GitHub、mini↔Gemini 都是 0.33）；
+#         最近的比第二近至少少 0.10；單位與候選正規化後都 ≥ 3 字元；
+#         只差結尾數字或 s 不換（Python3 不是 Python 的拼錯、Qwens 不是 Qwen3）。
+#      7. 字表檔不存在就整步跳過 B（寧可不修也不要亂修）。
+#      8. 兩個詞一組：成立就整組換（Clawd Code→Claude Code），不再對單字各自比對。
+#         我加了一條限制（規格沒寫）：兩個詞一組的目標必須也是兩個詞的字典詞，
+#         否則「a Figmar」合起來離 Figma 只有 0.29，冠詞 a 會被整組吃掉。
+#    總監在個人測試集上用這套規則量到：錯誤率 10.3% → 8.4%（第一版 8.7%）、
+#    44 句正常英文 0 句改錯。⚠️ 測試句是用字典詞出的題，效果偏樂觀；只修字典裡有的英文詞。
+
+# macOS 內建英文字表（約 23.6 萬字）。Windows 沒有這個檔 → 字表載不到 → B 整步跳過。
+_ENGLISH_WORDS_PATH = "/usr/share/dict/words"
+_english_words = None
+_english_words_tried = False
+
+# web2 是 1990 年代的字表，沒有這些現代常見字；不補的話 online、inline、email 會被當成「不是正常字」
+# 而進入模糊比對（online/inline→LINE 就是這樣來的）。刻意不放字典常見的專有名詞
+# （github、claude、gemini、ollama、nvidia）：它們要能做大小寫修正與被比對。
+# gitlab、llama 是審查實測會被誤換成 GitHub、Ollama 的正常詞。
+# 最後一行（box has paid…）是拿約 400 個最常用英文字逐一對照 web2 時發現它缺的（連 box、has 都沒有）。
+_MODERN_ENGLISH_WORDS = frozenset("""
+online offline inline email emails app apps login logout signup signin deploy deployed deployment
+token tokens cache cached merge merged commit commits review reviews session sessions prompt prompts
+workflow workflows dashboard dashboards plugin plugins template templates mini gitlab llama
+website websites webhook backend frontend database api apis url urls ok okay username config repo repos
+chatbot podcast wifi bluetooth smartphone download upload setup startup blog emoji hashtag spam
+box has paid died internet laptop todo dict
+codec codecs json yaml regex devops oauth clade skilful wispr
+""".split())
+# 最後一行是第二輪審查（2026-10-23）實測被誤換的真實字：codec→Codex、JSON→Jason（字典有人名時）、
+# clade→Claude、skilful→skill；wispr 是語音輸入產品 Wispr Flow（使用者在做同類 App，很可能提到）→Whisper。
+
+_EN_SUFFIXES = (("s", 3), ("es", 3), ("ed", 3), ("ing", 3), ("er", 5), ("ly", 5))
+# er／ly 的詞幹至少 5 字：wisp+er 若算正常字，Wisper（Whisper 的拼錯）就修不到了。
+
+_EN_WORD_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9]*")
+_EN_MIN_LEN = 3            # 比對單位與候選詞正規化後都至少這麼長
+_EN_FUZZY_MIN_CAND = 5     # 模糊比對的目標至少這麼長
+_EN_MAX_RATIO = 0.30       # 編輯距離 ÷ 較長長度（原 0.34；GitLab↔GitHub、mini↔Gemini 是 0.33，要擋掉）
+_EN_MIN_MARGIN = 0.10      # 最近的要比第二近的至少少這麼多，否則不知道該選誰、寧可不動
+_EN_EPS = 1e-9             # 浮點邊界：0.2-0.1 要算成剛好 0.10
+_EN_URL_CHARS = ".:_-/@"
+
+
+def _get_english_words():
+    """Lazy 載正常英文字表一次、快取成 frozenset；載不到回 None（呼叫端就整步跳過 B）。"""
+    global _english_words, _english_words_tried
+    if not _english_words_tried:
+        _english_words_tried = True
+        try:
+            with open(_ENGLISH_WORDS_PATH, encoding="utf-8", errors="ignore") as f:
+                words = frozenset(line.strip().lower() for line in f if line.strip())
+            # 讀到的字太少代表檔案壞了或不是字表：沒有字表比壞字表安全（壞字表會讓所有字都「不正常」）
+            if len(words) < 10_000:
+                raise ValueError("english word list too small")
+            _english_words = words | _MODERN_ENGLISH_WORDS
+        except Exception:
+            log_error("english_words_load_failed")
+    return _english_words
+
+
+def _is_normal_english(word: str) -> bool:
+    """這個詞是不是正常英文字（字表＋簡單字尾還原）。含數字的一律不是。"""
+    words = _get_english_words()
+    w = word.lower()
+    if words is None or not w.isalpha():
+        return False
+    if w in words:
+        return True
+    for suf, min_stem in _EN_SUFFIXES:
+        if w.endswith(suf) and len(w) - len(suf) >= min_stem:
+            stem = w[:-len(suf)]
+            forms = {stem, stem + "e"}
+            if stem[-1] == stem[-2]:
+                forms.add(stem[:-1])        # running → run
+            if any(f in words for f in forms):
+                return True
+    # y 結尾的字變形（wispy→wispier、whisky→whiskier、copy→copies）：web2 只收原形，第二輪審查實測 wispier→Whisper
+    for suf in ("iest", "ier", "ies", "ied", "ily"):
+        if w.endswith(suf) and len(w) - len(suf) >= 3 and w[:-len(suf)] + "y" in words:
+            return True
+    # 兩個正常字黏在一起（Treeview＝tree＋view，第二輪審查實測被換成 review）：也當正常字。
+    # 每段至少 4 字：允許 par＋quite 這種短切法的話，拼錯的 Parquite 也會被當成正常字而修不到（個人測試集需要修它）
+    for k in range(4, len(w) - 3):
+        if w[:k] in words and w[k:] in words:
+            return True
+    return False
+
+
+def _en_norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def _en_distance(a: str, b: str) -> int:
+    """Levenshtein 編輯距離（字串都很短，用最直接的寫法）。"""
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _en_candidates(terms) -> list[tuple[str, str]]:
+    """字典詞 → [(正規化, 字典寫法)]。只收純 ASCII 且含英文字母的詞（含中文的詞拿英文部分去比，
+    會把單獨的 claude 換成「Claude 程式」）；正規化後相同的只留第一個，免得互相打平。"""
+    seen: dict[str, str] = {}
+    for t in terms or []:
+        t = (t or "").strip()
+        if not t or not t.isascii() or not any(c.isalpha() for c in t):
+            continue
+        n = _en_norm(t)
+        if len(n) >= _EN_MIN_LEN and n not in seen:
+            seen[n] = t
+    return list(seen.items())
+
+
+def _en_only_suffix_differs(a: str, b: str) -> bool:
+    """a、b 只差結尾的數字或 s（Python3↔Python、Qwens↔Qwen3）。"""
+    return a != b and a.rstrip("0123456789s") == b.rstrip("0123456789s")
+
+
+def _en_match_unit(raw: str, cands: list[tuple[str, str]], *, pair: bool):
+    """一個比對單位對字典：回字典寫法或 None。pair=True（兩個詞一組）時目標必須也是兩個詞。"""
+    n = _en_norm(raw)
+    if len(n) < _EN_MIN_LEN:
+        return None
+    best_disp = None
+    for cn, display in cands:
+        if cn == n:                                  # 大小寫／空格不同而已：改成字典寫法
+            # 字典寫法是全小寫、使用者這邊有大寫（句首的 Vibe Coding）：不要把它改小寫，讀起來反而怪
+            if display == display.lower() and raw != raw.lower():
+                return None
+            best_disp = display
+            break
+    if best_disp is None:
+        scored = []
+        for cn, display in cands:
+            if len(cn) >= _EN_FUZZY_MIN_CAND:
+                scored.append((_en_distance(n, cn) / max(len(n), len(cn)), cn, display))
+        if not scored:
+            return None
+        scored.sort(key=lambda x: x[0])
+        best = scored[0]
+        if best[0] > _EN_MAX_RATIO + _EN_EPS:
+            return None
+        if len(scored) > 1 and scored[1][0] - best[0] < _EN_MIN_MARGIN - _EN_EPS:
+            return None
+        if _en_only_suffix_differs(n, best[1]):
+            return None
+        # 一邊只是另一邊頭尾多幾個字（WhisperX／WhisperPro→Whisper、iCloud→Cloud、Sessionize→session、
+        # Googled→Google、GPT4→GPT4o）：多半是另一個真的東西或詞形變化，不是拼錯（第二輪審查實測）。
+        # 代價：Figmar（Figma 多一個 r）也修不到了——寧可少修，不要改錯。
+        if n.startswith(best[1]) or best[1].startswith(n) or n.endswith(best[1]) or best[1].endswith(n):
+            return None
+        best_disp = best[2]
+    if pair and len(best_disp.split()) != 2:
+        return None
+    return best_disp
+
+
+def _en_boundary_ok(text: str, start: int, end: int) -> bool:
+    """單位前後緊貼 . _ - / @ : 的是網址、檔名、識別字，不碰。"""
+    if start > 0 and text[start - 1] in _EN_URL_CHARS:
+        return False
+    if end < len(text) and text[end] in _EN_URL_CHARS:
+        return False
+    return True
+
+
+def _apple_match_english(text: str, terms):
+    """蘋果結果裡拼錯的英文專有名詞，比對使用者字典的英文詞換回來（規則見上面的說明）。
+    回 (新文字, {原文: 字典寫法}, 換了幾處)。空字典、沒有英文、字表載不到就整步跳過。"""
+    cands = _en_candidates(terms)
+    if not text or not cands:
+        return text, {}, 0
+    words = list(_EN_WORD_RE.finditer(text))
+    if not words or _get_english_words() is None:
+        return text, {}, 0
+    normal = [_is_normal_english(w.group()) for w in words]
+
+    out: list[str] = []
+    hits: dict[str, str] = {}
+    count = 0
+    last = 0
+    i = 0
+    while i < len(words):
+        w = words[i]
+        start, end, disp = w.start(), w.end(), None
+        # 先試兩個詞一組；成立就整組換，這個位置不再對單字各自比對
+        if (i + 1 < len(words) and text[w.end()] == " " and words[i + 1].start() == w.end() + 1
+                and not (normal[i] and normal[i + 1])):
+            e2 = words[i + 1].end()
+            if _en_boundary_ok(text, start, e2):
+                disp = _en_match_unit(text[start:e2], cands, pair=True)
+                if disp is not None:
+                    # 跟字典詞「不一樣」的那幾個詞，至少要有一個不是正常英文字才換：
+                    # Google Maps→Google Meet、vibe code／coder／cooking→vibe coding 不一樣的都是正常字，
+                    # 是使用者真的講了別的東西（第二輪審查實測）；clad sonet、Clawd Code 裡有拼錯的字才換
+                    pairs_rt = [(r, t) for r, t in zip(text[start:e2].split(), disp.split()) if _en_norm(r) != _en_norm(t)]
+                    differ = [r for r, _ in pairs_rt]
+                    # 而且每個不一樣的詞都要跟字典那一個詞只差一點點（逐詞距離 ≤ 0.34）：整組合起來夠近、
+                    # 但某一個詞根本是別的字（Viber thing→vibe coding：thing 跟 coding 差一半）就不換（總監實測 2026-10-23）
+                    far = any(_en_distance(_en_norm(r), _en_norm(t)) / max(len(_en_norm(r)), len(_en_norm(t)), 1) > 0.34 + _EN_EPS
+                              for r, t in pairs_rt)
+                    if (differ and all(_is_normal_english(r) for r in differ)) or far:
+                        disp = None
+                    else:
+                        end = e2
+        if disp is None and not normal[i] and _en_boundary_ok(text, start, end):
+            disp = _en_match_unit(w.group(), cands, pair=False)
+        if disp is None:
+            i += 1
+            continue
+        raw = text[start:end]
+        if disp != raw:
+            out.append(text[last:start])
+            out.append(disp)
+            last = end
+            hits.setdefault(raw, disp)
+            count += 1
+        i += 2 if end != w.end() else 1
+    out.append(text[last:])
+    return "".join(out), hits, count
+
+
+def _run_apple_autofix(text: str, terms, corrections) -> dict:
+    """蘋果結果的自動修正（目前只有英文詞比對字典）。
+
+    try/except：丟例外就保留原文字、記 log_error，不讓轉錄失敗。
+    以「（」開頭的是系統訊息，跟字典 corrections 一致，不處理。
+    回傳 dict：text／english(hits, n, before_len, after_len 或 None)。
+    """
+    res = {"text": text, "english": None}
+    if not text or text.startswith("（"):
+        return res
+    # corrections 的 to 是使用者自己指定的拼法，一樣可信，納入候選（含中文的目標 _en_candidates 會濾掉）
+    corr_targets = [dst for _src, dst in (corrections or [])]
+    try:
+        new, hits, n = _apple_match_english(text, list(terms or []) + corr_targets)
+        if n:
+            res["english"] = {"hits": hits, "n": n, "before_len": len(text), "after_len": len(new)}
+            res["text"] = new
+    except Exception:
+        log_error("apple_english_match_failed")
+    return res
+
+
 # ── 靜音偵測與幻覺防護 ────────────────────────────────────────────────────────
 
 # 最小 RMS 閾值：低於此值視為靜音，跳過推論。
@@ -1716,6 +1991,7 @@ class Transcriber:
         # 走純字串替換，不需 LLM 推理。讀 ~/.whisper_app/dictionary.json 的 corrections 段。
         # 在 polish 之前套用 → 即使 polish 關閉、原文也已校正；polish 開啟也少做事。
         corrections_count = 0
+        corrections: list = []   # v2.35.0：下面蘋果自動修正也要用；載入失敗就是空的
         try:
             from dictionary import load_corrections, apply_corrections
             corrections = load_corrections()
@@ -1758,6 +2034,29 @@ class Transcriber:
             log_error("apply_corrections_failed")
 
         after_corrections = result.text
+
+        # v2.35.0：蘋果引擎專屬——corrections 之後再做英文詞比對字典（拼錯的英文專有名詞換回字典寫法）。
+        # 一定要在 corrections 之後：規則的來源字串是拿蘋果的原樣去找的，先改字會讓規則找不到。
+        # 日誌只寫數量不寫文字（使用者說的話不進日誌）；audit 的 hits 是「原→新」規則層級資訊。
+        # 原本還有「重新轉繁體」一步，已拿掉（沒有增益，見 _run_apple_autofix 上方的說明）。
+        if _is_apple_model(model_size) and result.text:
+            fix = _run_apple_autofix(result.text, dict_terms_snapshot, corrections)
+            result.text = fix["text"]
+            step = fix["english"]
+            if step:
+                log.info(f"WHISPER: 蘋果結果自動修正：英文比對換了 {step['n']} 處")
+                try:
+                    if _audit_log is not None:
+                        _audit_log.write_event(
+                            "post_filter_applied",
+                            _safe_pipeline_id(),
+                            filter="apple_english_match",
+                            before_len=step["before_len"],
+                            after_len=step["after_len"],
+                            hits=step["hits"],
+                        )
+                except Exception:
+                    pass
 
         # v2.19.x：pinyin guard（拼音 fuzzy match 修中文 ASR 同音/近音誤辨）
         # v2.20.1：預設關 — 230 筆 audit log 抓到 false positive
