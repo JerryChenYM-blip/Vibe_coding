@@ -1450,6 +1450,7 @@ def test_keepalive_ping_skips_when_lock_busy():
     win._state = "idle"
     win._model_var = types.SimpleNamespace(get=lambda: "qwen3-asr")
     win._last_ping_at = None
+    win._last_user_activity = time.time()   # v2.34.0：保溫只在最後使用後 30 分鐘內（牆上時間）
     win.after = MagicMock()
     lock.acquire()   # 模擬使用者轉錄中、鎖被占用
     try:

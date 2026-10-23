@@ -42,6 +42,7 @@ from logger import get_logger, log_action, log_error, log_settings, log_state
 from hotkey_manager import (
     HotkeyManager, format_hotkey,
     is_pynput_available, check_accessibility,
+    _STALE_COMBO_SEC,
 )
 from ollama_client import OllamaClient, OllamaConfig
 import presets as _presets
@@ -61,6 +62,13 @@ import auto_paste as _ap
 from platform_util import IS_MAC, IS_WINDOWS
 
 log = get_logger("gui")
+
+# v2.34.0：熱鍵看門狗判斷「按鍵紀錄是殘留的」的門檻。刻意直接取 hotkey_manager 判斷
+# combo 卡住的同一個數字（10 秒），兩邊對「多久沒事件算殘留」才不會各說各話。
+_STALE_PRESS_S = _STALE_COMBO_SEC
+# 側別修飾鍵還記在「按著」時用的較長門檻：真的按住修飾鍵、閒置 60 秒以上的情況可以忽略；
+# 超過就當成「放開事件漏收」造成的殘留，照常重啟把狀態清掉（不然按下／放開會一直顛倒，第三輪審查重現）。
+_STALE_HELD_MOD_S = 60.0
 
 
 # ── v2.19.0 pipeline 觀測性 helper ───────────────────────────────────────────
@@ -807,6 +815,30 @@ class AppWindow(ctk.CTkFrame):
     # 同時也是經驗值：M 系列 unified memory 大概 60-120s 不被 access 就會被 OS 標 page-out 候選。
     MLX_KEEPALIVE_INTERVAL_MS = 90 * 1000   # 90 秒
 
+    # v2.34.0：背景保溫只在「最後一次使用後」這段時間內做（只在 Mac；Windows 維持每 90 秒保溫——
+    # 休息的代價由按下熱鍵時的熱身吸收，而那個熱身只在 Mac 做，Windows 沒有補償）。
+    # 為什麼：2026-10-20～22 每天 447～826 次 ping、合計 10～13 分鐘運算，同期 Qwen3 錄音約
+    # 3 次／天；而且實驗證明 ping 並沒讓第一次推論變快（閒置 90 秒後仍慢約 2 倍，見交接紀錄）。
+    # 當初保溫是怕 macOS 把權重擠出記憶體（v2.17.4），v2.21.6 起已用 wired limit 釘住；
+    # 萬一還是被擠掉，重新載入實測 2.3～3.6 秒，由按下熱鍵時的熱身在使用者講話時吸收。
+    MLX_KEEPALIVE_ACTIVE_WINDOW_S = 30 * 60
+
+    # v2.34.0：按下熱鍵時熱身的門檻——模型上一次被用距今至少這麼久才做。
+    # 2026-10-23 實測：1 分鐘內用過 RTF 0.21～0.23（已經熱），超過 10 分鐘 0.35～0.88。
+    PRESS_WARMUP_MIN_IDLE_S = 60
+
+    # v2.34.0：只有這些模型做按鍵熱身。實驗與 App 數據都只有 qwen3-asr（0.6B）：
+    # warmup 呼叫（同一個 1.5 秒假人聲）在 App 日誌 5,406 次保溫 ping 的耗時是中位數 0.72 秒、
+    # p90 1.6 秒、p99 2.25 秒、最慢 17.3 秒（審查統計，2026-10-23）。
+    # 不開的：MLX Whisper 的 _warmup_mlx 自己的註解寫 2～5 秒；qwen3-asr-large（1.7B）沒量過。
+    # 熱身會佔著推論鎖，短錄音放開後要排在它後面，耗時沒量過就不能保證不拖慢——以後量過再加進來。
+    PRESS_WARMUP_MODELS = frozenset({"qwen3-asr"})
+
+    # v2.34.0：狀態旗標用 class 層預設值（__init__ 不重複設）：保溫目前是否在「休息」、
+    # 按鍵熱身是否有一個正在背景跑。
+    _keepalive_paused = False
+    _press_warmup_running = False
+
     # Fix 18 / 2026-05-23（Layer 2）：每 N 毫秒無條件 force-restart NSEvent monitor。
     # 即使 monitor 物件還 alive、其底層 ObjC block 仍可能在閒置 1hr+ 後被 invalidate
     # 而 watchdog 偵測不到（_monitor_global is not None 仍成立）。10 分鐘是
@@ -1137,6 +1169,12 @@ class AppWindow(ctk.CTkFrame):
         self.after(2500, self._warmup_ollama)
         # v2.17.4：定期跑 dummy ASR 保活 MLX weights（防 macOS swap out）
         # 第一次 5 分鐘後跑、之後 each tick 自己排程下次
+        # v2.34.0：保溫只在最後一次使用後 30 分鐘內做；啟動本身算一次使用。
+        # 必須在第一次排程之前設好，tick 一開始就會讀它。
+        # 用牆上時間（time.time）不用 monotonic：macOS 的單調時鐘睡眠時不前進（審查推斷），
+        # 闔蓋前剛用過、隔天一開就會被當成「剛用過」。牆上時間被使用者調時鐘會跳，
+        # 只影響一次保溫判斷，可接受。
+        self._last_user_activity: float = time.time()
         self.after(self.MLX_KEEPALIVE_INTERVAL_MS, self._mlx_keepalive_tick)
         # v2.20.3 N5：記下上次 keepalive ping 結束時間（用 perf_counter，單調）。
         # 用來算 since_last_ping_s（兩次 ping 間隔；首次為 None → 不 emit since_last）
@@ -2521,6 +2559,7 @@ class AppWindow(ctk.CTkFrame):
         )
         self._state            = "recording"
         self._state_start_time = time.perf_counter()
+        self._last_user_activity = time.time()   # v2.34.0：保溫的「最後使用」時間（牆上時間，理由見 __init__）
         self._rec_start        = self._state_start_time
         self._stream_samples   = 0
         self._full_audio_s     = 0.0
@@ -2636,6 +2675,85 @@ class AppWindow(ctk.CTkFrame):
         # 只在 skeleton 模式做（見 _build_stream_v2）。
         if self._skeleton_mode:
             self._show_big_wave()
+
+        # v2.34.0：錄音已經開始、畫面也都更新完了，最後才排按鍵熱身——
+        # 使用者按下就立刻講話，熱身絕不能讓錄音開始變慢（所以放最後、而且只排背景工作）。
+        self._maybe_press_warmup()
+
+    def _maybe_press_warmup(self) -> None:
+        """v2.34.0：按下熱鍵時在背景讓本機模型熱身一次（目前只開 Qwen3-ASR 0.6B，見 PRESS_WARMUP_MODELS）。
+
+        為什麼：2026-10-23 實驗（合成語音 8.17 秒、Qwen3-ASR-0.6B）閒置 90 秒後第一次推論
+        2.38～2.53 秒（RTF 0.29～0.31），緊接第二次 1.28～1.31（0.16）；先跑 1.5 秒小暖身再推論
+        1.37～2.01。App 日誌也一樣：距上次使用 > 10 分鐘，錄音第 1 段 RTF 0.35～0.88，1 分鐘內 0.21～0.23。
+        熱身挑「按下」而不是定時，是因為使用者按下後還要講一陣子（錄音平均約 47 秒），
+        熱身在他講話時就做完了，放開後的轉字吃到熱的。
+
+        已知取捨：錄音很短、而熱身剛好還在跑時，放開後的轉字要排在熱身後面（熱身佔著推論鎖）。
+        多等多久看熱身耗時：App 日誌 5,406 次 Qwen3-0.6B 保溫（同一個 warmup 呼叫）耗時
+        中位數 0.72 秒、p90 1.6 秒、p99 2.25 秒、最慢 17.3 秒（審查統計，2026-10-23）——
+        不是固定上限 1.5 秒；而且那些是「距上一次 ping ≤ 90 秒」的熱狀態，閒置 ≥ 60 秒的實驗量到
+        1.3～1.8 秒，休息 30 分鐘以上的第一次沒量過（權重若被擠出，重新載入 2.3～3.6 秒）。換到的是其餘約 95% 的錄音（Qwen3 錄音只有 5% 短於 2 秒，
+        history.db 270 筆中 14 筆）第一段推論快約 1.7 倍。
+        只對 PRESS_WARMUP_MODELS（qwen3-asr 0.6B）做，其他模型沒量過熱身耗時，見該常數的註解。
+
+        這個函式在主執行緒呼叫、只做幾個變數檢查，真正的熱身丟背景執行緒；
+        任何錯誤都吞掉，不能影響錄音。
+        """
+        try:
+            if not IS_MAC or self._press_warmup_running:
+                return
+            model = self._model_var.get()
+            if _is_apple_model(model):
+                return    # 蘋果的模型在作業系統裡，沒有權重需要熱身
+            if model.lower() not in self.PRESS_WARMUP_MODELS:
+                return    # 沒量過熱身耗時的模型不做，見 PRESS_WARMUP_MODELS
+            # 沒載入就不做：熱身會變成在使用者講話時冷載入，那條路交給既有的開機暖機流程
+            if not self.transcriber.is_local_model_loaded(model):
+                log.debug(f"MLX_PRESS_WARMUP: skip, model not loaded ({model})")
+                return
+            idle_s = self.transcriber.seconds_since_model_used()
+            if idle_s is not None and idle_s < self.PRESS_WARMUP_MIN_IDLE_S:
+                log.debug(f"MLX_PRESS_WARMUP: skip, used {idle_s:.0f}s ago")
+                return
+            self._press_warmup_running = True
+            threading.Thread(
+                target=self._press_warmup_worker, args=(model, idle_s), daemon=True
+            ).start()
+        except Exception:
+            self._press_warmup_running = False
+            log_error("press_warmup_schedule_failed")
+
+    def _press_warmup_worker(self, model: str, idle_s: Optional[float]) -> None:
+        """背景執行緒：真正做按鍵熱身。拿不到推論鎖或使用者已放開就放棄。"""
+        try:
+            # 使用者已經放開（或看門狗自動停止）：放開後的真推論優先，不跟它搶推論鎖
+            if self._state != "recording":
+                log.debug("MLX_PRESS_WARMUP: skip, no longer recording")
+                return
+            # 非阻塞試拿推論鎖：拿不到＝別的推論正在跑，模型本來就在動，不必熱身。
+            # 試完要先放掉才能呼叫 warmup()（threading.Lock 不可重入）；
+            # 中間的微小空窗跟背景保溫 ping 一樣可接受。
+            lk = getattr(self.transcriber, "_transcription_lock", None)
+            if lk is not None:
+                if not lk.acquire(blocking=False):
+                    log.debug("MLX_PRESS_WARMUP: skip, transcription lock busy")
+                    return
+                lk.release()
+            t0 = time.perf_counter()
+            ok = self.transcriber.warmup(model)
+            idle_txt = "never" if idle_s is None else f"{idle_s:.0f}"
+            took_ms = (time.perf_counter() - t0) * 1000
+            # 失敗的熱身不算「做過」：transcriber 不會更新「上次使用」，這裡也不能記 done，
+            # 不然日誌會讓人以為熱身有效而查不出為什麼還是慢。
+            if ok:
+                log.info(f"MLX_PRESS_WARMUP: done in {took_ms:.0f} ms (idle_s={idle_txt})")
+            else:
+                log.info(f"MLX_PRESS_WARMUP: failed after {took_ms:.0f} ms (idle_s={idle_txt})")
+        except Exception:
+            log_error("press_warmup_failed", model=model)
+        finally:
+            self._press_warmup_running = False
 
     def _transition_to_processing(self, audio_duration_s: float = 0.0) -> None:
         """狀態機：recording → processing。停止麥克風並在背景執行緒跑 Whisper。
@@ -2851,6 +2969,9 @@ class AppWindow(ctk.CTkFrame):
             log_state("->idle")
         self._state            = "idle"
         self._state_start_time = time.perf_counter()
+        # v2.34.0：轉字完成（或任何回到閒置）也算一次使用——一場長錄音可能超過 30 分鐘，
+        # 錄音開始時記的時間不夠新，放開後保溫不該馬上被判成「很久沒用」而休息。
+        self._last_user_activity = time.time()
         self._ripples.clear()
 
         # B2（v2.7.0）：processing 正常結束 → cancel 對應 timeout self-heal
@@ -6460,7 +6581,35 @@ class AppWindow(ctk.CTkFrame):
                     # 跳過本輪、下個 5s watchdog tick 再試（最多延 5 次 = +25s 可接受）。
                     pressed_count = len(getattr(mgr, "_pressed", ()))
                     combo_active  = getattr(mgr, "_combo_active", False)
-                    if pressed_count > 0 or combo_active:
+                    in_flight = pressed_count > 0 or combo_active
+                    # v2.34.0：in-flight 要「新鮮」才算數。_pressed 常殘留已放開的鍵，
+                    # 沒有這個判斷時，延後一次可長達 81.6 小時（10-11～10-15）、41.6 小時
+                    # （10-18～10-20），這段期間保險絲完全沒作用（同期熱鍵正常，因為 lone
+                    # 模式只看側別 modifier，殘留的紀錄不影響它）。最後一次事件超過
+                    # _STALE_PRESS_S 秒前，真的有人按著鍵的可能性可以忽略；重啟本身會清掉 _pressed。
+                    # 取捨：使用者真的連續按住同一個鍵超過 10 秒，剛好撞上定時重啟時，
+                    # 放開事件會被吃掉一次——跟 hotkey_manager 對 combo 的 10 秒處理一致。
+                    if in_flight:
+                        last_ev = getattr(mgr, "_last_event_at", 0.0)
+                        last_ev = float(last_ev) if isinstance(last_ev, (int, float)) else 0.0
+                        # 從沒收過事件（0.0）= 沒有任何一次按鍵是真的，紀錄一定是殘留
+                        event_age = (now - last_ev) if last_ev > 0 else float("inf")
+                        # 側別修飾鍵還在 _ns_held_modifiers 裡＝可能真的按著：這時重啟，stop() 會把集合
+                        # 清掉，之後放開被當成按下，tap 時機反轉到下一次重啟（最長約 10 分鐘，審查實測）。
+                        # 日誌分析顯示的殘留是 pressed=1/2 而熱鍵照常（lone 模式只看側別修飾鍵），
+                        # 所以殘留多半不是修飾鍵。修飾鍵記在集合裡時改用較長門檻（_STALE_HELD_MOD_S，60 秒）：
+                        # 60 秒內當成可能真的按著、照舊延後；超過就當成放開事件漏收的殘留——不重啟的話，
+                        # 之後每次按下／放開都會顛倒，直到使用者剛好多按一次（第三輪審查重現）。
+                        held = getattr(mgr, "_ns_held_modifiers", None)
+                        held_n = len(held) if isinstance(held, (set, frozenset, list, tuple, dict)) else 0
+                        if event_age > (_STALE_PRESS_S if held_n == 0 else _STALE_HELD_MOD_S):
+                            age_txt = "never" if event_age == float("inf") else f"{event_age:.0f}s ago"
+                            log.info(
+                                f"HOTKEY: watchdog ignoring stale in-flight "
+                                f"(pressed={pressed_count}, last_event {age_txt})"
+                            )
+                            in_flight = False
+                    if in_flight:
                         # v2.32.0：只記「開始延後」與之後每 10 分鐘一行，不再每 5 秒一行。
                         # 2026-10-05 審查：_pressed 常殘留已放開的鍵，延後狀態可以連續好幾
                         # 小時（最長 20.8 小時）——這行占 App 日誌 87%（147,321 行），
@@ -6934,6 +7083,21 @@ class AppWindow(ctk.CTkFrame):
                 # 下載程序同時對外連線（使用者沒同意過的持續對外請求）。
                 if _is_apple_model(model):
                     return
+                # v2.34.0：最後一次使用超過 30 分鐘就休息（tick 照常排程、只是不 ping）。
+                # 日誌只在「進入休息」與「恢復」各記一行，不能每 90 秒一行——
+                # 保溫日誌本來就佔掉 52% 的行數（2026-10-23 審查）。
+                # 只在 Mac 休息：Windows 沒有按鍵熱身補償，維持每 90 秒保溫（規格要求 Windows 行為不變）。
+                # 也只對有按鍵熱身補償的模型休息（PRESS_WARMUP_MODELS，目前只有 qwen3-asr 0.6B）：
+                # qwen3-asr-large／MLX Whisper 不做按鍵熱身（沒量過），停了保溫就完全沒有補償（審查找到）。
+                if (IS_MAC and model.lower() in self.PRESS_WARMUP_MODELS
+                        and time.time() - self._last_user_activity > self.MLX_KEEPALIVE_ACTIVE_WINDOW_S):
+                    if not self._keepalive_paused:
+                        self._keepalive_paused = True
+                        log.info("MLX_KEEPALIVE: paused — no use for 30 min")
+                    return
+                if self._keepalive_paused:
+                    self._keepalive_paused = False
+                    log.info("MLX_KEEPALIVE: resumed — model used again")
                 # 只對已載入的模型 keepalive（轉錄 lock 內、不撞用戶操作）
                 def _ping():
                     # v2.20.3 N5：量 ping 自身耗時（≈ 模型 warmup 推論時間）
@@ -6956,7 +7120,13 @@ class AppWindow(ctk.CTkFrame):
                         # _make_keepalive_audio()（1.5s formant-based 假人聲、低音量）。
                         # 走 session.transcribe() 直呼叫、不過 Transcriber.transcribe()
                         # 外層的 RMS gate / Silero VAD，所以不會被擋掉。
-                        self.transcriber.warmup(model)
+                        ok = self.transcriber.warmup(model)
+                        # v2.34.0：warmup 失敗（內部已記 log_error）不算 ping 完成、不記帳——
+                        #   否則 audit 的 seconds_since_last_keepalive_ping 與「模型上次被用」
+                        #   會把沒讓權重變熱的失敗當成剛保溫過。
+                        if not ok:
+                            log.info(f"MLX_KEEPALIVE: ping failed (model={model})")
+                            return
                         # v2.21.6：補呼叫 mark_keepalive_ping()——此方法 v2.20.3 定義後
                         #   從未被呼叫、audit 的 seconds_since_last_keepalive_ping 欄位
                         #   一直是 None（壞掉的觀測性、151 筆離群分析全失真）。

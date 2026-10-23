@@ -227,10 +227,18 @@ def check_dependencies() -> list[str]:
     import importlib.util
     missing = []
     for pkg in ("sounddevice", "faster_whisper", "customtkinter", "pyperclip"):
-        if pkg == "sounddevice":
+        if pkg in ("sounddevice", "faster_whisper"):
             # v2.32.3：只確認有裝、不載入。載入會做 PortAudio 初始化——麥克風模式是「語音突顯」時
             # 要 10～15 秒，而這裡在主執行緒、開視窗之前。改由 AppWindow 在背景載入
             # （recorder.ensure_sounddevice），載入失敗會在那邊記錄並在按錄音時提示。
+            # v2.34.0：faster_whisper 同樣改成只確認有裝。真的 import 在主執行緒、開視窗前要
+            # 0.85～3.91 秒（2026-10-23 終端機量；App 日誌啟動階段 pidfile_acquired→config_loaded
+            # 1.36～1.77 秒），而 transcriber 本來就是用到才載入（_ensure_model 內
+            # `from faster_whisper import WhisperModel`）。Mac 預設走 MLX／Qwen3／蘋果，根本用不到；
+            # Windows 的辨識就是它，用到時才載入，行為等價。
+            # 取捨：「裝了但壞掉」（版本衝突、缺 DLL）要等到真的辨識時才發現，不再於啟動就擋下；
+            # 那時 ImportError 會從 _ensure_model 往外丟，由呼叫端（轉字流程、暖機都有 try/except）
+            # 接住並顯示轉錄失敗，不會當機。
             if importlib.util.find_spec(pkg) is None:
                 missing.append(pkg)
             continue

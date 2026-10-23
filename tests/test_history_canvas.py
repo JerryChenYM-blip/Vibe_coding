@@ -84,6 +84,10 @@ def history_window(tmp_path_factory):
     root.withdraw()
     win = gui.HistoryWindow(root, store, lambda *a, **k: None)
     win.geometry("980x640+100+100")
+    # 透明度設 0：視窗照樣被 map、照樣收到帶真實寬度的 <Configure>（這正是被測的時序），但畫面上看不到。
+    # 不這樣做的話，每跑一次全套測試，使用者螢幕上就閃一次「歷史紀錄」視窗——代理反覆跑 mutation 時
+    # 會一直開開關關，使用者回報很干擾（2026-10-23）。不用移到螢幕外：macOS 會把視窗拉回可見範圍
+    win.attributes("-alpha", 0.0)
     win.deiconify()
     # 讓 Tk 真的跑完 map + <Configure>，這正是被測的時序
     deadline = time.time() + 3.0

@@ -1117,6 +1117,16 @@ class Transcriber:
         # 落在 cold（剛重啟、距上次 keepalive 久）或 warm（剛 ping 過）區間。
         self._last_transcribe_at: Optional[float] = None       # perf_counter
         self._last_keepalive_ping_at: Optional[float] = None   # perf_counter
+        # v2.34.0：模型「上一次被用」的牆上時間（time.time）——真推論、保溫 ping、成功的熱身都會更新。
+        # 為什麼不沿用上面三個 perf_counter：perf_counter 在 macOS 底層是 mach_absolute_time，
+        # 睡眠時不前進（審查推斷，沒有在睡眠前後實測過）。闔上螢幕前剛用過、隔天一開就按熱鍵，
+        # 單調時鐘會說「才剛用過」而不熱身，偏偏這種情況權重最可能已經被換出去。
+        # 牆上時間被使用者調時鐘會跳，只影響一次熱身判斷，可接受。
+        # 上面三個 perf_counter 欄位仍留給 audit 的 seconds_since_* 欄位（語意不變）。
+        self._last_used_wall_at: Optional[float] = None
+        # v2.34.0：mlx_whisper 沒有自己的「已載入」旗標（它的快取在套件內部），
+        # 暖機或真推論成功跑過就記下是哪個模型，供 is_local_model_loaded() 判斷。
+        self._mlx_whisper_warm_model: Optional[str] = None
         self._session_start_at: float = time.perf_counter()
         self._warmup_completed: bool = False
         self._transcribe_count: int = 0   # 用來判斷 is_first_after_restart
@@ -1163,12 +1173,39 @@ class Transcriber:
     # 抓 perf_counter 差值即可判斷該次轉錄距離上次 ping/warmup 多久。
 
     def mark_keepalive_ping(self) -> None:
-        """v2.20.3 N2：gui.py 在 keepalive ping 跑完時呼叫。"""
+        """v2.20.3 N2：gui.py 在 keepalive ping 跑完時呼叫（v2.34.0：只有 ping 成功才呼叫）。"""
         self._last_keepalive_ping_at = time.perf_counter()
+        self._last_used_wall_at = time.time()
 
     def mark_warmup_complete(self) -> None:
         """v2.20.3 N2：warmup 跑完時呼叫（覆蓋既有的 warmup() 結尾）。"""
         self._warmup_completed = True
+
+    def seconds_since_model_used(self) -> Optional[float]:
+        """v2.34.0：模型「上一次被用」到現在幾秒；從沒用過回 None。
+
+        真推論、成功的保溫 ping、成功的熱身三者取最近的一個（用牆上時間，理由見
+        __init__ 的 _last_used_wall_at）。按下熱鍵時的熱身靠這個決定要不要做：
+        2026-10-23 實測閒置 90 秒後第一次推論就慢約 2 倍，所以只有「放了一陣子」才值得多跑一次小暖身。
+        """
+        if self._last_used_wall_at is None:
+            return None
+        return time.time() - self._last_used_wall_at
+
+    def is_local_model_loaded(self, model_size: str) -> bool:
+        """v2.34.0：這個本機模型的權重現在是否已在記憶體（蘋果永遠回 False）。
+
+        按下熱鍵時的熱身只對「已載入」的模型做：沒載入的話，熱身會變成在使用者講話時冷載入，
+        那條路交給既有的開機暖機流程。不拿 _lock：只是讀幾個參照，拿鎖反而可能被
+        正在進行的模型載入卡住，而這個函式在主執行緒呼叫。
+        """
+        if _is_apple_model(model_size):
+            return False
+        if _is_qwen3_model(model_size):
+            return self._qwen3_session is not None and self._qwen3_loaded_model == model_size
+        if BACKEND == "mlx":
+            return self._mlx_whisper_warm_model == model_size
+        return self._model is not None and self._loaded_model_size == model_size
 
     def _snapshot_dictionary_terms(self) -> list[str]:
         """D2-S3：lock 內取 _dictionary_terms 的淺拷貝快照。
@@ -1252,6 +1289,7 @@ class Transcriber:
         }
         self._transcribe_count += 1
         self._last_transcribe_at = now
+        self._last_used_wall_at = time.time()   # v2.34.0：牆上時間版，給按鍵熱身判斷閒置用
 
         # v2.20.3 N4：corrections_hit 收集器（在 corrections filter 套用時被 update）
         # 留在 transcribe() 整個 scope 末端、最後塞進 dict_effectiveness 傳給 _emit_audit。
@@ -2144,8 +2182,12 @@ class Transcriber:
             segments=segments,
         )
 
-    def warmup(self, model_size: str, language: Optional[str] = None) -> None:
+    def warmup(self, model_size: str, language: Optional[str] = None) -> bool:
         """預先載入模型並跑一次靜音片段，暖機完成後第一次錄音不會卡頓。
+
+        回傳（v2.34.0）：本機模型是否真的熱身成功。失敗（載入或推論丟例外，內部已記 log_error）
+        回 False，且不會更新「模型上一次被用」——失敗的熱身沒讓權重變熱，算成「剛用過」
+        會讓下一次按鍵熱身被誤判不需要。蘋果原生辨識沒有本機權重，維持舊行為一律回 True。
 
         Args:
             model_size: 要預熱的模型大小。
@@ -2167,17 +2209,22 @@ class Transcriber:
                     log.info("WHISPER: switched to apple-speech, unloading local model weights")
                     self.unload()
             self._warmup_apple(model_size, language)
+            ok = True
         # v2.14.0：Qwen3-ASR 走獨立 backend
         elif _is_qwen3_model(model_size):
-            self._warmup_qwen3(model_size)
+            ok = bool(self._warmup_qwen3(model_size))
         elif BACKEND == "mlx":
-            self._warmup_mlx(model_size)
+            ok = bool(self._warmup_mlx(model_size))
         else:
-            self._warmup_ctranslate(model_size)
+            ok = bool(self._warmup_ctranslate(model_size))
         # v2.20.3 N2：warmup 跑完 → audit context.warmup_completed = True
         # 即使內部 _warmup_* 失敗（log_error 但不 raise），這裡仍會被 set；
         # 失敗時下次 transcribe 仍可能 cold start、context 欄位讓分析端可後驗。
         self._warmup_completed = True
+        if ok:
+            # v2.34.0：只有成功才算「用過」（按鍵熱身判斷要不要熱身看的就是它）；保溫 ping 與熱身都走這裡
+            self._last_used_wall_at = time.time()
+        return ok
 
     def unload(self) -> None:
         """釋放模型記憶體（CPU 與 MLX）。App 切換到省電模式時可呼叫。"""
@@ -2186,6 +2233,7 @@ class Transcriber:
                 del self._model
                 self._model = None
             self._loaded_model_size = None
+            self._mlx_whisper_warm_model = None   # v2.34.0
             # v2.14.0：釋放 Qwen3-ASR Session（模型權重在 Session 內）
             if self._qwen3_session is not None:
                 del self._qwen3_session
@@ -2209,7 +2257,7 @@ class Transcriber:
 
     # ── MLX 後端（Apple Silicon Metal GPU）────────────────────────────────────
 
-    def _warmup_mlx(self, model_size: str) -> None:
+    def _warmup_mlx(self, model_size: str) -> bool:
         """MLX 後端暖機：載入模型並跑一次 1.5s 低振幅合成音檔。
 
         Fix 11 / 2026-05-23 — 為什麼不是 silence：
@@ -2259,9 +2307,12 @@ class Transcriber:
                         language="zh",
                         verbose=False,
                     )
+                self._mlx_whisper_warm_model = model_size
                 log.info(f"WHISPER: Warmup MLX complete (repo={hf_repo}, payload=formant-1.5s)")
+                return True
             except Exception:
                 log_error("warmup_mlx_failed", model=model_size, repo=hf_repo)
+                return False
 
     def _transcribe_mlx(
         self,
@@ -2352,6 +2403,8 @@ class Transcriber:
                     )
             except Exception as e:
                 raise RuntimeError(f"MLX transcription failed: {e}")
+        # v2.34.0：真推論成功代表 mlx_whisper 已把這個模型載進記憶體（沒做過暖機也一樣）
+        self._mlx_whisper_warm_model = model_size
 
         # 從 mlx_whisper 的輸出格式中提取 segments 與文字
         segments_raw = output.get("segments", [])
@@ -2373,7 +2426,7 @@ class Transcriber:
 
     # ── CTranslate2 後端（CPU int8）──────────────────────────────────────────
 
-    def _warmup_ctranslate(self, model_size: str) -> None:
+    def _warmup_ctranslate(self, model_size: str) -> bool:
         """CTranslate2 後端暖機：確保模型載入，並跑一次靜音。"""
         import numpy as np
         try:
@@ -2383,8 +2436,10 @@ class Transcriber:
                 segs, _ = model.transcribe(silence, beam_size=1, temperature=0)
                 list(segs)   # 必須迭代才會真正執行推論
             log.info(f"WHISPER: Warmup CTranslate complete (model={model_size})")
+            return True
         except Exception:
             log_error("warmup_ctranslate_failed", model=model_size)
+            return False
 
     def _transcribe_ctranslate(
         self,
@@ -2524,7 +2579,7 @@ class Transcriber:
                 log_error("qwen3_session_load_failed", model=hf_repo)
                 raise RuntimeError(f"無法載入 Qwen3-ASR session ({hf_repo}): {e}")
 
-    def _warmup_qwen3(self, model_size: str) -> None:
+    def _warmup_qwen3(self, model_size: str) -> bool:
         """Qwen3-ASR 暖機：載入 session + 跑 1.5s 假人聲 payload 編譯 Metal shader。
 
         類似 _warmup_mlx 的策略——用合成音檔而非 silence、強制走完整
@@ -2541,8 +2596,10 @@ class Transcriber:
                 session = self._ensure_qwen3_session(model_size)
                 session.transcribe(audio, language="Chinese", context="")
                 log.info(f"WHISPER: Warmup Qwen3-ASR complete ({model_size}, payload=formant-1.5s)")
+                return True
             except Exception:
                 log_error("warmup_qwen3_failed", model=hf_repo)
+                return False
 
     def _transcribe_qwen3(
         self,

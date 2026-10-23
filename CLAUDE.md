@@ -317,6 +317,7 @@ cat ~/.whisper_app/polish_log.jsonl | jq .         # 潤飾紀錄
 ```
 
 ### 常見坑
+0. **個人測試集（不可取代、不在專案裡）**：使用者本人念的測試錄音與各引擎轉寫結果放在 `~/WhisperPro_測試集/<日期>/`（`sentences.txt` 是標準答案、`recording.wav` 是錄音、`chunks/`、`results/`）。不進版控、不要刪；比較引擎準確度時優先用它，不要用合成語音（誤差太大）。詳見 `docs/工作紀錄/2026-10-23_蘋果語音辨識原理與提升準確度研究.md` §7。
 1. **CTkOptionMenu 不接受 `fg_color="transparent"`** — 一律用實色
 2. **tkinter 沒有真正的 alpha／blur／陰影** — 透明度用 `_blend(fg, bg, alpha)` 做 RGB 線性插值模擬；模糊／陰影不要硬上
 3. **圖示不要用 cairosvg／svglib** — Python 3.13 + libcairo 裝不起來，已改用純 PIL 手繪（4 倍超採樣 + LANCZOS 縮放）
