@@ -197,8 +197,16 @@ def check_dependencies() -> list[str]:
     v2.11.0：移除 webrtcvad（前置 VAD 已改用 faster-whisper 內建 silero
     + numpy RMS，vad.py 模組已刪）。
     """
+    import importlib.util
     missing = []
     for pkg in ("sounddevice", "faster_whisper", "customtkinter", "pyperclip"):
+        if pkg == "sounddevice":
+            # v2.32.3：只確認有裝、不載入。載入會做 PortAudio 初始化——麥克風模式是「語音突顯」時
+            # 要 10～15 秒，而這裡在主執行緒、開視窗之前。改由 AppWindow 在背景載入
+            # （recorder.ensure_sounddevice），載入失敗會在那邊記錄並在按錄音時提示。
+            if importlib.util.find_spec(pkg) is None:
+                missing.append(pkg)
+            continue
         try:
             __import__(pkg)
         except ImportError:

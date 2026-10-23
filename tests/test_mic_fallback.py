@@ -193,3 +193,32 @@ def test_這台_Mac_查得到內建麥克風而且錄音程式認得():
     if name is None:
         pytest.skip("這台 Mac 沒有內建麥克風（例如 Mac mini）")
     assert name in {d["name"] for d in _rec.AudioRecorder.list_devices()}
+
+
+def test_重整後指定麥克風的編號一律對回來_硬體卡住那條路也是(env, monkeypatch):
+    """v2.32.3：不受影響的裝置變動不再重整，舊編號沒人修——備援重整後就要對回來，
+    不然下一次錄音會開到別支（審查模擬：錄到 BlackHole、一片空白）。"""
+    rec, st = env
+    _slow(monkeypatch)                         # 走「硬體卡住」那條路（原本只有另一條會對編號）
+    rec._device_name = "EarPods"
+    rec._device_index = 0
+    st["devices"] = [{"id": 0, "name": "BlackHole 16ch"}, {"id": 5, "name": "EarPods"},
+                     {"id": 6, "name": "MacBook Pro的麥克風"}]
+    st["ok"] = {6}
+    monkeypatch.setattr(_rec, "builtin_input_device_name", lambda: "MacBook Pro的麥克風")
+    assert rec.start() is True
+    rec.stop()
+    assert rec._device_index == 5, "重整後 EarPods 換到 5 號，不能還指著 0 號（現在是 BlackHole）"
+
+
+def test_重整後指定麥克風不見了_編號清掉不亂指(env, monkeypatch):
+    rec, st = env
+    _slow(monkeypatch)
+    rec._device_name = "EarPods"
+    rec._device_index = 1
+    st["devices"] = [{"id": 0, "name": "MacBook Pro的麥克風"}, {"id": 1, "name": "BlackHole 16ch"}]
+    st["ok"] = {0}
+    monkeypatch.setattr(_rec, "builtin_input_device_name", lambda: "MacBook Pro的麥克風")
+    assert rec.start() is True
+    rec.stop()
+    assert rec._device_index is None

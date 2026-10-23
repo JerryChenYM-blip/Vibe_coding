@@ -19,6 +19,8 @@ Windows 特殊處理：
 
 from __future__ import annotations
 
+import atexit
+import contextlib
 import ctypes
 import os
 import subprocess
@@ -67,17 +69,229 @@ def _load_portaudio() -> None:
         pass   # Homebrew 不存在或 portaudio 未安裝，讓 sounddevice import 自然失敗
 
 
-# 模組載入時立即嘗試修復，確保後續 import sounddevice 能成功
-_load_portaudio()
-
-try:
-    import sounddevice as sd
-except ImportError:
-    sd = None   # 沒有 sounddevice 時，所有錄音操作都回傳失敗/空陣列
-
 from logger import get_logger, log_error
 
 log = get_logger("recorder")
+
+# v2.32.3：sounddevice 改成「要用時才載入」，Mac 由 AppWindow 在視窗出現後於背景載入。
+#
+# 為什麼不在模組最上層 import：sounddevice 一 import 就跑 PortAudio 初始化，向系統查每個音訊裝置
+# 的一堆屬性。macOS 27 上，App 的麥克風模式是「語音突顯」時，App 身分每查一次要 0.05～0.3 秒
+# （系統每次都重新協商語音突顯處理）——9 個裝置的機器 import 要 9.8～15.4 秒、重掃一次 9.5 秒；
+# 改「標準」只要 0.2 秒／0.01 秒（2026-10-06 用 App 身分實測）。放在最上層等於整段卡在開視窗之前。
+# 開著語音突顯時，按熱鍵開麥克風本身不慢（那一週中位數 152 ms），慢的只有「掃全部裝置」。
+#
+# Windows 沒有這個問題，維持原本「import 時就載入」。
+sd = None            # 載入成功後才是 sounddevice 模組；None 時所有錄音操作回傳失敗／空陣列
+_sd_failed = False   # 載入失敗過就不再重試（失敗通常是缺 libportaudio，重試也不會好）
+_sd_lock = threading.Lock()
+
+# 重掃（PortAudio terminate＋initialize）期間握著這把鎖。這段時間 PortAudio 是「未初始化」，
+# 別的執行緒去查裝置會拿到空清單、甚至讀到已釋放的記憶體（審查用真的 PortAudio 重現：72% 拿到空清單，
+# 偶爾 AssertionError／UnicodeDecodeError）。查裝置的一方不能等（主執行緒一等就是語音突顯時的 10 秒），
+# 所以拿不到鎖就回上一份清單（_device_cache）。
+_pa_lock = threading.Lock()
+_device_cache: list[dict] = []
+
+# 背景執行緒正在 PortAudio 裡（第一次載入或重掃）的件數。App 結束時 Python 會拆掉 sounddevice 模組、
+# 卸載 PortAudio；背景執行緒剛好還在裡面就會踩到已釋放的記憶體閃退（審查模擬：80 次裡 34 次）。
+_pa_busy = 0
+_pa_busy_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _portaudio_work():
+    global _pa_busy
+    with _pa_busy_lock:
+        _pa_busy += 1
+    try:
+        yield
+    finally:
+        with _pa_busy_lock:
+            _pa_busy -= 1
+
+
+def _import_sounddevice():
+    _load_portaudio()
+    import sounddevice
+    return sounddevice
+
+
+def ensure_sounddevice() -> bool:
+    """載入 sounddevice（第一次會做 PortAudio 初始化）。可重複呼叫、多執行緒同時呼叫只做一次。"""
+    global sd, _sd_failed
+    with _sd_lock:
+        if sd is not None:
+            return True
+        if _sd_failed:
+            return False
+        try:
+            with _portaudio_work():
+                module = _import_sounddevice()
+        except Exception:
+            # 原本只接 ImportError，找不到 libportaudio 的 OSError 會讓整個 App 開不起來；
+            # 現在可能在背景發生，一樣當成「不能錄音」，並留下紀錄
+            log_error("sounddevice_load_failed")
+            _sd_failed = True
+            return False
+        # sounddevice 自己註冊了「結束時關掉 PortAudio」，而且比我們晚註冊、會先跑——
+        # 那時背景重掃可能正在 initialize，兩邊同時動 PortAudio。改由 _on_exit 在確認沒人在用之後才呼叫。
+        try:
+            atexit.unregister(module._exit_handler)
+        except Exception:
+            pass
+        sd = module
+        _refresh_device_cache()
+        return True
+
+
+def _refresh_device_cache() -> None:
+    global _device_cache
+    try:
+        _device_cache = [
+            {"id": i, "name": d["name"]}
+            for i, d in enumerate(sd.query_devices())
+            if d.get("max_input_channels", 0) > 0
+        ]
+    except Exception:
+        log_error("query_audio_devices_failed")
+
+
+@atexit.register
+def _on_exit() -> None:
+    """App 結束：背景執行緒還在 PortAudio 裡就最多等 2 秒；還沒好就直接結束程序，
+    不讓 Python 拆掉它正在用的模組（會閃退）。沒人在用才照 sounddevice 原本的方式關掉 PortAudio。
+
+    最早註冊（recorder 很早就被 import），所以最後才跑：pidfile 清理、啟動紀錄等其他收尾都已做完。"""
+    deadline = time.monotonic() + 2.0
+    while _pa_busy and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if _pa_busy:
+        try:
+            log.warning("RECORD: exiting while PortAudio work is in flight; skipping teardown")
+        except Exception:
+            pass
+        os._exit(0)
+        return   # 正式環境到不了這裡；測試把 os._exit 換掉時，不能接著真的去關 PortAudio
+    if sd is not None:
+        try:
+            sd._exit_handler()
+        except Exception:
+            pass
+
+
+def sounddevice_ready() -> bool:
+    return sd is not None
+
+
+def sounddevice_failed() -> bool:
+    return _sd_failed
+
+
+if not IS_MAC:
+    ensure_sounddevice()
+
+
+def _probe_coreaudio_ms() -> Optional[float]:
+    """問一次預設麥克風的取樣率，回傳花了幾毫秒；問不到回 None。只讀、不開麥克風。"""
+    import ctypes.util
+
+    class _Addr(ctypes.Structure):
+        _fields_ = [("sel", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("elem", ctypes.c_uint32)]
+
+    def _cc(code: bytes) -> int:
+        return int.from_bytes(code, "big")
+
+    ca = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
+    ca.AudioObjectGetPropertyData.argtypes = [
+        ctypes.c_uint32, ctypes.POINTER(_Addr), ctypes.c_uint32, ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p,
+    ]
+    t0 = time.perf_counter()
+    dev = ctypes.c_uint32(0)
+    size = ctypes.c_uint32(4)
+    addr = _Addr(_cc(b"dIn "), _cc(b"glob"), 0)
+    if ca.AudioObjectGetPropertyData(1, ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(dev)) != 0:
+        return None
+    rate = ctypes.c_double(0.0)
+    size = ctypes.c_uint32(8)
+    addr = _Addr(_cc(b"nsrt"), _cc(b"glob"), 0)
+    if ca.AudioObjectGetPropertyData(dev.value, ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(rate)) != 0:
+        return None
+    return (time.perf_counter() - t0) * 1000
+
+
+def wait_until_settled(timeout: float = 30.0, fast_ms: float = 20.0, need: int = 2,
+                       interval: float = 0.3, _probe=None, _sleep=time.sleep) -> float:
+    """等系統把音訊設定調整好，回傳等了幾秒。在背景執行緒呼叫。
+
+    為什麼要等（2026-10-06 用 App 身分實測，麥克風模式「語音突顯」）：PortAudio 掃完裝置之後，
+    系統還要約 17 秒在背景把語音突顯調整好；這段時間開麥克風要 3～7 秒（在主執行緒就是畫面卡住），
+    之後只要 0.06～0.1 秒。這段時間問一個很輕的屬性（預設麥克風的取樣率）也會慢（80～200 ms），
+    調整好就變 0～2 ms——拿它當訊號，不用真的去開麥克風。標準模式第一次問就很快，幾乎不用等。
+
+    連續 need 次都快才算好；問不到或超過 timeout 就不等了（不能因為量不到就永遠不讓人錄音）。"""
+    if not IS_MAC:
+        return 0.0
+    probe = _probe or _probe_coreaudio_ms
+    t0 = time.perf_counter()
+    streak = 0
+    misses = 0
+    while time.perf_counter() - t0 < timeout:
+        try:
+            ms = probe()
+        except Exception:
+            ms = None
+        if ms is None:
+            # 問不到：可能根本沒有麥克風（沒東西要等），也可能預設麥克風剛被拔、系統還在換。
+            # 連續幾次都問不到才放棄，不要第一次就放行（那時系統可能正在調整）
+            misses += 1
+            if misses >= 3:
+                break
+            _sleep(interval)
+            continue
+        misses = 0
+        streak = streak + 1 if ms < fast_ms else 0
+        if streak >= need:
+            break
+        _sleep(interval if streak == 0 else 0.05)
+    return round(time.perf_counter() - t0, 2)
+
+
+_MIC_MODE_NAMES = {0: "標準", 1: "寬廣頻譜", 2: "語音突顯"}
+
+
+def _preferred_microphone_mode_ctypes() -> int:
+    """+[AVCaptureDevice preferredMicrophoneMode]，直接用 ctypes 呼叫 Objective-C runtime。
+
+    不用 PyObjC 的 objc.loadBundle：它載入 AVFoundation 時整段握著 GIL，主執行緒（畫面）會頓
+    0.75～1.4 秒（審查實測）；ctypes 呼叫期間會放掉 GIL。"""
+    import ctypes.util
+    ctypes.cdll.LoadLibrary("/System/Library/Frameworks/AVFoundation.framework/AVFoundation")
+    rt = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+    rt.objc_getClass.restype = ctypes.c_void_p
+    rt.objc_getClass.argtypes = [ctypes.c_char_p]
+    rt.sel_registerName.restype = ctypes.c_void_p
+    rt.sel_registerName.argtypes = [ctypes.c_char_p]
+    rt.objc_msgSend.restype = ctypes.c_long
+    rt.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    cls = rt.objc_getClass(b"AVCaptureDevice")
+    if not cls:
+        raise RuntimeError("AVCaptureDevice not found")
+    return int(rt.objc_msgSend(cls, rt.sel_registerName(b"preferredMicrophoneMode")))
+
+
+def read_microphone_mode(_reader=_preferred_microphone_mode_ctypes) -> Optional[int]:
+    """這個 App 在 macOS 的麥克風模式：0 標準、1 寬廣頻譜、2 語音突顯；讀不到回 None。
+
+    只讀：App 不能改這個設定，只有使用者能在控制中心改（錄音中才會出現「麥克風模式」）。
+    記進日誌是為了下次啟動變慢時一眼看得出原因（2026-10-06 查了一整天才找到）。"""
+    if not IS_MAC:
+        return None
+    try:
+        return int(_reader())
+    except Exception:
+        return None
 
 
 # ── 錄音參數常數 ──────────────────────────────────────────────────────────────
@@ -93,6 +307,16 @@ BLOCK_MS    = 100      # sounddevice callback 每次呼叫的時間塊大小（�
 # 每次都要等 5～8.5 秒才失敗；同一支再試一次只會讓使用者再白等一輪。
 # 反過來，清單過期（拔掉耳機後問預設麥克風拿到 -1）是 4 毫秒內就失敗。
 _SLOW_OPEN_FAIL_S = 1.0
+
+
+def coreaudio_input_names() -> set:
+    """系統現在所有能收音的裝置名字（不經過 PortAudio，剛插的也看得到）。問不到回空集合。"""
+    if not IS_MAC:
+        return set()
+    try:
+        return set(_ca_input_devices())
+    except Exception:
+        return set()
 
 
 def builtin_input_device_name() -> Optional[str]:
@@ -166,6 +390,84 @@ def builtin_input_device_name() -> Optional[str]:
         return None
 
 
+# ── v2.32.3：裝置變動時判斷「有沒有影響到正在用的麥克風」用的輕量查詢 ──────────────
+# 只問系統一兩個問題，不碰 PortAudio。語音突顯時 PortAudio 重掃一次要約 10 秒、之後系統還要約 17 秒
+# 調整（這段時間開麥克風會卡）；而這台機器每天約 25 次裝置變動，多半跟正在用的麥克風無關
+# （日誌裡裝置編號在 4↔5 之間跳，推斷是 iPhone 接續互通麥克風自己上下線）。
+
+class _CAAddr(ctypes.Structure):
+    _fields_ = [("mSelector", ctypes.c_uint32), ("mScope", ctypes.c_uint32), ("mElement", ctypes.c_uint32)]
+
+
+def _cc4(code: bytes) -> int:
+    return int.from_bytes(code, "big")
+
+
+_ca_libs = None
+
+
+def _ca():
+    global _ca_libs
+    if _ca_libs is None:
+        import ctypes.util
+        ca = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
+        cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+        cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+        cf.CFStringGetCString.restype = ctypes.c_bool
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        _ca_libs = (ca, cf)
+    return _ca_libs
+
+
+def _ca_default_input() -> int:
+    """系統預設麥克風的 AudioDeviceID（0＝沒有）。"""
+    ca, _ = _ca()
+    dev, size = ctypes.c_uint32(0), ctypes.c_uint32(4)
+    addr = _CAAddr(_cc4(b"dIn "), _cc4(b"glob"), 0)
+    if ca.AudioObjectGetPropertyData(ctypes.c_uint32(1), ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(dev)) != 0:
+        raise OSError("default input query failed")
+    return dev.value
+
+
+def _ca_alive(dev_id: int) -> bool:
+    """這個 AudioDeviceID 還在不在（拔掉之後查會失敗或回 0）。"""
+    ca, _ = _ca()
+    alive, size = ctypes.c_uint32(0), ctypes.c_uint32(4)
+    addr = _CAAddr(_cc4(b"livn"), _cc4(b"glob"), 0)
+    if ca.AudioObjectGetPropertyData(ctypes.c_uint32(dev_id), ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(alive)) != 0:
+        return False
+    return bool(alive.value)
+
+
+def _ca_input_devices() -> dict:
+    """{名字: AudioDeviceID}，只列能收音的裝置。名字跟 PortAudio 的一樣（都是 CoreAudio 的裝置名稱）。"""
+    ca, cf = _ca()
+    glob, inpt = _cc4(b"glob"), _cc4(b"inpt")
+    addr = _CAAddr(_cc4(b"dev#"), glob, 0)
+    size = ctypes.c_uint32(0)
+    if ca.AudioObjectGetPropertyDataSize(ctypes.c_uint32(1), ctypes.byref(addr), 0, None, ctypes.byref(size)) != 0:
+        raise OSError("device list query failed")
+    ids = (ctypes.c_uint32 * (size.value // 4))()
+    if ca.AudioObjectGetPropertyData(ctypes.c_uint32(1), ctypes.byref(addr), 0, None, ctypes.byref(size), ids) != 0:
+        raise OSError("device list query failed")
+    out = {}
+    for dev in ids:
+        dev_id = ctypes.c_uint32(dev)
+        addr, sz = _CAAddr(_cc4(b"stm#"), inpt, 0), ctypes.c_uint32(0)
+        if ca.AudioObjectGetPropertyDataSize(dev_id, ctypes.byref(addr), 0, None, ctypes.byref(sz)) != 0 or sz.value == 0:
+            continue
+        ref, sz = ctypes.c_void_p(), ctypes.c_uint32(ctypes.sizeof(ctypes.c_void_p))
+        addr = _CAAddr(_cc4(b"lnam"), glob, 0)
+        if ca.AudioObjectGetPropertyData(dev_id, ctypes.byref(addr), 0, None, ctypes.byref(sz), ctypes.byref(ref)) != 0 or not ref.value:
+            continue
+        buf = ctypes.create_string_buffer(512)
+        ok = cf.CFStringGetCString(ref, buf, 512, 0x08000100)   # kCFStringEncodingUTF8
+        cf.CFRelease(ref)
+        if ok:
+            out[buf.value.decode("utf-8")] = int(dev)
+    return out
+
+
 class AudioRecorder:
     """執行緒安全的麥克風錄音器，輸出 float32 numpy 陣列。
 
@@ -195,6 +497,10 @@ class AudioRecorder:
         self._ca_lib = None          # CoreAudio.framework 的 CDLL handle
         self._ca_listener = None     # CFUNCTYPE callback 物件——必須存成 attribute 防 GC（否則 segfault）
         self._ca_addr = None         # AudioObjectPropertyAddress 實例（remove 時要傳回去）
+        self._ca_addr_default = None # v2.32.3：「預設麥克風換了」那個監聽
+        self._monitor_lock = threading.Lock()
+        self._monitor_closed = False  # stop_device_monitor 之後不准再登記（登記改在背景做）
+        self._ca_snap = None          # v2.32.3：上次 PortAudio 掃描時系統的樣子（見 snapshot_coreaudio）
         self._ca_on_change = None    # 上層傳入的 on_change callable
 
         # Windows 裝置變動監聽相關（輪詢法，見 start_device_monitor 的 IS_WINDOWS 分支）：
@@ -334,6 +640,11 @@ class AudioRecorder:
         """
         # ① 重整清單（refresh_portaudio 自己會拿 self._lock，RLock 可重入）
         self.refresh_portaudio()
+        # v2.32.3：重整後所有編號都可能位移——不管下面走哪條路，都先把指定麥克風的編號對回來
+        # （不在清單裡就清掉）。以前靠下一次裝置變動的重整順手修好；現在不受影響的變動不重整，
+        # 舊編號會一直指錯，審查模擬出錄到 BlackHole、一片空白（2026-10-07）
+        if self._device_name is not None:
+            self._device_index = self._index_for_name(self._device_name)
 
         candidates: list[tuple[Optional[int], str]] = []
         # ② 同一支再試一次：只在第一次是瞬間失敗時（慢慢失敗 = 硬體卡住，再試只是白等）
@@ -489,16 +800,14 @@ class AudioRecorder:
         """
         if sd is None:
             return []
+        # v2.32.3：重掃進行中（PortAudio 未初始化）就回上一份清單，不等（見 _pa_lock）
+        if not _pa_lock.acquire(blocking=False):
+            return list(_device_cache)
         try:
-            devices = []
-            for i, d in enumerate(sd.query_devices()):
-                # 過濾只保留有麥克風輸入的裝置
-                if d.get("max_input_channels", 0) > 0:
-                    devices.append({"id": i, "name": d["name"]})
-            return devices
-        except Exception:
-            log_error("query_audio_devices_failed")
-            return []
+            _refresh_device_cache()
+            return list(_device_cache)
+        finally:
+            _pa_lock.release()
 
     # ── 麥克風熱插拔偵測（v2.21）────────────────────────────────────────────────
 
@@ -518,12 +827,75 @@ class AudioRecorder:
                 log.info("RECORD: refresh_portaudio skipped (recording in progress)")
                 return self.list_devices()
             try:
-                sd._terminate()
-                sd._initialize()
+                with _pa_lock, _portaudio_work():
+                    sd._terminate()
+                    sd._initialize()
+                    _refresh_device_cache()
+                # 上一次記下的系統狀態跟這次的清單不一定對得上了：作廢，由呼叫端重新記
+                # （背景重掃那條路會馬上記；備援重掃沒記的話，下一次裝置變動一律當作受影響）
+                self._ca_snap = None
                 log.info("RECORD: PortAudio re-initialized for device refresh")
             except Exception:
                 log_error("portaudio_reinit_failed")
         return self.list_devices()
+
+    def snapshot_coreaudio(self) -> None:
+        """記下「這次 PortAudio 掃描時」系統的樣子，下次裝置變動時拿來比。在背景執行緒呼叫。
+
+        要在掃描一完成就記，不能等系統調整好（語音突顯約 17 秒）再記：那段時間的變動會被當成
+        「本來就這樣」，之後的比對永遠看不出 PortAudio 手上的清單已經過時（審查找到，2026-10-07）。"""
+        if not IS_MAC:
+            return
+        try:
+            self._ca_snap = {"default": _ca_default_input(), "ids": _ca_input_devices()}
+        except Exception:
+            self._ca_snap = None
+            log_error("coreaudio_snapshot_failed")
+
+    def device_change_affects_us(self) -> bool:
+        """裝置變動有沒有影響到正在用的麥克風（有才需要重掃 PortAudio）。在背景執行緒呼叫。
+
+        - 指定了麥克風：只看那一支——不見了、或上次掃描時不在但現在插回來了，才算受影響。
+          還在的話，PortAudio 舊清單裡它的編號照樣指向同一個裝置（系統裝置編號在裝置存在期間不變），開得起來。
+        - 用系統預設：只看預設麥克風有沒有換——PortAudio 的「預設」是上次掃描時記下的那支。
+        任何一步問不到就當作受影響（照原本的做法重掃），不能因為省這一次而錄錯麥克風。
+        Windows 一律回 True：重掃很便宜，維持原本行為。"""
+        if not IS_MAC:
+            return True
+        snap = getattr(self, "_ca_snap", None)
+        if not snap:
+            return True
+        try:
+            name = self._device_name
+            if name:
+                dev = snap["ids"].get(name)
+                if dev is None:
+                    return name in _ca_input_devices()
+                return not _ca_alive(dev)
+            return _ca_default_input() != snap["default"]
+        except Exception:
+            log_error("device_change_check_failed")
+            return True
+
+    def portaudio_view_consistent(self) -> bool:
+        """PortAudio 手上的清單，對「正在用的麥克風」來說跟系統現在的樣子一致嗎？在背景執行緒呼叫。
+
+        比 device_change_affects_us 多一層保險：它只能看「上次記下之後」的變化；這裡直接拿
+        PortAudio 的清單跟系統比，連記下之前（例如啟動時掃描進行中、還沒開始監聽）的變化都抓得到。
+        問不到就回 False（照原本重掃）。"""
+        if not IS_MAC:
+            return True
+        try:
+            ca_ids = _ca_input_devices()
+            name = self._device_name
+            if name:
+                pa_names = {d["name"] for d in self.list_devices()}
+                return (name in pa_names) == (name in ca_ids)
+            # 系統預設：PortAudio 的「預設」是掃描當下記的那支，要跟系統現在的預設是同一支
+            pa_default = sd.query_devices(kind="input")["name"]
+            return ca_ids.get(pa_default) == _ca_default_input()
+        except Exception:
+            return False
 
     def is_active_device_present(self) -> bool:
         """檢查目前選定的裝置是否還在（插著）。
@@ -613,25 +985,42 @@ class AudioRecorder:
                     return 0   # OSStatus noErr
 
                 cb = CALLBACK_TYPE(_ca_callback)
+                # v2.32.3：也監聽「預設麥克風換了」。用系統預設時，插耳機後系統可能晚一點才把預設換過去，
+                # 只聽「裝置清單變了」的話，判斷「有沒有影響」那一刻預設還沒換，之後就不會再被通知
+                addr_default = AudioObjectPropertyAddress(
+                    int.from_bytes(b"dIn ", "big"),
+                    kAudioObjectPropertyScopeGlobal,
+                    kAudioObjectPropertyElementMain,
+                )
 
                 # ── 註冊監聽 ──
-                status = ca.AudioObjectAddPropertyListener(
-                    ctypes.c_uint32(kAudioObjectSystemObject),
-                    ctypes.byref(addr),
-                    cb,
-                    None,
-                )
-                if status != 0:
-                    log.warning(f"RECORD: AudioObjectAddPropertyListener failed, status={status}")
-                    return False
+                # v2.32.3：登記改在背景做；跟 stop_device_monitor 用同一把鎖，App 關掉之後不能再登記
+                # （不然監聽留在系統裡、指向已釋放的 callback，關閉時有閃退風險）
+                with self._monitor_lock:
+                    if self._monitor_closed:
+                        return False
+                    status = ca.AudioObjectAddPropertyListener(
+                        ctypes.c_uint32(kAudioObjectSystemObject),
+                        ctypes.byref(addr),
+                        cb,
+                        None,
+                    )
+                    if status != 0:
+                        log.warning(f"RECORD: AudioObjectAddPropertyListener failed, status={status}")
+                        return False
+                    if ca.AudioObjectAddPropertyListener(
+                        ctypes.c_uint32(kAudioObjectSystemObject), ctypes.byref(addr_default), cb, None,
+                    ) != 0:
+                        addr_default = None   # 只少了「預設換了」的通知，裝置清單的通知照樣有
 
-                # ── 存 handle ──
-                # cb（CFUNCTYPE 實體）必須存成 instance attribute，否則離開本函式後被 GC 回收，
-                # CoreAudio 之後回呼一個已釋放的位址 → segfault。addr 同理（remove 時要傳回去）。
-                self._ca_lib = ca
-                self._ca_listener = cb
-                self._ca_addr = addr
-                self._ca_on_change = on_change
+                    # ── 存 handle ──
+                    # cb（CFUNCTYPE 實體）必須存成 instance attribute，否則離開本函式後被 GC 回收，
+                    # CoreAudio 之後回呼一個已釋放的位址 → segfault。addr 同理（remove 時要傳回去）。
+                    self._ca_lib = ca
+                    self._ca_listener = cb
+                    self._ca_addr = addr
+                    self._ca_addr_default = addr_default
+                    self._ca_on_change = on_change
                 log.info("RECORD: CoreAudio device monitor registered")
                 return True
             except Exception:
@@ -690,25 +1079,30 @@ class AudioRecorder:
         remove listener 的動作。
         """
         if IS_MAC:
-            if self._ca_lib is None or self._ca_listener is None or self._ca_addr is None:
-                return
-            try:
-                kAudioObjectSystemObject = 1
-                self._ca_lib.AudioObjectRemovePropertyListener(
-                    ctypes.c_uint32(kAudioObjectSystemObject),
-                    ctypes.byref(self._ca_addr),
-                    self._ca_listener,
-                    None,
-                )
-                log.info("RECORD: CoreAudio device monitor removed")
-            except Exception:
-                log_error("stop_device_monitor_failed")
-            finally:
-                # 清掉 handle，防止重複 remove；callback 物件此時可安全被 GC
-                self._ca_lib = None
-                self._ca_listener = None
-                self._ca_addr = None
-                self._ca_on_change = None
+            with self._monitor_lock:
+                self._monitor_closed = True   # 背景還沒登記的話，之後也不准登記了
+                if self._ca_lib is None or self._ca_listener is None or self._ca_addr is None:
+                    return
+                try:
+                    kAudioObjectSystemObject = 1
+                    for a in (self._ca_addr, getattr(self, "_ca_addr_default", None)):
+                        if a is not None:
+                            self._ca_lib.AudioObjectRemovePropertyListener(
+                                ctypes.c_uint32(kAudioObjectSystemObject),
+                                ctypes.byref(a),
+                                self._ca_listener,
+                                None,
+                            )
+                    log.info("RECORD: CoreAudio device monitor removed")
+                except Exception:
+                    log_error("stop_device_monitor_failed")
+                finally:
+                    # 清掉 handle，防止重複 remove；callback 物件此時可安全被 GC
+                    self._ca_lib = None
+                    self._ca_listener = None
+                    self._ca_addr = None
+                    self._ca_addr_default = None
+                    self._ca_on_change = None
         elif IS_WINDOWS:
             if self._poll_stop_event is None:
                 return
