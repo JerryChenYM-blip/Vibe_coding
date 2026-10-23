@@ -1,12 +1,14 @@
 # Mac/Windows 雙棲 — 移植自 macOS v2.21.6
 """
-麥克風錄音模組（sounddevice 封裝）。
+麥克風錄音模組（macOS：系統 AudioQueue；Windows：sounddevice 封裝）。
 
 提供執行緒安全的音訊錄製介面，輸出 float32 numpy 陣列（16 kHz 單聲道）。
 
-macOS 特殊處理：
-  若 sounddevice 找不到 libportaudio（DYLD_LIBRARY_PATH 未設定），
-  會嘗試從 Homebrew 安裝路徑動態載入，使用者無需手動設定環境變數。
+macOS 特殊處理（v2.33.0 起）：
+  不再載入 sounddevice／PortAudio——它一初始化就掃全部裝置，麥克風模式是「語音突顯」時要 10～15 秒。
+  改用 mac_audio_queue.AQInputStream 只開「一支」麥克風，並在 App 啟動最早期就先開著暖機
+  （見 prewarm）；裝置清單改走 CoreAudio 查詢並快取，主執行緒絕不做列舉。
+  （_load_portaudio 的 Homebrew 動態載入沒動，只是 Mac 的正式路徑已不走 sounddevice。）
 
 Windows 特殊處理：
   PyPI 上的 sounddevice wheel 已內建打包 PortAudio DLL，不需要 Homebrew
@@ -30,6 +32,7 @@ from typing import Optional
 
 import numpy as np
 
+import mac_audio_queue as _mac
 from platform_util import IS_MAC, IS_WINDOWS
 
 
@@ -73,13 +76,12 @@ from logger import get_logger, log_error
 
 log = get_logger("recorder")
 
-# v2.32.3：sounddevice 改成「要用時才載入」，Mac 由 AppWindow 在視窗出現後於背景載入。
+# v2.32.3：sounddevice 改成「要用時才載入」。v2.33.0 起 Mac 完全不載入它（改用 AudioQueue，見檔案開頭）。
 #
 # 為什麼不在模組最上層 import：sounddevice 一 import 就跑 PortAudio 初始化，向系統查每個音訊裝置
 # 的一堆屬性。macOS 27 上，App 的麥克風模式是「語音突顯」時，App 身分每查一次要 0.05～0.3 秒
 # （系統每次都重新協商語音突顯處理）——9 個裝置的機器 import 要 9.8～15.4 秒、重掃一次 9.5 秒；
-# 改「標準」只要 0.2 秒／0.01 秒（2026-10-06 用 App 身分實測）。放在最上層等於整段卡在開視窗之前。
-# 開著語音突顯時，按熱鍵開麥克風本身不慢（那一週中位數 152 ms），慢的只有「掃全部裝置」。
+# 改「標準」只要 0.2 秒／0.01 秒（2026-10-06 用 App 身分實測）。
 #
 # Windows 沒有這個問題，維持原本「import 時就載入」。
 sd = None            # 載入成功後才是 sounddevice 模組；None 時所有錄音操作回傳失敗／空陣列
@@ -159,20 +161,25 @@ def _refresh_device_cache() -> None:
 
 @atexit.register
 def _on_exit() -> None:
-    """App 結束：背景執行緒還在 PortAudio 裡就最多等 2 秒；還沒好就直接結束程序，
-    不讓 Python 拆掉它正在用的模組（會閃退）。沒人在用才照 sounddevice 原本的方式關掉 PortAudio。
+    """App 結束：背景執行緒還在 PortAudio／AudioQueue 裡就最多等 2 秒；還沒好就直接結束程序，
+    不讓 Python 拆掉它正在用的模組（會閃退）。沒人在用才關掉還開著的 AudioQueue（暖機的、錄音中的），
+    再照 sounddevice 原本的方式關掉 PortAudio。
 
     最早註冊（recorder 很早就被 import），所以最後才跑：pidfile 清理、啟動紀錄等其他收尾都已做完。"""
     deadline = time.monotonic() + 2.0
-    while _pa_busy and time.monotonic() < deadline:
+    while (_pa_busy or _mac.busy_count()) and time.monotonic() < deadline:
         time.sleep(0.05)
-    if _pa_busy:
+    if _pa_busy or _mac.busy_count():
         try:
-            log.warning("RECORD: exiting while PortAudio work is in flight; skipping teardown")
+            log.warning("RECORD: exiting while PortAudio/AudioQueue work is in flight; skipping teardown")
         except Exception:
             pass
         os._exit(0)
         return   # 正式環境到不了這裡；測試把 os._exit 換掉時，不能接著真的去關 PortAudio
+    try:
+        _mac.close_all()   # 暖機中的、錄音中的都在登記表裡；關掉 = 選單列的橘色麥克風燈跟著熄
+    except Exception:
+        pass
     if sd is not None:
         try:
             sd._exit_handler()
@@ -190,72 +197,6 @@ def sounddevice_failed() -> bool:
 
 if not IS_MAC:
     ensure_sounddevice()
-
-
-def _probe_coreaudio_ms() -> Optional[float]:
-    """問一次預設麥克風的取樣率，回傳花了幾毫秒；問不到回 None。只讀、不開麥克風。"""
-    import ctypes.util
-
-    class _Addr(ctypes.Structure):
-        _fields_ = [("sel", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("elem", ctypes.c_uint32)]
-
-    def _cc(code: bytes) -> int:
-        return int.from_bytes(code, "big")
-
-    ca = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
-    ca.AudioObjectGetPropertyData.argtypes = [
-        ctypes.c_uint32, ctypes.POINTER(_Addr), ctypes.c_uint32, ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p,
-    ]
-    t0 = time.perf_counter()
-    dev = ctypes.c_uint32(0)
-    size = ctypes.c_uint32(4)
-    addr = _Addr(_cc(b"dIn "), _cc(b"glob"), 0)
-    if ca.AudioObjectGetPropertyData(1, ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(dev)) != 0:
-        return None
-    rate = ctypes.c_double(0.0)
-    size = ctypes.c_uint32(8)
-    addr = _Addr(_cc(b"nsrt"), _cc(b"glob"), 0)
-    if ca.AudioObjectGetPropertyData(dev.value, ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(rate)) != 0:
-        return None
-    return (time.perf_counter() - t0) * 1000
-
-
-def wait_until_settled(timeout: float = 30.0, fast_ms: float = 20.0, need: int = 2,
-                       interval: float = 0.3, _probe=None, _sleep=time.sleep) -> float:
-    """等系統把音訊設定調整好，回傳等了幾秒。在背景執行緒呼叫。
-
-    為什麼要等（2026-10-06 用 App 身分實測，麥克風模式「語音突顯」）：PortAudio 掃完裝置之後，
-    系統還要約 17 秒在背景把語音突顯調整好；這段時間開麥克風要 3～7 秒（在主執行緒就是畫面卡住），
-    之後只要 0.06～0.1 秒。這段時間問一個很輕的屬性（預設麥克風的取樣率）也會慢（80～200 ms），
-    調整好就變 0～2 ms——拿它當訊號，不用真的去開麥克風。標準模式第一次問就很快，幾乎不用等。
-
-    連續 need 次都快才算好；問不到或超過 timeout 就不等了（不能因為量不到就永遠不讓人錄音）。"""
-    if not IS_MAC:
-        return 0.0
-    probe = _probe or _probe_coreaudio_ms
-    t0 = time.perf_counter()
-    streak = 0
-    misses = 0
-    while time.perf_counter() - t0 < timeout:
-        try:
-            ms = probe()
-        except Exception:
-            ms = None
-        if ms is None:
-            # 問不到：可能根本沒有麥克風（沒東西要等），也可能預設麥克風剛被拔、系統還在換。
-            # 連續幾次都問不到才放棄，不要第一次就放行（那時系統可能正在調整）
-            misses += 1
-            if misses >= 3:
-                break
-            _sleep(interval)
-            continue
-        misses = 0
-        streak = streak + 1 if ms < fast_ms else 0
-        if streak >= need:
-            break
-        _sleep(interval if streak == 0 else 0.05)
-    return round(time.perf_counter() - t0, 2)
 
 
 _MIC_MODE_NAMES = {0: "標準", 1: "寬廣頻譜", 2: "語音突顯"}
@@ -310,11 +251,12 @@ _SLOW_OPEN_FAIL_S = 1.0
 
 
 def coreaudio_input_names() -> set:
-    """系統現在所有能收音的裝置名字（不經過 PortAudio，剛插的也看得到）。問不到回空集合。"""
+    """系統現在所有能收音的裝置名字（直接問 CoreAudio，剛插的也看得到）。問不到回空集合。
+    要列舉全部裝置，語音突顯時約 2.5 秒——只能在背景執行緒呼叫。"""
     if not IS_MAC:
         return set()
     try:
-        return set(_ca_input_devices())
+        return {d["name"] for d in _mac.input_devices()}
     except Exception:
         return set()
 
@@ -390,82 +332,301 @@ def builtin_input_device_name() -> Optional[str]:
         return None
 
 
-# ── v2.32.3：裝置變動時判斷「有沒有影響到正在用的麥克風」用的輕量查詢 ──────────────
-# 只問系統一兩個問題，不碰 PortAudio。語音突顯時 PortAudio 重掃一次要約 10 秒、之後系統還要約 17 秒
-# 調整（這段時間開麥克風會卡）；而這台機器每天約 25 次裝置變動，多半跟正在用的麥克風無關
-# （日誌裡裝置編號在 4↔5 之間跳，推斷是 iPhone 接續互通麥克風自己上下線）。
+# ── v2.33.0：Mac 裝置清單快取與麥克風「暖機」 ─────────────────────────────────────
 
-class _CAAddr(ctypes.Structure):
-    _fields_ = [("mSelector", ctypes.c_uint32), ("mScope", ctypes.c_uint32), ("mElement", ctypes.c_uint32)]
-
-
-def _cc4(code: bytes) -> int:
-    return int.from_bytes(code, "big")
+# Mac 的輸入裝置清單：[{"id": UID 字串, "name": 名字}]。主執行緒只讀這份快取，絕不自己列舉
+# （語音突顯時列舉全部裝置要 2～4 秒）；填它的是暖機背景執行緒與 AudioRecorder.refresh_devices()。
+_mac_devices: list = []
+_mac_devices_ready = False   # 至少填過一次（空清單也算：真的沒有任何麥克風）
+_mac_devices_event = threading.Event()   # 第一次填好時 set，給 wait_devices 等
 
 
-_ca_libs = None
+def _set_mac_devices(devices: list) -> None:
+    global _mac_devices, _mac_devices_ready
+    _mac_devices = list(devices)
+    _mac_devices_ready = True
+    _mac_devices_event.set()
 
 
-def _ca():
-    global _ca_libs
-    if _ca_libs is None:
-        import ctypes.util
-        ca = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
-        cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
-        cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
-        cf.CFStringGetCString.restype = ctypes.c_bool
-        cf.CFRelease.argtypes = [ctypes.c_void_p]
-        _ca_libs = (ca, cf)
-    return _ca_libs
+def wait_devices(timeout: float) -> bool:
+    """等裝置清單快取第一次填好（背景執行緒用）。填好回 True，逾時回 False。
+
+    為什麼要等：啟動時設定的麥克風只記了名字（清單還沒填），清單一填好就要對帳——
+    設定的那支沒插著就退回系統預設，不然每次按錄音都會為了找它而卡住。"""
+    if _mac_devices_ready:
+        return True
+    _mac_devices_event.wait(timeout)
+    return _mac_devices_ready
 
 
-def _ca_default_input() -> int:
-    """系統預設麥克風的 AudioDeviceID（0＝沒有）。"""
-    ca, _ = _ca()
-    dev, size = ctypes.c_uint32(0), ctypes.c_uint32(4)
-    addr = _CAAddr(_cc4(b"dIn "), _cc4(b"glob"), 0)
-    if ca.AudioObjectGetPropertyData(ctypes.c_uint32(1), ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(dev)) != 0:
-        raise OSError("default input query failed")
-    return dev.value
+def devices_ready() -> bool:
+    """裝置清單可以信了嗎？Mac：快取填過；Windows：PortAudio 已載入。設定視窗用它決定要不要保留使用者選的那支。"""
+    return _mac_devices_ready if IS_MAC else sd is not None
 
 
-def _ca_alive(dev_id: int) -> bool:
-    """這個 AudioDeviceID 還在不在（拔掉之後查會失敗或回 0）。"""
-    ca, _ = _ca()
-    alive, size = ctypes.c_uint32(0), ctypes.c_uint32(4)
-    addr = _CAAddr(_cc4(b"livn"), _cc4(b"glob"), 0)
-    if ca.AudioObjectGetPropertyData(ctypes.c_uint32(dev_id), ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(alive)) != 0:
+# 暖機要撐多久。30 秒是實測值（2026-10-08，App 身分、macOS 27、麥克風模式「語音突顯」）：
+#   • 程序啟動後約 30 秒內，每開一次麥克風要 1～5 秒；30 秒後降到 0.05～0.08 秒（跟用哪種 API 無關，
+#     推斷是系統替這個 App 準備語音突顯的初始化期）
+#   • 啟動就開著、撐到 30 秒才關 → 之後每次開 0.06～0.08 秒；只撐 15 秒不夠
+#   • 實驗程式：bench_aq_hold.py／bench_aq_hold15.py／bench_aq_hold30.py（總監暫存區，未入版控）
+# 使用者已同意：因此每次開 App，選單列的橘色麥克風燈會亮約 30 秒（聲音沒有被錄下來）。
+# 刻意不做成設定項：這是系統行為的補償，不是使用者的偏好。
+_WARM_HOLD_S = 30.0
+
+
+class _WarmState:
+    """暖機狀態。所有欄位都由 _warm_lock 保護；絕不在握著 _warm_lock 時呼叫 AudioQueue（可能卡住）。"""
+
+    def __init__(self) -> None:
+        self.gen = 0                  # 世代號碼：作廢（release_warm）就 +1，背景執行緒開好後發現不符就自己關掉
+        self.state = "none"           # none / opening / live / failed
+        self.stream = None
+        self.key: Optional[str] = None            # 這條串流是給哪個 _device_name 用的（None = 系統預設）
+        # 設定的那支不在（沒插著）而退回開系統預設時，記下「當初是替哪個名字開的」。
+        # 錄音器的 _device_name 在清單對帳前還是那個名字，沒有這欄的話 key(None) ≠ 名字，
+        # 每按一次都會判成不符、丟掉暖機、主執行緒再列舉一次（審查 #0/#3，2026-10-09）
+        self.requested: Optional[str] = None
+        self.opened_default_id: Optional[int] = None   # 開的是系統預設時，當時預設麥克風的 AudioDeviceID
+        self.in_use = False           # 錄音器正在用它錄
+        self.expired = False          # 30 秒到了但還在錄：等 stop() 時才關
+        self.sink = None              # 錄音中把聲音交給誰（沒在錄 = None，聲音直接丟掉）
+        self.t0 = 0.0                 # prewarm 被呼叫那一刻（time.monotonic）
+        self.live_at: Optional[float] = None
+        self.error = ""
+        self.done = threading.Event()   # 開啟中結束（開好／失敗／被作廢）
+        self.done.set()
+        self.wake = threading.Event()   # 叫醒等待 30 秒的背景執行緒（作廢時）
+
+
+_warm = _WarmState()
+_warm_lock = threading.Lock()
+
+
+def _close_quietly(stream) -> None:
+    try:
+        stream.close()
+    except Exception:
+        log_error("warm_stream_close_failed")
+
+
+def _close_in_background(stream) -> None:
+    """關閉交給背景：AudioQueueStop 要等 callback 跑完，不要讓呼叫端（可能是主執行緒）等。"""
+    if stream is None:
+        return
+    threading.Thread(target=_close_quietly, args=(stream,), daemon=True, name="MicClose").start()
+
+
+def warm_state() -> str:
+    """none（沒有暖機）／opening（還在開）／live（開好了）／failed。"""
+    return _warm.state
+
+
+def warm_wait(timeout: float) -> str:
+    """等暖機從「開啟中」結束（開好／失敗／被作廢），回傳當時的狀態。背景執行緒用。"""
+    _warm.done.wait(timeout)
+    return _warm.state
+
+
+def warm_info() -> dict:
+    """給啟動日誌：{"state", "seconds"（從 prewarm 被呼叫算到開好）, "error"}。"""
+    w = _warm
+    secs = round(w.live_at - w.t0, 2) if w.live_at is not None else None
+    return {"state": w.state, "seconds": secs, "error": w.error}
+
+
+def prewarm(device_name: Optional[str] = None, hold_s: float = _WARM_HOLD_S) -> bool:
+    """App 啟動最早期就在背景開著麥克風，撐到 hold_s 秒才關（見 _WARM_HOLD_S 的實測說明）。
+
+    主執行緒絕不等它：立刻回傳，開麥克風在背景做。開好之前按熱鍵，gui 會提示「麥克風開啟中」。
+    Windows 不需要（回 False）。已經在開／開好了也不重複開。"""
+    if not IS_MAC:
         return False
-    return bool(alive.value)
+    with _warm_lock:
+        w = _warm
+        if w.state in ("opening", "live"):
+            return False
+        w.gen += 1
+        gen = w.gen
+        w.state, w.stream, w.key, w.opened_default_id = "opening", None, None, None
+        w.requested = None
+        w.in_use, w.expired, w.sink, w.error = False, False, None, ""
+        w.t0, w.live_at = time.monotonic(), None
+        w.done.clear()
+        w.wake.clear()
+    threading.Thread(target=_warm_worker, args=(w, gen, device_name, hold_s),
+                     daemon=True, name="MicWarmup").start()
+    return True
 
 
-def _ca_input_devices() -> dict:
-    """{名字: AudioDeviceID}，只列能收音的裝置。名字跟 PortAudio 的一樣（都是 CoreAudio 的裝置名稱）。"""
-    ca, cf = _ca()
-    glob, inpt = _cc4(b"glob"), _cc4(b"inpt")
-    addr = _CAAddr(_cc4(b"dev#"), glob, 0)
-    size = ctypes.c_uint32(0)
-    if ca.AudioObjectGetPropertyDataSize(ctypes.c_uint32(1), ctypes.byref(addr), 0, None, ctypes.byref(size)) != 0:
-        raise OSError("device list query failed")
-    ids = (ctypes.c_uint32 * (size.value // 4))()
-    if ca.AudioObjectGetPropertyData(ctypes.c_uint32(1), ctypes.byref(addr), 0, None, ctypes.byref(size), ids) != 0:
-        raise OSError("device list query failed")
-    out = {}
-    for dev in ids:
-        dev_id = ctypes.c_uint32(dev)
-        addr, sz = _CAAddr(_cc4(b"stm#"), inpt, 0), ctypes.c_uint32(0)
-        if ca.AudioObjectGetPropertyDataSize(dev_id, ctypes.byref(addr), 0, None, ctypes.byref(sz)) != 0 or sz.value == 0:
-            continue
-        ref, sz = ctypes.c_void_p(), ctypes.c_uint32(ctypes.sizeof(ctypes.c_void_p))
-        addr = _CAAddr(_cc4(b"lnam"), glob, 0)
-        if ca.AudioObjectGetPropertyData(dev_id, ctypes.byref(addr), 0, None, ctypes.byref(sz), ctypes.byref(ref)) != 0 or not ref.value:
-            continue
-        buf = ctypes.create_string_buffer(512)
-        ok = cf.CFStringGetCString(ref, buf, 512, 0x08000100)   # kCFStringEncodingUTF8
-        cf.CFRelease(ref)
-        if ok:
-            out[buf.value.decode("utf-8")] = int(dev)
-    return out
+def _warm_worker(w: _WarmState, gen: int, device_name: Optional[str], hold_s: float) -> None:
+    # 一律用傳進來的 w，不去讀全域 _warm：這條執行緒活很久（等 30 秒），期間全域可能被換掉
+    stream = None
+    devices_listed = False
+    try:
+        default_id, default_name = None, None
+        try:
+            default_id, default_name = _mac.default_input()
+        except Exception:
+            log_error("warm_default_input_failed")
+        uid, key, requested = None, device_name, None
+        if device_name is not None and device_name != default_name:
+            # 指定了預設以外的麥克風：要列舉才找得到它的 UID（約 2.5 秒）。這是暖機期間要多花的時間，
+            # 但列舉的結果順便填進清單快取，省掉開完之後再列舉一次
+            try:
+                devices = _mac.input_devices()
+                _set_mac_devices(devices)
+                devices_listed = True
+                uid = next((d["id"] for d in devices if d["name"] == device_name), None)
+            except Exception:
+                log_error("warm_list_devices_failed")
+            if uid is None:
+                key, requested = None, device_name   # 找不到（沒插著）→ 開預設，標記成「給系統預設用的」
+        blocksize = int(BLOCK_MS / 1000 * SAMPLE_RATE)
+
+        def _dispatch(indata, frames, time_info, status, _w=w):
+            sink = _w.sink
+            if sink is not None:
+                sink(indata, frames, time_info, status)
+
+        stream = _mac.AQInputStream(SAMPLE_RATE, CHANNELS, blocksize, uid, _dispatch)
+        stream.start()
+    except Exception as exc:
+        if stream is not None:
+            _close_quietly(stream)
+        log_error("mic_warmup_failed")
+        with _warm_lock:
+            if w.gen == gen:
+                w.state, w.error = "failed", f"{type(exc).__name__}: {exc}"
+                w.done.set()
+        return
+    with _warm_lock:
+        superseded = w.gen != gen
+        if not superseded:
+            w.stream, w.key, w.requested = stream, key, requested
+            w.opened_default_id = default_id if uid is None else None
+            w.state, w.live_at = "live", time.monotonic()
+            w.done.set()
+    if superseded:
+        # 開的途中被作廢了（設定換麥克風、App 要關了）：開好的這條不能裝上去，自己關掉
+        _close_quietly(stream)
+        return
+    log.info(f"RECORD: warm microphone live in {w.live_at - w.t0:.2f}s since startup "
+             f"(key={key!r}, hold {hold_s:.0f}s)")
+    if not devices_listed:
+        # 開麥克風之後才列舉：先列舉會拖慢暖機（實測 2.5 秒）
+        try:
+            _set_mac_devices(_mac.input_devices())
+        except Exception:
+            log_error("warm_list_devices_failed")
+    w.wake.wait(max(0.0, w.t0 + hold_s - time.monotonic()))
+    if w.gen == gen:
+        _expire_warm(w)
+
+
+def _expire_warm(w: _WarmState) -> None:
+    """30 秒到：沒在錄就關掉（橘燈熄）；正在用它錄就標記到期，等 stop() 時才關。"""
+    with _warm_lock:
+        if w.state != "live":
+            return
+        if w.in_use:
+            w.expired = True
+            return
+        stream, w.stream, w.state = w.stream, None, "none"
+        w.wake.set()
+    _close_quietly(stream)
+
+
+def release_warm() -> None:
+    """作廢暖機：設定換了麥克風、裝置變動影響到它、App 關閉。
+
+    還在開的：世代號碼 +1，背景開好後發現不符會自己關掉、不裝上去。
+    正在用它錄音的：不在這裡關（錄音器還在收聲音），只把它從暖機卸下，stop() 時會發現不是暖機而關掉。"""
+    stream = None
+    with _warm_lock:
+        w = _warm
+        w.gen += 1
+        if w.state == "live" and not w.in_use:
+            stream = w.stream
+        w.stream = None
+        w.state = "none"
+        w.done.set()
+        w.wake.set()   # 還在等 30 秒的背景執行緒立刻醒來收工（已經結束的也無害）
+    _close_in_background(stream)
+
+
+def release_warm_if_affected(devices: list) -> bool:
+    """裝置變動後，暖機那支受影響就作廢，回傳有沒有作廢。在背景執行緒呼叫（會問系統一個問題）。
+
+    受影響 = 沒帶 UID（用系統預設）開的、而預設麥克風換了；或指定的那支從最新清單消失了；
+    或當初找不到而退回預設的那支現在插上了。問不到就當作受影響
+    （寧可多開一次，也不能讓之後的錄音留在已經不對的麥克風上）。
+
+    「沒帶 UID」不等於「key 是 None」：指定的那支剛好就是當時的預設時，也是開預設（省一次列舉），
+    這時預設換了一樣要作廢（審查 #1/#5/#8）。"""
+    with _warm_lock:
+        w = _warm
+        if w.state != "live":
+            return False
+        key, opened_default_id, requested = w.key, w.opened_default_id, w.requested
+    try:
+        names = {d["name"] for d in devices}
+        affected = False
+        if opened_default_id is not None:
+            affected = _mac.default_input_id() != opened_default_id
+        elif key is None:
+            affected = True   # 開預設但當時沒問到預設是誰：無從比對，當作受影響
+        if not affected and key is not None:
+            affected = key not in names
+        if not affected and requested is not None:
+            affected = requested in names
+    except Exception:
+        affected = True
+    if affected:
+        log.info(f"RECORD: warm microphone invalidated by device change (key={key!r})")
+        release_warm()
+    return affected
+
+
+def _requested_still_absent(key: Optional[str], requested: Optional[str]) -> bool:
+    """暖機替「設定的那支（沒插著）」開了系統預設時，錄音器要錄的也是系統預設——但只在那支『現在仍確定不在』時成立。
+
+    不能只比名字：暖機開啟中（2～5 秒）那支才插上、或暖機自己的列舉丟了例外而那支其實插著，
+    這時只比名字會讓使用者一直錄到內建麥克風，而且沒有任何提示（第二輪審查 P1/P5，2026-10-09 重現）。
+    清單還沒填好 = 不知道，也不成立：不知道就不冒險，走一般流程（會自己解析 UID）。
+    不在 release_warm_if_affected 補這個判斷：暖機還在開啟中時它直接回 False，接手這一刻看快取最準。"""
+    if key is None or key != requested:
+        return False
+    return _mac_devices_ready and all(d["name"] != key for d in _mac_devices)
+
+
+def _take_warm(key: Optional[str], sink):
+    """錄音開始時嘗試接手暖機串流。回傳 (結果, 串流)：
+    took（接手了）／opening（還在開，不等也不開第二條）／mismatch（開好了但不是這次要的那支）／none（沒有可用的）。"""
+    with _warm_lock:
+        w = _warm
+        if w.state == "opening":
+            return "opening", None
+        if w.state != "live" or w.stream is None or w.in_use or w.expired:
+            return "none", None
+        if w.key != key and not _requested_still_absent(key, w.requested):
+            return "mismatch", None
+        w.in_use = True
+        w.sink = sink
+        return "took", w.stream
+
+
+def _return_warm(stream) -> bool:
+    """錄完把暖機串流還回去。回 True = 繼續留著等下一次；False = 已作廢或到期，呼叫端要關掉它。"""
+    with _warm_lock:
+        w = _warm
+        if w.stream is not stream:
+            return False    # 錄音中被 release_warm 卸下了
+        w.in_use = False
+        w.sink = None
+        if w.expired or w.state != "live":
+            w.stream, w.state = None, "none"
+            return False
+        return True
 
 
 class AudioRecorder:
@@ -480,6 +641,7 @@ class AudioRecorder:
     def __init__(self) -> None:
         self._frames: list[np.ndarray] = []    # 每次 callback 的音訊塊
         self._stream: Optional[sd.InputStream] = None
+        self._stream_warm = False               # v2.33.0（Mac）：self._stream 是接手來的暖機串流，stop() 時要還回去
         self._is_recording = False
         self._rms_level: float = 0.0           # 最新一幀的 RMS 振幅（0~1）
         self._lock = threading.RLock()          # 可重入鎖，保護 frames 與 stream
@@ -500,7 +662,6 @@ class AudioRecorder:
         self._ca_addr_default = None # v2.32.3：「預設麥克風換了」那個監聽
         self._monitor_lock = threading.Lock()
         self._monitor_closed = False  # stop_device_monitor 之後不准再登記（登記改在背景做）
-        self._ca_snap = None          # v2.32.3：上次 PortAudio 掃描時系統的樣子（見 snapshot_coreaudio）
         self._ca_on_change = None    # 上層傳入的 on_change callable
 
         # Windows 裝置變動監聽相關（輪詢法，見 start_device_monitor 的 IS_WINDOWS 分支）：
@@ -532,10 +693,16 @@ class AudioRecorder:
         Returns:
             True 代表找到並設定成功，False 代表找不到（回退到系統預設）。
         """
+        if IS_MAC and not _mac_devices_ready:
+            # v2.33.0：啟動初期清單還沒填好（暖機背景執行緒正在列舉）。主執行緒不能自己列舉
+            # （語音突顯時 2～4 秒），先記名字；UID 等清單填好（refresh_devices）或開麥克風時再對
+            self._device_index = None
+            self._device_name = name
+            return True
         devices = self.list_devices()
         for dev in devices:
             if name == dev["name"]:
-                self._device_index = dev["id"]
+                self._device_index = dev["id"]    # Mac：UID 字串；Windows：PortAudio 編號
                 self._device_name = dev["name"]   # 記下名字供 is_active_device_present() 比對
                 return True
         self._device_index = None   # 找不到就回退到系統預設
@@ -548,6 +715,8 @@ class AudioRecorder:
         Returns:
             True 代表串流成功開啟，False 代表失敗（sounddevice 不可用或裝置錯誤）。
         """
+        if IS_MAC:
+            return self._start_mac()
         if sd is None:
             log.error("RECORD: sounddevice is not available.")
             return False
@@ -617,8 +786,158 @@ class AudioRecorder:
             first_slow = (time.perf_counter() - t_first) > _SLOW_OPEN_FAIL_S
             return self._open_with_fallbacks(_open_stream, target, first_slow)
 
-    def _index_for_name(self, name: Optional[str]) -> Optional[int]:
-        """依裝置名字找目前清單裡的編號；找不到回 None。"""
+    def _start_mac(self) -> bool:
+        """Mac 版 start()：不碰 sounddevice，用 AudioQueue。見檔案開頭與 prewarm 的說明。
+
+        優先接手暖機串流（不碰硬體，立刻開始）；暖機還在開就直接回 False（不等、不開第二條）；
+        其餘照一般流程開。"""
+        with self._lock:
+            if self._is_recording:
+                log.warning("RECORD: Already recording, ignoring start request.")
+                return True
+
+            self._frames = []
+            self._rms_level = 0.0
+            self._capture_gen += 1
+            my_gen = self._capture_gen
+            self._started_with_fallback = False
+            self._fallback_label = ""
+            t_begin = time.perf_counter()
+
+            # 暖機串流的 callback 在錄音開始前就建好了，聲音一直在進來；所以聲音交給誰（sink）
+            # 在這裡才掛上，而且綁定這一次錄音的世代號碼——沒掛上之前進來的聲音直接丟掉
+            def _sink(indata, frames, time_info, status, _gen=my_gen):
+                self._audio_callback(indata, frames, time_info, status, _gen)
+
+            verdict, warm_stream = _take_warm(self._device_name, _sink)
+            if verdict == "took":
+                self._stream = warm_stream
+                self._stream_warm = True
+                self._is_recording = True
+                log.info(f"RECORD: took over warm microphone in {(time.perf_counter() - t_begin) * 1000:.1f} ms "
+                         f"(device={self._device_name!r}, gen={my_gen})")
+                return True
+            if verdict == "opening":
+                # 暖機還在開（約 2～3 秒、最慢 30 秒）。這時再開第二條會讓兩邊都更慢；gui 在按下前就會先擋，
+                # 這裡是防呆
+                log.warning("RECORD: warm microphone still opening; start refused")
+                return False
+            if verdict == "mismatch":
+                release_warm()   # 開著的不是這次要的那支（設定換了麥克風），關掉、照一般流程開
+
+            target = self._device_index
+            forced_label = ""
+            if self._device_name and target is None:
+                target = self._index_for_name(self._device_name)   # 只查快取，不列舉
+                enumerated = False
+                if target is None and not _mac_devices_ready:
+                    # 清單還沒填好才走這條慢路徑：當場向系統找（語音突顯時 2～4 秒）。
+                    # 現在只剩「暖機失敗＋清單未填」的極少數情況（gui 會等清單填好再對帳）
+                    try:
+                        devices = _mac.input_devices()
+                        _set_mac_devices(devices)
+                        enumerated = True
+                        target = self._index_for_name(self._device_name)
+                    except Exception:
+                        log_error("recorder_resolve_device_failed", device=self._device_name)
+                if target is not None:
+                    self._device_index = target
+                elif _mac_devices_ready or enumerated:
+                    # 清單已填好、裡面沒有這支 = 它不在（沒插著）。不要再列舉：直接開預設，
+                    # 並清掉 runtime 的名字，不然每按一次都重來一遍（審查 #0/#3）。
+                    # 只動 runtime，config 不動（跟 _apply_device_list 一樣：重新插回來時仍會用回原裝置）
+                    log.warning(f"RECORD: input_device '{self._device_name}' not in device list, "
+                                f"falling back to the system default")
+                    self._device_name = None
+                    self._device_index = None
+                    forced_label = "系統預設麥克風"   # 照舊版：退回系統預設並提示（名字清掉了，只會提示這一次）
+                else:
+                    forced_label = "系統預設麥克風"   # 列舉本身失敗：不確定，保留名字，下次再試
+            blocksize = int(BLOCK_MS / 1000 * SAMPLE_RATE)
+
+            def _open_stream(uid):
+                def _cb(indata, frames, time_info, status, _gen=my_gen):
+                    self._audio_callback(indata, frames, time_info, status, _gen)
+                stream = _mac.AQInputStream(SAMPLE_RATE, CHANNELS, blocksize, uid, _cb)
+                try:
+                    stream.start()
+                except Exception:
+                    # 建好但啟動失敗的串流要關掉，不然留著半開的佔住裝置（v2.31.4 同樣的理由）。
+                    # 交給背景關：我們正握著 self._lock，AudioQueueStop 會等 callback 跑完而 callback
+                    # 要拿這把鎖——在鎖內關就是死結（審查 #2 用「start 失敗前 callback 已在跑」的假串流重現）
+                    _close_in_background(stream)
+                    raise
+                return stream
+
+            t_first = time.perf_counter()
+            try:
+                log.info(f"RECORD: Attempting to start microphone (AudioQueue). Device={target}, "
+                         f"Samplerate={SAMPLE_RATE}, Blocksize={blocksize}, gen={my_gen}")
+                self._stream = _open_stream(target)
+                self._stream_warm = False
+                self._is_recording = True
+                if forced_label:
+                    self._started_with_fallback = True
+                    self._fallback_label = forced_label
+                log.info(f"RECORD: Stream active in {time.perf_counter() - t_first:.2f}s "
+                         f"(warm takeover: no, verdict={verdict})")
+                return True
+            except Exception:
+                log_error("recorder_init_failed", device=target)
+                self._stream = None
+                self._is_recording = False
+            first_slow = (time.perf_counter() - t_first) > _SLOW_OPEN_FAIL_S
+            return self._open_with_fallbacks_mac(_open_stream, target, first_slow)
+
+    def _open_with_fallbacks_mac(self, open_fn, target: Optional[str], first_slow: bool) -> bool:
+        """Mac 版的開麥克風補救（v2.31.4 的順序與判斷原封不動，只是裝置身分從 PortAudio 編號換成 UID）。
+        呼叫端（_start_mac）已持有 self._lock。
+
+        順序：①重新列舉清單 ②同一支再試（只在瞬間失敗時）③內建麥克風 ④系統預設。
+        UID 在裝置存在期間不變，所以不像 PortAudio 要擔心重掃後編號位移；①是為了拿到剛插拔後的新清單。
+        """
+        self.refresh_devices()   # 列舉失敗回 None、快取不動：不用它的回傳值，拿手上的快取繼續往下試
+        if self._device_name is not None:
+            self._device_index = self._index_for_name(self._device_name)
+
+        candidates: list[tuple[Optional[str], str]] = []
+        if not first_slow:
+            if self._device_name is None:
+                candidates.append((target, ""))
+            else:
+                uid = self._index_for_name(self._device_name)
+                if uid is not None:
+                    candidates.append((uid, ""))
+        builtin = builtin_input_device_name()
+        if builtin and not (first_slow and builtin == self._device_name):
+            uid = self._index_for_name(builtin)
+            if uid is not None:
+                candidates.append((uid, "內建麥克風"))
+        if target is not None:
+            candidates.append((None, "系統預設麥克風"))
+
+        tried: set = set()
+        for dev, label in candidates:
+            if dev in tried:
+                continue
+            tried.add(dev)
+            try:
+                log.warning(f"RECORD: retry device={dev} ({label or 'same device after refresh'})")
+                self._stream = open_fn(dev)
+                self._stream_warm = False
+                self._is_recording = True
+                self._started_with_fallback = bool(label)
+                self._fallback_label = label
+                log.info(f"RECORD: Stream active（{label or '重整清單後同一支'}）")
+                return True
+            except Exception:
+                log_error("recorder_init_failed_fallback", device=dev, step=label or "retry_same")
+                self._stream = None
+                self._is_recording = False
+        return False
+
+    def _index_for_name(self, name: Optional[str]):
+        """依裝置名字找目前清單裡的識別（Windows：PortAudio 編號；Mac：UID 字串）；找不到回 None。"""
         if not name:
             return None
         for dev in self.list_devices():
@@ -641,8 +960,7 @@ class AudioRecorder:
         # ① 重整清單（refresh_portaudio 自己會拿 self._lock，RLock 可重入）
         self.refresh_portaudio()
         # v2.32.3：重整後所有編號都可能位移——不管下面走哪條路，都先把指定麥克風的編號對回來
-        # （不在清單裡就清掉）。以前靠下一次裝置變動的重整順手修好；現在不受影響的變動不重整，
-        # 舊編號會一直指錯，審查模擬出錄到 BlackHole、一片空白（2026-10-07）
+        # （不在清單裡就清掉），不然舊編號會一直指錯，審查模擬出錄到 BlackHole、一片空白（2026-10-07）
         if self._device_name is not None:
             self._device_index = self._index_for_name(self._device_name)
 
@@ -696,6 +1014,7 @@ class AudioRecorder:
             float32 一維 numpy 陣列（所有幀 concatenate 後）。
             若沒有捕捉到任何音訊則回傳空陣列。
         """
+        stream, was_warm = None, False
         with self._lock:
             if not self._is_recording:
                 log.debug("RECORD: stop() called while already idle.")
@@ -706,8 +1025,14 @@ class AudioRecorder:
             # D2-S1：bump generation；任何還沒 drain 的 in-flight callback 立刻 stale
             self._capture_gen += 1
 
+            if IS_MAC:
+                # 只在鎖內把串流「拆下來」，關硬體留到鎖外：AudioQueueStop(immediate) 會等正在跑的
+                # callback 跑完，而 callback 要拿 self._lock——在鎖內關，兩邊互等就死結
+                stream, was_warm = self._stream, self._stream_warm
+                self._stream = None
+                self._stream_warm = False
             # 關閉 PortAudio 串流，釋放硬體資源
-            if self._stream is not None:
+            elif self._stream is not None:
                 try:
                     self._stream.stop()
                     self._stream.close()
@@ -719,6 +1044,17 @@ class AudioRecorder:
             # 複製 frames list 後立即清空，釋放記憶體
             frames = list(self._frames)
             self._frames = []
+
+        if stream is not None:
+            if was_warm and _return_warm(stream):
+                log.info("RECORD: warm microphone kept for next recording")
+            else:
+                # 一律交給背景關：開 App 30 秒內關一次實測要 1～3 秒（2026-10-08 實測，App 身分、語音突顯），
+                # stop() 是主執行緒呼叫的，不能讓畫面卡住。暖機串流也一樣——錄音中被 release_warm 卸下的
+                # （裝置變動、設定換麥克風）可能還在 30 秒內，不能假設「到期了所以關得快」（第三輪審查實測卡 0.8 秒）。
+                # 錄到的 frames 已在鎖內拿走、callback 有世代檢查，晚關不影響回傳的錄音
+                _close_in_background(stream)
+                log.info("RECORD: AudioQueue stream close handed to background.")
 
         if not frames:
             log.warning("RECORD: No audio data captured.")
@@ -797,7 +1133,11 @@ class AudioRecorder:
 
         Returns:
             [{"id": int, "name": str}, ...] 的列表，可傳給 set_device_by_name()。
+            Mac（v2.33.0）：id 是 UID 字串，內容是快取——主執行緒絕不做列舉，
+            快取由暖機背景執行緒與 refresh_devices() 填。
         """
+        if IS_MAC:
+            return list(_mac_devices)
         if sd is None:
             return []
         # v2.32.3：重掃進行中（PortAudio 未初始化）就回上一份清單，不等（見 _pa_lock）
@@ -831,71 +1171,45 @@ class AudioRecorder:
                     sd._terminate()
                     sd._initialize()
                     _refresh_device_cache()
-                # 上一次記下的系統狀態跟這次的清單不一定對得上了：作廢，由呼叫端重新記
-                # （背景重掃那條路會馬上記；備援重掃沒記的話，下一次裝置變動一律當作受影響）
-                self._ca_snap = None
                 log.info("RECORD: PortAudio re-initialized for device refresh")
             except Exception:
                 log_error("portaudio_reinit_failed")
         return self.list_devices()
 
-    def snapshot_coreaudio(self) -> None:
-        """記下「這次 PortAudio 掃描時」系統的樣子，下次裝置變動時拿來比。在背景執行緒呼叫。
+    def refresh_devices(self) -> Optional[list]:
+        """重新取得輸入裝置清單（跨平台）。要在背景執行緒呼叫，會等到列舉完才回傳。
 
-        要在掃描一完成就記，不能等系統調整好（語音突顯約 17 秒）再記：那段時間的變動會被當成
-        「本來就這樣」，之後的比對永遠看不出 PortAudio 手上的清單已經過時（審查找到，2026-10-07）。"""
+        Mac：重新向 CoreAudio 列舉並更新快取（語音突顯時約 2.5 秒）。不需要拿錄音鎖、錄音中也可以做——
+        它只讀系統、不碰正在錄音的串流（PortAudio 重掃會打斷串流，所以 Windows 那邊錄音中要跳過）。
+        列舉失敗回 None、快取不動：回舊快取（尤其是還沒填過的空清單）會被呼叫端當成權威的
+        「現在沒有任何麥克風」，把使用者選的那支當成已移除（審查 #6）。
+        Windows：照舊呼叫 refresh_portaudio()。"""
         if not IS_MAC:
-            return
+            return self.refresh_portaudio()
         try:
-            self._ca_snap = {"default": _ca_default_input(), "ids": _ca_input_devices()}
+            devices = _mac.input_devices()
         except Exception:
-            self._ca_snap = None
-            log_error("coreaudio_snapshot_failed")
+            log_error("coreaudio_list_failed")
+            return None
+        _set_mac_devices(devices)
+        # 啟動初期 set_device_by_name 只記了名字（當時清單是空的）：清單一到就把 UID 對上
+        name = self._device_name
+        if name and self._device_index is None:
+            for d in devices:
+                if d["name"] == name:
+                    self._device_index = d["id"]
+                    break
+        log.info(f"RECORD: CoreAudio device list refreshed ({len(devices)} inputs)")
+        return list(devices)
 
-    def device_change_affects_us(self) -> bool:
-        """裝置變動有沒有影響到正在用的麥克風（有才需要重掃 PortAudio）。在背景執行緒呼叫。
+    def warm_state(self) -> str:
+        return warm_state()
 
-        - 指定了麥克風：只看那一支——不見了、或上次掃描時不在但現在插回來了，才算受影響。
-          還在的話，PortAudio 舊清單裡它的編號照樣指向同一個裝置（系統裝置編號在裝置存在期間不變），開得起來。
-        - 用系統預設：只看預設麥克風有沒有換——PortAudio 的「預設」是上次掃描時記下的那支。
-        任何一步問不到就當作受影響（照原本的做法重掃），不能因為省這一次而錄錯麥克風。
-        Windows 一律回 True：重掃很便宜，維持原本行為。"""
-        if not IS_MAC:
-            return True
-        snap = getattr(self, "_ca_snap", None)
-        if not snap:
-            return True
-        try:
-            name = self._device_name
-            if name:
-                dev = snap["ids"].get(name)
-                if dev is None:
-                    return name in _ca_input_devices()
-                return not _ca_alive(dev)
-            return _ca_default_input() != snap["default"]
-        except Exception:
-            log_error("device_change_check_failed")
-            return True
+    def release_warm(self) -> None:
+        release_warm()
 
-    def portaudio_view_consistent(self) -> bool:
-        """PortAudio 手上的清單，對「正在用的麥克風」來說跟系統現在的樣子一致嗎？在背景執行緒呼叫。
-
-        比 device_change_affects_us 多一層保險：它只能看「上次記下之後」的變化；這裡直接拿
-        PortAudio 的清單跟系統比，連記下之前（例如啟動時掃描進行中、還沒開始監聽）的變化都抓得到。
-        問不到就回 False（照原本重掃）。"""
-        if not IS_MAC:
-            return True
-        try:
-            ca_ids = _ca_input_devices()
-            name = self._device_name
-            if name:
-                pa_names = {d["name"] for d in self.list_devices()}
-                return (name in pa_names) == (name in ca_ids)
-            # 系統預設：PortAudio 的「預設」是掃描當下記的那支，要跟系統現在的預設是同一支
-            pa_default = sd.query_devices(kind="input")["name"]
-            return ca_ids.get(pa_default) == _ca_default_input()
-        except Exception:
-            return False
+    def release_warm_if_affected(self, devices: list) -> bool:
+        return release_warm_if_affected(devices)
 
     def is_active_device_present(self) -> bool:
         """檢查目前選定的裝置是否還在（插著）。
@@ -986,7 +1300,8 @@ class AudioRecorder:
 
                 cb = CALLBACK_TYPE(_ca_callback)
                 # v2.32.3：也監聽「預設麥克風換了」。用系統預設時，插耳機後系統可能晚一點才把預設換過去，
-                # 只聽「裝置清單變了」的話，判斷「有沒有影響」那一刻預設還沒換，之後就不會再被通知
+                # 只聽「裝置清單變了」的話，預設換了卻沒人通知——v2.33.0 暖機開的是「預設」那支，
+                # 預設換了就要作廢暖機（release_warm_if_affected）
                 addr_default = AudioObjectPropertyAddress(
                     int.from_bytes(b"dIn ", "big"),
                     kAudioObjectPropertyScopeGlobal,

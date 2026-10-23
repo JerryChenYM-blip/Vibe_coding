@@ -1231,6 +1231,8 @@ def test_recorder_falls_back_to_default_device(monkeypatch):
     """v2.21.4：指定裝置（AirPods）開串流失敗 → 退回系統預設(device=None)重試成功、
     且標記 _started_with_fallback=True（gui 端據此 toast 提示）。"""
     import recorder as _rec
+    # v2.33.0：Mac 改走 AudioQueue；這個測試驗的是 sounddevice 那條（Windows）的退路，Mac 版在 test_mac_recorder.py
+    monkeypatch.setattr(_rec, "IS_MAC", False)
     rec = _rec.AudioRecorder()
     rec._device_index = 7  # 假 AirPods index、尚未 ready
 
@@ -1260,6 +1262,7 @@ def test_recorder_falls_back_to_default_device(monkeypatch):
 def test_recorder_no_fallback_flag_on_clean_start(monkeypatch):
     """指定裝置一次就成功時、_started_with_fallback 應為 False（不誤觸 toast）。"""
     import recorder as _rec
+    monkeypatch.setattr(_rec, "IS_MAC", False)   # 同上：驗 sounddevice 那條
     rec = _rec.AudioRecorder()
     rec._device_index = 3
 
@@ -1321,10 +1324,16 @@ def _run_device_change(win, monkeypatch):
     win._handle_device_change()
 
 
-def _fake_recorder_for_device_change(device_name, stale_index, new_list):
+def _fake_recorder_for_device_change(device_name, stale_index, new_list, monkeypatch):
     """造一個 recorder stub：_device_name 已設、_device_index 是位移前的舊值，
-    refresh_portaudio/list_devices 回傳新清單（index 已位移）。"""
+    refresh_portaudio/list_devices 回傳新清單（index 已位移）。
+
+    v2.33.0：「重新初始化 PortAudio 後編號位移」是 sounddevice（Windows）才有的現象，這組測試
+    固定走 Windows 流程；Mac 用 UID、不會位移，對應測試在 test_mac_recorder.py。"""
+    import gui
     import recorder as _rec
+    monkeypatch.setattr(_rec, "IS_MAC", False)
+    monkeypatch.setattr(gui, "IS_MAC", False)
     rec = _rec.AudioRecorder()
     rec._device_name = device_name
     rec._device_index = stale_index
@@ -1342,7 +1351,7 @@ def test_device_change_reresolves_stale_index_when_device_present(monkeypatch):
     new_list = [{"id": 0, "name": "Built-in"},
                 {"id": 3, "name": "Wired"},
                 {"id": 5, "name": "AirPods"}]
-    win.recorder = _fake_recorder_for_device_change("AirPods", 2, new_list)
+    win.recorder = _fake_recorder_for_device_change("AirPods", 2, new_list, monkeypatch)
     win._show_toast = MagicMock()
     _run_device_change(win, monkeypatch)
     # 修好後：index 應從舊的 2 被重新解析成 5（指回真正的 AirPods）
@@ -1356,7 +1365,7 @@ def test_device_change_falls_back_when_device_removed(monkeypatch):
     from gui import AppWindow
     win = AppWindow.__new__(AppWindow)
     new_list = [{"id": 0, "name": "Built-in"}, {"id": 1, "name": "Wired"}]
-    win.recorder = _fake_recorder_for_device_change("AirPods", 2, new_list)
+    win.recorder = _fake_recorder_for_device_change("AirPods", 2, new_list, monkeypatch)
     win._show_toast = MagicMock()
     _run_device_change(win, monkeypatch)
     assert win.recorder._device_index is None      # 退回系統預設
@@ -1369,7 +1378,7 @@ def test_device_change_noop_on_system_default(monkeypatch):
     from gui import AppWindow
     win = AppWindow.__new__(AppWindow)
     new_list = [{"id": 0, "name": "Built-in"}, {"id": 1, "name": "AirPods"}]
-    win.recorder = _fake_recorder_for_device_change(None, None, new_list)
+    win.recorder = _fake_recorder_for_device_change(None, None, new_list, monkeypatch)
     win._show_toast = MagicMock()
     _run_device_change(win, monkeypatch)
     assert win.recorder._device_index is None

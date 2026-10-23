@@ -166,6 +166,33 @@ log.info("=" * 60)
 log.info(f"NEW SESSION: Whisper Pro started at {datetime.datetime.now():%Y-%m-%d %H:%M:%S}")
 log.info("=" * 60)
 
+# v2.33.0：麥克風暖機——必須排在 import customtkinter／gui 之前（越早開越好）。
+#
+# 為什麼：macOS 27 上麥克風模式是「語音突顯」時，程序啟動後約 30 秒內每開一次麥克風要 1～5 秒
+# （2026-10-08 實測）。從程序最早期就在背景開著、撐到 30 秒才關，視窗出現（約 3.5 秒）時就能直接錄。
+# import gui 要 1 秒多，prewarm 排在它後面就白白晚開；實測 imports_done 約 1.6 秒、
+# gui_window_created 約 3.55 秒，暖機約 1.7～2.6 秒開好，所以排在前面才趕得上。
+#
+# 只在 `python main.py` 直接執行時做（.app 也是這樣啟動）：測試 import main 時不能真的去開麥克風。
+# 只讀設定檔裡的 input_device（不用 Config.load()，它可能搬移／改寫舊設定）；讀不到就當系統預設。
+def _early_input_device():
+    import json
+    try:
+        with open(os.path.expanduser("~/.whisper_app/config.json"), encoding="utf-8") as fh:
+            name = json.load(fh).get("input_device")
+        return name if isinstance(name, str) and name else None
+    except Exception:
+        return None
+
+
+if IS_MAC and __name__ == "__main__":
+    try:
+        import recorder as _recorder_early
+        _recorder_early.prewarm(_early_input_device())
+        _startup_phase("mic_prewarm_started")
+    except Exception:
+        log_error("mic_prewarm_start_failed")
+
 import customtkinter as ctk
 import gui
 

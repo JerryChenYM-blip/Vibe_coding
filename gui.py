@@ -128,6 +128,17 @@ def _settings_device_options(current: Optional[str], devices: list, ready: bool)
     return values, list(devices), initial
 
 
+def _settings_devices_ready(app) -> bool:
+    """設定視窗要不要信任目前的麥克風清單。
+
+    Mac（v2.33.0）：看裝置清單快取填過沒；沒填好時要保留使用者選的那支，不然一按儲存就被改成系統預設。
+    Windows：看麥克風元件準備好了沒、有沒有在重掃。"""
+    if IS_MAC:
+        return recorder_mod.devices_ready()
+    return (getattr(app, "_audio_ready", recorder_mod.sounddevice_ready())
+            and not getattr(app, "_audio_refreshing", False))
+
+
 def _pipe_record_paste_latency(latency_s: float):
     """記錄一筆 paste latency 到 session summary；失敗 silent。"""
     try:
@@ -897,13 +908,12 @@ class AppWindow(ctk.CTkFrame):
         except Exception:
             pass
         self.recorder    = AudioRecorder()
-        # v2.32.3：麥克風元件可能還沒載入（Mac 改在視窗出現後於背景載入，見 recorder.py 頂端）
+        # v2.32.3：麥克風元件可能還沒載入（Windows 載入失敗時才會用到；Mac v2.33.0 起不載 sounddevice）
         self._audio_ready          = False   # 已載入「而且」已套用設定的麥克風，才能開始錄音
         self._audio_refreshing     = False   # 插拔後的背景重掃進行中
         self._audio_refresh_started = 0.0
         self._audio_refresh_again  = False   # 重掃中又有變動，結束後要再掃一次
         self._audio_change_pending = False   # 還沒準備好／錄音中有插拔，之後補做
-        self._devices_dirty        = False   # 有裝置變動被判定不影響、沒重掃：設定視窗的清單可能是舊的
         self._start_audio()
         self.transcriber = Transcriber()
         # v2.19.0：可疑音檔保留設定推給 transcriber（Agent T 還沒寫完時 hasattr 防炸）
@@ -2405,12 +2415,29 @@ class AppWindow(ctk.CTkFrame):
             log.debug(f"_transition_to_recording ignored (state={self._state})")
             return
 
-        # v2.32.3：麥克風元件還在背景準備（剛開 App），或插拔後正在背景重掃：先別開麥克風。
-        # 重掃時 recorder 握著鎖，這時呼叫 start() 主執行緒會跟著卡住（語音突顯時約 10 秒）。
+        # v2.33.0（Mac）：只有「暖機麥克風還在開」才擋（開 App 後約 2～3 秒、最慢 30 秒）。
+        # 裝置清單重新列舉不碰錄音鎖、不影響開麥克風，所以不再因為它擋住使用者。
+        if IS_MAC:
+            if self.recorder.warm_state() == "opening":
+                log_action("recording_blocked_audio_busy", reason="warm_opening")
+                try:
+                    self._show_toast("麥克風開啟中，請過一下再按")
+                except Exception:
+                    pass
+                # 使用者多半在別的 App 打字，主視窗的提示看不到——錄音小窗是唯一跨 App 看得到的地方
+                mini = getattr(self, "_mini_window", None)
+                if mini is not None:
+                    try:
+                        mini.show_warning("麥克風開啟中")
+                    except Exception:
+                        pass
+                return
+        # v2.32.3（Windows 照舊）：麥克風元件還在背景準備，或插拔後正在背景重掃：先別開麥克風。
+        # 重掃時 recorder 握著鎖，這時呼叫 start() 主執行緒會跟著卡住。
         # 載入失敗（永遠不會好）不在這裡擋，照舊走下面「麥克風無法啟動」的提示。
-        not_loaded = (not getattr(self, "_audio_ready", recorder_mod.sounddevice_ready())
+        not_loaded = (not IS_MAC and not getattr(self, "_audio_ready", recorder_mod.sounddevice_ready())
                       and not recorder_mod.sounddevice_failed())
-        refreshing = getattr(self, "_audio_refreshing", False)
+        refreshing = not IS_MAC and getattr(self, "_audio_refreshing", False)
         if not_loaded or refreshing:
             # 60 秒：語音突顯時重掃約 10 秒＋系統調整約 17 秒，正常也可能接近 30 秒
             stuck = refreshing and time.monotonic() - getattr(self, "_audio_refresh_started", 0.0) > 60
@@ -5711,20 +5738,25 @@ class AppWindow(ctk.CTkFrame):
         SettingsWindow(self, self.cfg, self._on_settings_saved)
 
     # ── v2.21.0 Phase M：麥克風熱插拔處理 ───────────────────────────────────
-    # ── v2.32.3：麥克風元件在背景準備 ─────────────────────────────────────
+    # ── v2.32.3：麥克風元件在背景準備；v2.33.0：Mac 改成暖機＋AudioQueue ─────────────
 
     def _apply_input_device_setting(self, input_device) -> None:
-        """設定存檔後，把麥克風來源套到 recorder（下次 start() 用）。"""
+        """設定存檔後，把麥克風來源套到 recorder（下次 start() 用）。
+
+        _on_settings_saved 每次存檔（改語言、改模型也一樣）都會呼叫這裡，所以『有沒有換麥克風』要跟
+        上一次套用的設定值比（_applied_input_device），不能拿 recorder 的 runtime 名字比：
+        設定的麥克風沒插著時 runtime 早就退回成 None，拿它比會把每次存檔都當成換了麥克風，
+        白白作廢暖機（審查 #4）。"""
+        prev = getattr(self, "_applied_input_device", getattr(self.recorder, "_device_name", None))
+        self._applied_input_device = input_device
+        if IS_MAC and input_device != prev:
+            # 暖機開的是舊的那支（或系統預設）：換了麥克風就作廢它，下次錄音照一般流程用 UID 開
+            self.recorder.release_warm()
         if input_device:
+            # Mac 清單已填好：找得到 → 設 UID；找不到 → 只記 warning、退回系統預設（不重新列舉、不跳提示，
+            # 清單會在每次裝置變動時更新）。清單還沒填好：只記名字，等啟動對帳（_on_audio_ready）
             ok = self.recorder.set_device_by_name(input_device)
-            if not ok and input_device in recorder_mod.coreaudio_input_names():
-                # v2.32.3：系統有這支、只是 PortAudio 還沒掃到（剛插的、之前的變動判定不影響沒重掃）：
-                # 記住名字、背景重掃，掃完 _apply_device_list 會用名字對回編號
-                self.recorder._device_name = input_device
-                self.recorder._device_index = None
-                self._handle_device_change(force=True)
-                ok = True
-            elif not ok:
+            if not ok:
                 log.warning(
                     f"RECORD: input_device '{input_device}' 找不到、"
                     f"回退到系統預設"
@@ -5739,8 +5771,15 @@ class AppWindow(ctk.CTkFrame):
             log_settings("device_applied", device="(system default)")
 
     def _start_audio(self) -> None:
-        """已經載入（Windows：import 時就載入）就照原本當場套用設定的麥克風；
-        還沒載入（Mac）就在背景載入，視窗不用等。"""
+        """Mac（v2.33.0）：不載 sounddevice。主執行緒只記下設定的麥克風名字、立刻放行——暖機在 main.py
+        最早期就在背景開始了；登記裝置監聽、等暖機結果都在背景做（見 _load_audio_in_background）。
+        Windows：已經載入（import 時就載入）就照原本當場套用設定的麥克風；沒載入就在背景載入。"""
+        if IS_MAC:
+            self._apply_startup_device()
+            self._audio_ready = True
+            # 等主迴圈跑起來才開背景執行緒（理由同下）
+            self.after(0, self._spawn_audio_init)
+            return
         if recorder_mod.sounddevice_ready():
             self._apply_startup_device()
             self._start_device_monitor()
@@ -5764,60 +5803,71 @@ class AppWindow(ctk.CTkFrame):
                 log_error("start_device_monitor_failed")
 
     def _load_audio_in_background(self) -> None:
-        t0 = time.perf_counter()
-        ok = recorder_mod.ensure_sounddevice()
-        seconds = round(time.perf_counter() - t0, 2)
-        # 註冊熱插拔監聽也要在背景、而且排在載入之後：它也是跟系統音訊服務打交道，語音突顯時
-        # 在主執行緒做花了 13.7 秒（2026-10-06 18:42 實測，原本排在 AppWindow 初始化裡、視窗出來前）
-        settle = 0.0
-        stale = False
-        if ok:
+        mic_detail = ""
+        if IS_MAC:
+            # 登記熱插拔監聽也要在背景：它也是跟系統音訊服務打交道，語音突顯時在主執行緒做花了
+            # 13.7 秒（2026-10-06 18:42 實測）。然後等暖機有結果（開好／失敗），給啟動日誌用。
             self._start_device_monitor()
-            # 掃完馬上記下系統的樣子，之後裝置變動拿來比（見 _handle_device_change）。
-            # 不能等系統調整好再記：那段時間的變動會被當成本來就這樣（審查找到）
-            self.recorder.snapshot_coreaudio()
-            # 掃完裝置後系統還要一段時間調整（語音突顯約 17 秒），這段時間開麥克風會卡畫面 3～7 秒
-            settle = recorder_mod.wait_until_settled()
-            # 掃描進行中（還沒開始監聽）有變動的話，PortAudio 手上的清單可能已經過時：核對一次
-            stale = (self.recorder.device_change_affects_us()
-                     or not self.recorder.portaudio_view_consistent())
+            state = recorder_mod.warm_wait(60.0)
+            info = recorder_mod.warm_info()
+            # 失敗才算不 OK；none（開的途中被作廢，例如設定換了麥克風）不是失敗。
+            # 60 秒後還在 opening：不是『準備好了』，不能記成 ready=True in 0.00s。擋門行為不變：
+            # 仍是開啟中就提示「麥克風開啟中」，使用者按了也不會卡死
+            ok = state not in ("failed", "opening")
+            seconds = info["seconds"] or 0.0
+            mic_detail = info["error"]
+            if state == "opening":
+                mic_detail = "暖機麥克風開了 60 秒還沒好"
+                log.warning("AUDIO: 麥克風開了 60 秒還沒好（暖機仍在開啟中）；按錄音會一直提示『麥克風開啟中』。"
+                            "可能是首次啟動的麥克風權限視窗沒回答，或驅動程式沒回應")
+            # 裝置清單快取要在這裡確保填好，好讓 _on_audio_ready 對帳（設定的麥克風沒插著就退回預設）。
+            # 暖機成功時背景會順便列舉：等它（10 秒內）；失敗／被作廢／等不到就自己列舉——
+            # 這是背景執行緒，列舉 2～4 秒不影響任何人
+            try:
+                if state != "live" or not recorder_mod.wait_devices(10.0):
+                    self.recorder.refresh_devices()
+            except Exception:
+                log_error("audio_init_refresh_devices_failed")
+        else:
+            t0 = time.perf_counter()
+            ok = recorder_mod.ensure_sounddevice()
+            seconds = round(time.perf_counter() - t0, 2)
+            if ok:
+                self._start_device_monitor()
         mic_mode = recorder_mod.read_microphone_mode()
         try:
-            self.after(0, self._on_audio_ready, ok, seconds, mic_mode, settle, stale)
+            self.after(0, self._on_audio_ready, ok, seconds, mic_mode, mic_detail)
         except Exception:
             pass   # App 已在關閉
 
-    def _on_audio_ready(self, ok: bool, seconds: float, mic_mode, settle: float = 0.0,
-                        stale: bool = False) -> None:
-        """主執行緒：麥克風元件載入完成。
+    def _on_audio_ready(self, ok: bool, seconds: float, mic_mode, detail: str = "") -> None:
+        """主執行緒：麥克風準備完成（Mac：暖機有結果）。
 
         防呆：記下花了幾秒與麥克風模式。2026-10-06 啟動從 6 秒變 20 秒，查了一整天才發現是
-        控制中心的「語音突顯」——以後看日誌這一行就知道。"""
+        控制中心的「語音突顯」——以後看日誌這一行就知道。Mac 的秒數是「從程序啟動算到暖機開好」。"""
         mode_name = recorder_mod._MIC_MODE_NAMES.get(mic_mode, "未知")
-        log.info(f"AUDIO: ready={ok} in {seconds:.2f}s + settle {settle:.2f}s "
-                 f"(mic_mode={mic_mode} {mode_name})")
-        _pipe_event("audio_ready", ok=ok, seconds=seconds, mic_mode=mic_mode, settle_s=settle)
-        if ok and seconds + settle > 5:
+        log.info(f"AUDIO: ready={ok} in {seconds:.2f}s since startup "
+                 f"(mic_mode={mic_mode} {mode_name}){' error=' + detail if detail else ''}")
+        _pipe_event("audio_ready", ok=ok, seconds=seconds, mic_mode=mic_mode)
+        if ok and seconds > 5:
             log.warning(
-                f"AUDIO: 麥克風準備花了 {seconds + settle:.1f} 秒。macOS 27 上麥克風模式是「語音突顯」時，"
-                f"每查一次音訊裝置都會慢；改「標準」約 0.2 秒（控制中心，錄音中才看得到）"
+                f"AUDIO: 麥克風準備花了 {seconds:.1f} 秒（正常約 2～3 秒）。macOS 27 上麥克風模式是「語音突顯」時，"
+                f"程序啟動後約 30 秒內開麥克風都會慢；改「標準」不受影響（控制中心，錄音中才看得到）"
             )
-        if not ok:
+        if not ok and not IS_MAC:
             return
+        # 先套用設定的麥克風才放行（Windows 照改版前的順序）。Mac 在這裡做的是『對帳』：啟動時只記了名字，
+        # 現在清單填好了——有就對上 UID；設定的那支沒插著就照舊版清掉名字退回系統預設（只記 warning、不跳提示）。
+        # 暖機失敗（ok=False）時清單也由背景補填過，照樣要對帳
         self._apply_startup_device()
-        # 先套用設定的麥克風才放行：只看「元件載好了」的話，中間那一下按熱鍵會用系統預設麥克風錄
         self._audio_ready = True
-        if stale:
-            # 清單已經過時：直接重掃（不先判斷——判斷是拿剛記下的狀態比，看不出來）
-            self._audio_change_pending = False
-            log_action("audio_list_stale_after_load")
-            self._handle_device_change(force=True, recheck=False)
-        elif getattr(self, "_audio_change_pending", False):
+        if getattr(self, "_audio_change_pending", False):
             self._audio_change_pending = False
             self._handle_device_change()
 
     def _apply_startup_device(self) -> None:
         # F1（v2.12.0）：啟動時依 cfg.input_device 設裝置；失敗回退系統預設
+        self._applied_input_device = self.cfg.input_device   # 之後存檔時拿來判斷有沒有換麥克風
         if self.cfg.input_device:
             try:
                 if not self.recorder.set_device_by_name(self.cfg.input_device):
@@ -5843,78 +5893,57 @@ class AppWindow(ctk.CTkFrame):
         except Exception:
             pass   # App 關閉中、root 已銷毀
 
-    def _handle_device_change(self, force: bool = False, recheck: bool = True) -> None:
+    def _handle_device_change(self) -> None:
         """主執行緒：麥克風插/拔後的處理。
 
-        - 在背景重新初始化 PortAudio 拿最新清單（錄音中跳過），完成後回主執行緒套用
+        - 在背景重新取得最新裝置清單（Mac：向 CoreAudio 列舉，約 2.5 秒；Windows：重新初始化 PortAudio），
+          完成後回主執行緒套用
         - 若使用者選定的裝置（cfg.input_device）已不在 → 退回系統預設 + 提示
+        - Mac：暖機麥克風受影響（預設換了、指定的那支不見了）就作廢
         錄音中不動裝置（避免打斷當下錄音）、等這次錄完下次生效。
         """
         # v2.32.3：重掃改到背景。原本在主執行緒做，麥克風模式是「語音突顯」時每次約 10 秒，
         # 整個 App 跟著凍住；而 iPhone 麥克風連上／斷開、耳機插拔都會觸發。
-        if not recorder_mod.sounddevice_ready():
+        if not IS_MAC and not recorder_mod.sounddevice_ready():
             self._audio_change_pending = True   # 背景載入完成後補做
             return
         if self.recorder.is_recording():
             self._audio_change_pending = True   # 錄完回到閒置再補做（不然清單一直停在舊的）
             return
         if getattr(self, "_audio_refreshing", False):
-            # 不疊著開新的：這次結束後再掃一次就拿得到最新的（設定視窗要求的強制重掃優先）
-            if force or getattr(self, "_audio_refresh_again", False) == "force":
-                self._audio_refresh_again = "force"
-            else:
-                self._audio_refresh_again = True
+            # 不疊著開新的：這次結束後再掃一次就拿得到最新的
+            self._audio_refresh_again = True
             return
         self._audio_refreshing = True
         self._audio_refresh_started = time.monotonic()
 
         def _bg():
-            devices, skipped, stale = None, False, False
+            devices = None
             try:
-                # v2.32.3：先問系統「有沒有影響到正在用的麥克風」（一兩個很輕的問題），沒有就不重掃。
-                # 語音突顯時重掃加系統調整要約 27 秒不能錄音，而每天約 25 次變動多半跟正在用的那支無關。
-                if not force and not self.recorder.device_change_affects_us():
-                    skipped = True
-                    # 不重掃也等一下系統：裝置一上線，系統可能又要重新調整語音突顯，這時開麥克風會卡。
-                    # 沒在調整的話問兩次就好（約 0.05 秒）
-                    recorder_mod.wait_until_settled()
-                else:
-                    devices = self.recorder.refresh_portaudio()
-                    # 掃完馬上記（理由同 _load_audio_in_background），再等系統調整好才放行錄音
-                    self.recorder.snapshot_coreaudio()
-                    recorder_mod.wait_until_settled()
-                    # 核對一次：這次重掃的那一刻到記下狀態之間若又有變動，清單可能已經過時。
-                    # 只核對一層（recheck=False 的那次不再核對），免得對不上的機器一直重掃
-                    if recheck:
-                        stale = not self.recorder.portaudio_view_consistent()
+                devices = self.recorder.refresh_devices()
+                # Mac 列舉失敗回 None：不要拿它判斷暖機受不受影響，也不套用（_finish_device_change 會跳過）
+                if IS_MAC and devices is not None:
+                    self.recorder.release_warm_if_affected(devices)
             except Exception:
                 log_error("device_refresh_failed")
                 devices = None
             try:
-                self.after(0, self._finish_device_change, devices, skipped, stale)
+                self.after(0, self._finish_device_change, devices)
             except Exception:
                 pass   # App 已在關閉
 
         threading.Thread(target=_bg, daemon=True, name="AudioRefresh").start()
 
-    def _finish_device_change(self, devices, skipped: bool = False, stale: bool = False) -> None:
-        """主執行緒：背景重掃完成（或判定不受影響、沒重掃），套用新清單。"""
+    def _finish_device_change(self, devices) -> None:
+        """主執行緒：背景重新取得清單完成，套用新清單。"""
         self._audio_refreshing = False
         try:
-            if skipped:
-                self._devices_dirty = True
-                log_action("mic_device_change_skipped", device=getattr(self.recorder, "_device_name", None))
-            elif devices is not None:
-                self._devices_dirty = False
+            if devices is not None:
                 self._apply_device_list(devices)
         finally:
-            again = getattr(self, "_audio_refresh_again", False)
-            if again:
+            if getattr(self, "_audio_refresh_again", False):
                 self._audio_refresh_again = False
-                self._handle_device_change(force=(again == "force"))
-            elif stale:
-                log_action("audio_list_stale_after_refresh")
-                self._handle_device_change(force=True, recheck=False)
+                self._handle_device_change()
 
     def _apply_device_list(self, devices) -> None:
         try:
@@ -5945,6 +5974,17 @@ class AppWindow(ctk.CTkFrame):
                     self.recorder._device_index = None
                     self.recorder._device_name = None
                     log_action("mic_device_reindex_failed_fallback", device=active)
+            elif IS_MAC and getattr(self.cfg, "input_device", None) in names:
+                # v2.33.0 第三輪：設定的那支現在在清單裡，runtime 卻沒在用它（_device_name 是 None）。
+                # runtime 名字會被三種「當下判斷」清掉：按錄音剛好在插上與清單更新之間、設定存檔剛好在
+                # 清單更新前、被拔掉後又插回來。清單更新是最後知道真相的一刻，所以在這裡用 config 的值
+                # 靜默恢復（不跳提示）；不然這一次的誤判會讓整個 App 執行期間都錄系統預設
+                # （審查 #concurrency0、#fixes1，2026-10-09 重現）。config 沒動過，所以不是『替使用者換麥克風』
+                wanted = self.cfg.input_device
+                if self.recorder.set_device_by_name(wanted):
+                    log_action("mic_device_restored", device=wanted)
+                else:
+                    log_action("mic_device_changed", count=len(devices))
             else:
                 log_action("mic_device_changed", count=len(devices))
         except Exception:
@@ -7252,6 +7292,12 @@ class AppWindow(ctk.CTkFrame):
                 self.recorder.stop()
             except Exception:
                 log_error("recorder_stop_on_close_failed")
+        # v2.33.0：暖機麥克風（開 App 後 30 秒內還開著的那條）一併關掉，選單列的橘色麥克風燈才會熄
+        if IS_MAC:
+            try:
+                self.recorder.release_warm()
+            except Exception:
+                log_error("release_warm_on_close_failed")
         # Phase 4.3 mini 視窗也要 destroy，避免主視窗關了 HUD 還浮著
         self._destroy_mini_window()
 
@@ -7335,8 +7381,12 @@ class SettingsWindow(ctk.CTkToplevel):
         # ── 輸入電平即時表（「錄音」分類唯一 Canvas；只在該頁可見時才跑）───────
         self._level_engine = WaveformEngine(n_bars=WAVE_N_BARS_MAIN)
         self._level_canvas: Optional[tk.Canvas] = None
-        self._level_stream = None            # 獨立於 AudioRecorder 的最小 sd.InputStream
+        self._level_stream = None            # 獨立於 AudioRecorder 的最小串流（Windows：sd.InputStream；Mac：AQInputStream）
         self._level_stream_failed = False    # 本次停留該頁期間已失敗過一次，別狂 retry
+        # v2.33.0（Mac）：串流在背景開，開好後跟 _release_level_stream 用同一把鎖交接（見 _level_open_worker）
+        self._level_lock = threading.Lock()
+        self._level_open_gen = 0             # 每次釋放 +1：背景還在開的那次發現世代不符就自己關掉
+        self._level_opening = False
         self._level_after_id: Optional[str] = None
         self._level_rms = 0.0
         self._level_last_tick = 0.0
@@ -7645,8 +7695,8 @@ class SettingsWindow(ctk.CTkToplevel):
             _devices = []
             log_error("settings_list_devices_failed")
         _app = self.master
-        _ready = (getattr(_app, "_audio_ready", recorder_mod.sounddevice_ready())
-                  and not getattr(_app, "_audio_refreshing", False))
+        # v2.33.0（Mac）：「清單可信了嗎」= 快取填過；Windows 照舊看元件準備好沒、有沒有在重掃
+        _ready = _settings_devices_ready(_app)
         self._device_values, self._available_devices, initial = _settings_device_options(
             self.cfg.input_device, _devices, _ready)
         self._device_var = ctk.StringVar(value=initial)
@@ -9248,6 +9298,9 @@ class SettingsWindow(ctk.CTkToplevel):
     def _open_level_stream(self) -> None:
         """開一個獨立、最小的麥克風串流只算 RMS，不錄音、不存音訊、完全不碰
         AudioRecorder（不會干擾主錄音狀態機）。失敗一律靜默降級。"""
+        if IS_MAC:
+            self._open_level_stream_mac()
+            return
         # v2.32.3：麥克風元件還沒準備好、或背景正在重掃，就先不開音量表（下一輪再試）——
         # 在這裡 import 會在主執行緒做那段很慢的初始化；重掃中開串流則會跟它同時動 PortAudio
         app = self.master
@@ -9286,16 +9339,81 @@ class SettingsWindow(ctk.CTkToplevel):
             self._level_stream = None
             self._level_stream_failed = True
 
+    def _open_level_stream_mac(self) -> None:
+        """v2.33.0（Mac）：音量表改用 AudioQueue，在背景開。
+
+        為什麼一定要背景：程序啟動後約 30 秒內，每開一次麥克風要 1～5 秒（2026-10-08 實測，語音突顯），
+        在主執行緒開就是設定視窗卡住。兩個 AudioQueue 可以同時開同一支麥克風（實測兩個都收得到聲音），
+        所以不必為了它關掉暖機。"""
+        if self._level_opening:
+            return   # 上一次的還在背景開（可能剛換了麥克風、舊的那次作廢後還沒回報），等它回報再說
+        uid = self._resolve_preview_device_index()
+        self._level_opening = True
+        gen = self._level_open_gen
+        threading.Thread(target=self._level_open_worker, args=(uid, gen), daemon=True,
+                         name="LevelMeterOpen").start()
+
+    def _level_open_worker(self, uid, gen: int) -> None:
+        import numpy as np
+        stream = None
+        try:
+            from mac_audio_queue import AQInputStream
+            from recorder import SAMPLE_RATE as _sr, BLOCK_MS as _block_ms
+
+            def _cb(indata, frames, time_info, status, _sw=self):
+                try:
+                    _sw._level_rms = float(np.sqrt(np.mean(indata ** 2)))
+                except Exception:
+                    pass
+
+            stream = AQInputStream(_sr, 1, int(_block_ms / 1000 * _sr), uid, _cb)
+            stream.start()
+        except Exception:
+            log_error("settings_level_meter_open_failed")
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            with self._level_lock:
+                self._level_opening = False
+                if gen == self._level_open_gen:
+                    self._level_stream_failed = True
+            return
+        # 交接要跟 _release_level_stream 搶同一把鎖：開的途中設定視窗關了／換頁了／換麥克風，
+        # 世代號碼已經 +1，這條開好的就自己關掉，不裝上去（不然沒人會再關它，麥克風燈一直亮）。
+        # 不用 after() 交接：視窗被銷毀時排著的 after 會被丟掉，串流就漏掉了
+        with self._level_lock:
+            self._level_opening = False
+            if gen == self._level_open_gen:
+                self._level_stream = stream
+                return
+        try:
+            stream.close()
+        except Exception:
+            pass
+
     def _release_level_stream(self) -> None:
         """關掉目前的電平表麥克風串流（若有）。render tick 是否繼續跑不受影響。"""
-        stream = self._level_stream
-        self._level_stream = None
-        if stream is not None:
+        with self._level_lock:
+            self._level_open_gen += 1   # 還在背景開的那次作廢
+            stream = self._level_stream
+            self._level_stream = None
+        if stream is None:
+            return
+
+        def _close():
             try:
                 stream.stop()
                 stream.close()
             except Exception:
                 log_error("settings_level_meter_release_failed")
+        if IS_MAC:
+            # AudioQueueStop 要等 callback 跑完；開 App 30 秒內關一次實測 1～3 秒（2026-10-08，語音突顯），
+            # 在主執行緒關會卡住設定視窗，所以交給背景。App 結束時還沒關完的由 mac_audio_queue.close_all 收尾
+            threading.Thread(target=_close, daemon=True, name="LevelMeterClose").start()
+        else:
+            _close()
 
     def _fetch_live_device_names(self) -> None:
         names = recorder_mod.coreaudio_input_names()
@@ -9317,8 +9435,9 @@ class SettingsWindow(ctk.CTkToplevel):
         except Exception:
             log_error("settings_merge_device_names_failed")
 
-    def _resolve_preview_device_index(self) -> Optional[int]:
-        """把麥克風下拉選單目前選的裝置名稱換成 PortAudio index；系統預設回 None。"""
+    def _resolve_preview_device_index(self):
+        """把麥克風下拉選單目前選的裝置名稱換成裝置識別（Windows：PortAudio 編號；Mac：UID 字串）；
+        系統預設回 None。"""
         sel = self._device_var.get()
         if sel == "（系統預設）":
             return None

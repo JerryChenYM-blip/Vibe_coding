@@ -26,7 +26,7 @@
 | 用途 | 套件 / 方式 | 備註 |
 |---|---|---|
 | GUI 介面 | `customtkinter 5.2.2` | tkinter 包裝，深色模式 |
-| 音訊錄音 | `sounddevice 0.5.1` | 16 kHz 單聲道 float32 |
+| 音訊錄音 | **Mac：系統 AudioQueue（`mac_audio_queue.py`，ctypes 直呼 AudioToolbox）**；Windows：`sounddevice 0.5.1` | 16 kHz 單聲道 float32；Mac v2.33.0 起不載入 sounddevice（見坑點 #18） |
 | 語音辨識（MLX 後端）| `mlx-whisper` | Apple Silicon Metal GPU 加速（預設） |
 | 語音辨識（CPU 後端）| `faster-whisper 1.1.1` | int8 量化、非 Apple Silicon 的 fallback |
 | VAD 靜音偵測 | `faster-whisper` 內建 Silero VAD | v2.1.0 放寬：threshold 0.3、min_silence 800ms |
@@ -55,7 +55,8 @@ Python 版本：**3.13 arm64**（Apple Silicon）。
 ├── icons.py              # ★ 純 PIL 手繪 Lucide 風格圖示（11 個，零依賴）
 ├── animation.py          # 純函式：easing、breathing、blend、Ripple（Ambient Chamber 用）
 ├── transcriber.py        # Whisper 封裝（MLX + CTranslate2 雙後端）、VAD 放寬、音量正規化、幻覺過濾
-├── recorder.py           # AudioRecorder：sounddevice 回呼 + RMS 電平
+├── recorder.py           # AudioRecorder：Mac 走 AudioQueue＋啟動暖機 30 秒、Windows 走 sounddevice；RMS 電平
+├── mac_audio_queue.py    # ★ v2.33.0：Mac 專用 AudioQueue 串流（AQInputStream）與 CoreAudio 裝置查詢
 ├── hotkey_manager.py     # NSEvent 全域快捷鍵監聽（Fix 7 換掉 pynput）+ Tk 原生 binding（綁定對話框）
 ├── auto_paste.py         # ⌘V 模擬自動貼上 + 前景 App 偵測
 ├── config.py             # ~/.whisper_app/config.json 讀寫（原子性儲存）
@@ -333,7 +334,13 @@ cat ~/.whisper_app/polish_log.jsonl | jq .         # 潤飾紀錄
 15. **Tk Toplevel 拿 NSWindow handle 沒有官方 API**（Fix 8 / 2026-05-22）— Tk 沒有 method 直接拿到對應的 NSWindow。Workaround：給 Toplevel 設一個獨特 title（如 `WhisperProMiniHUD`），然後從 `NSApp.windows()` 迭代用 `w.title()` 比對找出來。`overrideredirect(True)` 後 title 不會顯示在 UI 上，純當 handle 用。拿到後即可呼叫 `setLevel_` / `setCollectionBehavior_` 把 HUD 升到 NSStatusWindowLevel（25）跨 Space / 全螢幕仍可見。注意 Tk Toplevel 對應的 NSWindow **不是 NSPanel**，所以 `NSWindowStyleMaskNonactivatingPanel` 不能用——`setStyleMask` 對非 panel 會炸；setLevel + collectionBehavior 已是 80% 效果（Speakly 也只用這兩個）。實作於 `gui.py` `MiniRecordingWindow._upgrade_to_panel_level`，整段包 try/except，失敗時 fallback 成普通 Toplevel（only same Space 可見）。
 16. **多螢幕 Tk vs NSScreen 座標換算**（Fix 8）— NSScreen.frame 用左下原點且 origin 不必是 (0,0)（副螢幕可能在主螢幕左/右/上）；Tk geometry 字串用左上原點且 y 相對 `screens[0]`。換算公式：`tk_y = primary_h - (ns_y_bottom + WIN_H)`，其中 `ns_y_bottom = sf.origin.y + BOTTOM_MARGIN`。游標所在螢幕用 `NSEvent.mouseLocation()` 配 `NSScreen.screens()` 比對。實作於 `gui.py` `MiniRecordingWindow._position_at_cursor_screen_bottom`。
 17. **左右側 modifier 同按、放開一顆會被誤判**（Fix 9 P1-A / 2026-05-22）— pynput / NSEvent 的 `event.modifierFlags()` 對 `cmd_l` / `cmd_r`（以及 alt/ctrl/shift 左右）共用同一個 device-independent bit（如 `NSEventModifierFlagCommand`）。情境「按 Left Cmd → 按 Right Cmd → 放開 Left Cmd」放開時 modifierFlags 仍含 cmd bit（因 cmd_r 還按著），舊邏輯誤判 release 為 press → `_pressed` 累積 stale `Key.cmd_l`，lone-mode 下次乾淨 press 無法 arm 需等 10s self-heal。**判斷 FlagsChanged 是 press 還是 release 不能只看 modifier bit**，必須用 set 自己做 state machine：sided keycode 在集合中 = release，否則 = press。實作於 `hotkey_manager.py` `_handle_ns_event` FlagsChanged 分支用 `self._ns_held_modifiers: set[int]` 追蹤；`stop()` 同步 clear。詳見 `docs/superpowers/plans/2026-05-22-pr-13-code-review-fixes.md` §2 P1-A。
-18. **macOS 27 麥克風模式「語音突顯」讓所有音訊裝置查詢變慢**（2026-10-06）— 控制中心替 Whisper Pro 存的麥克風模式是語音突顯時，App 身分每向 CoreAudio 查一次裝置屬性要 0.05～0.3 秒，PortAudio 初始化（`import sounddevice`）9.8～15.4 秒、`refresh_portaudio()` 9.5 秒；改標準 0.2／0.01 秒。終端機跑沒有 App 身分，量不出來——要用 `open --env PYTHONPROFILEIMPORTTIME=1 ~/Applications/WhisperPro.app` 量真實啟動。v2.32.3 起 Mac 上 sounddevice 在背景載入（`recorder.ensure_sounddevice()`），**主執行緒上不能再直接 `import sounddevice` 或呼叫 `refresh_portaudio()`**。啟動日誌 `AUDIO: ready=… (mic_mode=…)` 會記模式與耗時。詳見 `docs/工作紀錄/2026-10-06_v2.32.3-啟動慢與麥克風模式.md`。
+18. **macOS 27 麥克風模式「語音突顯」讓所有音訊裝置查詢變慢**（2026-10-06；v2.33.0 改做法）— 控制中心替 Whisper Pro 存的麥克風模式是語音突顯時，App 身分每向 CoreAudio 查一次裝置屬性要 0.05～0.3 秒。PortAudio 一初始化就掃全部裝置（約 126 次查詢）→ `import sounddevice` 9.8～15.4 秒、重掃 9.5 秒；改標準 0.2／0.01 秒。終端機跑沒有 App 身分，量不出來——要用 `open --env PYTHONPROFILEIMPORTTIME=1 ~/Applications/WhisperPro.app` 量真實啟動。
+    **v2.33.0 做法（Mac）**：不再載入 sounddevice／PortAudio，錄音改用系統 AudioQueue 只開「一支」麥克風（`mac_audio_queue.AQInputStream`）。守則：
+    - **Mac 上 PortAudio 與 AudioQueue 不能並用**：AudioQueue 開著時 PortAudio 再開同一支，3 秒內收不到聲音（2026-10-08 實測）。主執行緒、背景都不要再 `import sounddevice`（Windows 才用它）。
+    - **主執行緒絕不做 CoreAudio 列舉**：語音突顯時列舉全部裝置 2～4 秒。`AudioRecorder.list_devices()` 在 Mac 只回快取（`[{"id": UID, "name": 名字}]`），快取由暖機背景執行緒與 `refresh_devices()`（背景呼叫）填；`_device_index` 在 Mac 放 UID 字串。
+    - **開 App 先暖機 30 秒**：`main.py` 在 `import gui` 之前呼叫 `recorder.prewarm(config 裡的 input_device)`，背景開著麥克風撐到程序啟動後 30 秒才關。程序啟動後約 30 秒內每開一次麥克風要 1～5 秒，之後 0.06～0.08 秒；只撐 15 秒不夠（2026-10-08 實測）。代價：開 App 後選單列橘色麥克風燈亮約 30 秒（使用者已同意，聲音沒有錄下來）。按錄音時暖機開好且是同一支就直接接手、不碰硬體；還在開就提示「麥克風開啟中」。暖機被作廢（換麥克風、裝置變動影響到它、App 關閉）用世代號碼，背景開到一半被作廢的會自己關掉。
+    - **AudioQueue 一定要在鎖外關**：`AudioQueueStop(immediate)` 會等正在跑的 callback 跑完，而 callback 要拿 `AudioRecorder._lock`；在鎖內關會死結。`stop()` 在鎖內只把串流拆下來。
+    啟動日誌 `AUDIO: ready=… in X s since startup (mic_mode=…)` 記暖機從程序啟動算到開好的秒數與麥克風模式；`RECORD: took over warm microphone` 表示接手成功。詳見 `docs/工作紀錄/2026-10-06_v2.32.3-啟動慢與麥克風模式.md`、`docs/工作紀錄/2026-10-09_v2.33.0-麥克風改用AudioQueue與暖機.md`。
 
 ---
 
@@ -479,6 +486,7 @@ cat ~/.whisper_app/polish_log.jsonl | jq .         # 潤飾紀錄
 | Ollama 環境診斷 | `onboarding.py` | 純函式：missing_binary / not_running / no_models / ready |
 | 設定匯入匯出 | `gui.py` SettingsWindow `_export_settings` / `_import_settings` | zip + manifest.json schema_version=1 |
 | 日誌系統 | `logger.py` | `log_action` / `log_state` / `log_settings` / `log_error` |
+| Mac 錄音／麥克風暖機 | `mac_audio_queue.py` + `recorder.py` | `AQInputStream`、`prewarm()`／`release_warm()`、`refresh_devices()`；測試用 `tests/conftest.py` 的 `mac_env`（假 AudioQueue，絕不開真麥克風） |
 | 首次權限引導 | `main.py` + `gui.py` | pynput 輔助使用權限檢查 |
 | 設定欄位 | `config.py` | dataclass + 原子性儲存 |
 
